@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DocGraph</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary">
+        <img class="brand-mark" src="/icon.png" alt="DocGraph" width="48" height="48">
+        <nav class="nav">
+          <button type="button" class="nav-item active" data-route="dashboard" data-i18n="nav.dashboard">Dashboard</button>
+          <button type="button" class="nav-item" data-route="connectors" data-i18n="nav.connectors">Connectors</button>
+          <button type="button" class="nav-item" data-route="search" data-i18n="nav.search">Search</button>
+          <button type="button" class="nav-item" data-route="nodes" data-i18n="nav.nodes">Nodes</button>
+        </nav>
+      </aside>
+      <main class="content-shell">
+      <header class="topbar">
+        <div>
+          <h1>DocGraph</h1>
+          <p data-i18n="app.subtitle">Local-first product knowledge graph.</p>
+        </div>
+        <div class="topbar-actions">
+          <label class="language-control">
+            <span data-i18n="language.label">Language</span>
+            <select id="language-select" aria-label="Language">
+              <option value="en">English</option>
+              <option value="zh-CN">中文</option>
+            </select>
+          </label>
+          <span id="health" class="status" data-i18n="health.checking">Checking</span>
+        </div>
+      </header>
+
+      <section class="view active" data-view="dashboard">
+        <div class="grid">
+          <article class="panel">
+          <h2 data-i18n="status.title">System Status</h2>
+          <dl id="stats" class="stats">
+            <div><dt data-i18n="status.sources">Sources</dt><dd>-</dd></div>
+            <div><dt data-i18n="status.documents">Documents</dt><dd>-</dd></div>
+            <div><dt data-i18n="status.sections">Sections</dt><dd>-</dd></div>
+            <div><dt data-i18n="status.nodes">Nodes</dt><dd>-</dd></div>
+            <div><dt data-i18n="status.edges">Edges</dt><dd>-</dd></div>
+            <div><dt data-i18n="status.jobs">Jobs</dt><dd>-</dd></div>
+          </dl>
+          </article>
+
+          <article class="panel">
+          <h2 data-i18n="next.title">Next Steps</h2>
+          <ol>
+            <li data-i18n="next.add_source">Add a documentation source.</li>
+            <li data-i18n="next.sync">Run sync to build sections and graph data.</li>
+            <li data-i18n="next.use">Use search, context, REST API, or MCP.</li>
+          </ol>
+          <p class="muted" data-i18n="next.note">Static documentation sources can be added and indexed now.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" data-view="connectors">
+        <article class="panel wide">
+          <div class="section-heading">
+            <h2 data-i18n="sources.title">Sources</h2>
+            <button id="source-add-button" type="button" data-i18n="source.add">Add Source</button>
+          </div>
+          <dialog id="source-dialog" class="modal">
+            <div class="modal-panel">
+              <div class="modal-header">
+                <h2 data-source-dialog-title data-i18n="source.add">Add Source</h2>
+                <button class="secondary-button" type="button" data-close-source-dialog data-i18n="source.close">Close</button>
+              </div>
+              <form id="source-form" class="form">
+            <input name="source_id" type="hidden">
+            <label class="field" data-kinds="all">
+              <span class="field-label">
+                <span data-i18n="source.type">Type</span>
+                <span class="field-state required" data-i18n="field.required">Required</span>
+              </span>
+              <select name="kind" required>
+                <option value="local" data-i18n="source.kind.local">Local Markdown directory</option>
+                <option value="static" data-i18n="source.kind.static">Static docs directory</option>
+                <option value="html" data-i18n="source.kind.html">HTML directory</option>
+                <option value="sftp" data-i18n="source.kind.sftp">SFTP remote directory</option>
+                <option value="openapi" data-i18n="source.kind.openapi">OpenAPI JSON file</option>
+                <option value="git" data-i18n="source.kind.git">Git repository</option>
+                <option value="confluence" data-i18n="source.kind.confluence">Confluence</option>
+                <option value="webdocs" data-i18n="source.kind.webdocs">Online docs center</option>
+              </select>
+              <small class="field-help" data-i18n="source.type.help">Choose how DocGraph should read this documentation source.</small>
+            </label>
+            <label class="field" data-kinds="all">
+              <span class="field-label">
+                <span data-i18n="source.name">Name</span>
+                <span class="field-state required" data-i18n="field.required">Required</span>
+              </span>
+              <input name="name" required placeholder="Product docs" data-i18n-placeholder="source.name.placeholder">
+            </label>
+            <label class="field" data-kinds="all">
+              <span class="field-label">
+                <span data-i18n="source.dsn">Path / DSN</span>
+                <span class="field-state required" data-i18n="field.required">Required</span>
+              </span>
+              <input name="dsn" required placeholder="/path/to/docs" data-i18n-placeholder="source.dsn.placeholder">
+              <small class="field-help" data-source-dsn-help></small>
+            </label>
+            <label class="field" data-kinds="all">
+              <span class="field-label">
+                <span data-i18n="source.product">Product</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="product_hint" placeholder="Membership" data-i18n-placeholder="source.product.placeholder">
+              <small class="field-help" data-i18n="source.product.help"></small>
+            </label>
+            <label class="field" data-kinds="all">
+              <span class="field-label">
+                <span data-i18n="source.module">Module</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="module_hint" placeholder="Benefits" data-i18n-placeholder="source.module.placeholder">
+              <small class="field-help" data-i18n="source.module.help"></small>
+            </label>
+            <label class="field" data-kinds="git">
+              <span class="field-label">
+                <span data-i18n="source.branch">Branch</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="branch" placeholder="main">
+            </label>
+            <label class="field" data-kinds="git">
+              <span class="field-label">
+                <span data-i18n="source.source_path">Source Path</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="source_path" placeholder="docs">
+            </label>
+            <label class="field" data-kinds="git sftp">
+              <span class="field-label">
+                <span data-i18n="source.cache">Cache</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="cache" placeholder="/path/to/remote-clone">
+            </label>
+            <label class="field" data-kinds="static sftp">
+              <span class="field-label">
+                <span data-i18n="source.include">Include</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="include" placeholder="**/*.md,**/*.html,**/*.txt">
+            </label>
+            <label class="field" data-kinds="static sftp">
+              <span class="field-label">
+                <span data-i18n="source.exclude">Exclude</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="exclude" placeholder="**/drafts/**,**/archive/**">
+            </label>
+            <label class="field" data-kinds="static sftp html">
+              <span class="field-label">
+                <span data-i18n="source.url_prefix">URL Prefix</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="url_prefix" placeholder="https://docs.example.com">
+            </label>
+            <label class="field" data-kinds="sftp">
+              <span class="field-label">
+                <span data-i18n="source.identity_file">Identity File</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="identity_file" placeholder="~/.ssh/id_ed25519">
+            </label>
+            <label class="field" data-kinds="sftp">
+              <span class="field-label">
+                <span data-i18n="source.password">Password</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="password" type="password" autocomplete="off">
+            </label>
+            <label class="field" data-kinds="sftp">
+              <span class="field-label">
+                <span data-i18n="source.passphrase">Passphrase</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="passphrase" type="password" autocomplete="off">
+            </label>
+            <label class="field" data-kinds="sftp">
+              <span class="field-label">
+                <span data-i18n="source.known_hosts">Known Hosts</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="known_hosts" placeholder="~/.ssh/known_hosts">
+            </label>
+            <label class="field checkbox-field" data-kinds="sftp">
+              <span class="field-label">
+                <span data-i18n="source.strict_host_key">Strict Host Key</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="strict_host_key" type="checkbox">
+            </label>
+            <label class="field" data-kinds="confluence">
+              <span class="field-label">
+                <span data-i18n="source.page_id">Page ID</span>
+                <span class="field-state sync-required" data-i18n="field.required_for_sync">Required for sync</span>
+              </span>
+              <div class="field-row">
+                <input name="page_id" placeholder="123456" class="flex-input">
+                <label class="inline-checkbox">
+                  <input name="include_children" type="checkbox">
+                  <span class="inline-checkbox-label">
+                    <span data-i18n="source.include_children">Include Children</span>
+                  </span>
+                </label>
+              </div>
+              <small class="field-help" data-i18n="source.include_children.help">Also sync all descendant pages of the specified page.</small>
+            </label>
+            <label class="field" data-kinds="confluence">
+              <span class="field-label">
+                <span data-i18n="source.space_key">Space Key</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="space_key" placeholder="PROD">
+            </label>
+            <label class="field" data-kinds="confluence">
+              <span class="field-label">
+                <span data-i18n="source.token">Token</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="token" type="password" autocomplete="off" placeholder="Confluence token" data-i18n-placeholder="source.token.placeholder">
+            </label>
+            <label class="field" data-kinds="webdocs">
+              <span class="field-label">
+                <span data-i18n="source.max_pages">Max Pages</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="max_pages" type="number" min="1" placeholder="unlimited" data-i18n-placeholder="source.max_pages.placeholder">
+              <small class="field-help" data-i18n="source.max_pages.help">Blank means unlimited. Set a cap only when you want to control sync size.</small>
+            </label>
+            <label class="field" data-kinds="webdocs">
+              <span class="field-label">
+                <span data-i18n="source.max_depth">Max Depth</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="max_depth" type="number" min="1" placeholder="unlimited" data-i18n-placeholder="source.max_depth.placeholder">
+              <small class="field-help" data-i18n="source.max_depth.help">Blank means unlimited descendant depth.</small>
+            </label>
+            <label class="field" data-kinds="webdocs">
+              <span class="field-label">
+                <span data-i18n="source.bearer_token">Bearer Token</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="bearer_token" type="password" autocomplete="off" placeholder="eyJ...">
+            </label>
+            <label class="field" data-kinds="confluence webdocs">
+              <span class="field-label">
+                <span data-i18n="source.cookie">Cookie</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="cookie" type="password" autocomplete="off" placeholder="SESSION=...; token=...">
+            </label>
+            <label class="field" data-kinds="webdocs">
+              <span class="field-label">
+                <span data-i18n="source.headers_json">Headers JSON</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="headers_json" placeholder='{"X-Auth":"..."}'>
+              <small class="field-help" data-i18n="source.headers_json.help">Extra request headers sent while crawling.</small>
+            </label>
+            <label class="field" data-kinds="webdocs">
+              <span class="field-label">
+                <span data-i18n="source.is_spa">Single-Page App</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <label class="inline-checkbox">
+                <input name="is_spa" type="checkbox">
+                <span class="inline-checkbox-label">
+                  <span data-i18n="source.is_spa.label">Enable JS rendering</span>
+                </span>
+              </label>
+              <small class="field-help" data-i18n="source.is_spa.help">Enable for sites that require JavaScript to render content (e.g. Vue, React apps). Auto-detected when possible.</small>
+            </label>
+                <button type="submit" data-source-submit-label data-i18n="source.add">Add Source</button>
+              </form>
+            </div>
+          </dialog>
+          <div id="sources" class="list"></div>
+        </article>
+      </section>
+
+      <section class="view" data-view="search">
+        <div class="search-page">
+          <div class="search-hero">
+            <h2 class="search-wordmark">DocGraph</h2>
+            <form id="search-form" class="search-form">
+              <label class="sr-only" for="search-query" data-i18n="search.query">Query</label>
+              <div class="search-box">
+                <span class="search-icon" aria-hidden="true"></span>
+                <input id="search-query" name="query" required autocomplete="off" placeholder="feature, API, module" data-i18n-placeholder="search.placeholder">
+                <select id="search-limit" name="limit" aria-label="Results per page" data-i18n-title="search.limit_label" title="Results per page">
+                  <option value="10">10</option>
+                  <option value="20" selected>20</option>
+                  <option value="30">30</option>
+                  <option value="50">50</option>
+                  <option value="200" data-i18n="search.limit_unlimited">Unlimited</option>
+                </select>
+                <button type="submit" data-i18n="search.submit">Search</button>
+              </div>
+            </form>
+          </div>
+          <div id="search-summary" class="search-summary"></div>
+          <div id="results" class="search-results"></div>
+        </div>
+      </section>
+
+      <section class="view" data-view="nodes">
+        <article class="panel wide">
+          <h2 data-i18n="node.title">Node Explorer</h2>
+          <details class="node-help-panel">
+            <summary data-i18n="node.help.title">How nodes and edges are built from documents</summary>
+            <div class="node-help-content" data-i18n-html="node.help.content"></div>
+          </details>
+          <form id="node-search-form" class="form node-search-form">
+            <label class="field">
+              <span class="field-label">
+                <span data-i18n="node.search">Search Nodes</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="query" placeholder="document title, API, module, node id" data-i18n-placeholder="node.search.placeholder">
+            </label>
+            <button type="submit" data-i18n="node.search.submit">Search</button>
+          </form>
+          <div id="node-search-results" class="list node-search-results"></div>
+          <form id="node-form" class="form inline-form">
+            <label class="field">
+              <span class="field-label">
+                <span data-i18n="node.id">Node ID</span>
+                <span class="field-state required" data-i18n="field.required">Required</span>
+              </span>
+              <input name="id" required placeholder="node_xxx, api_xxx, prd_xxx, mod_xxx">
+            </label>
+            <label class="field">
+              <span class="field-label">
+                <span data-i18n="node.direction">Direction</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <select name="direction">
+                <option value="both" data-i18n="node.direction.both">Both</option>
+                <option value="out" data-i18n="node.direction.out">Outgoing</option>
+                <option value="in" data-i18n="node.direction.in">Incoming</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">
+                <span data-i18n="node.edge_kind">Edge Kind</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="kind" placeholder="contains, describes, exposes_api">
+            </label>
+            <label class="field">
+              <span class="field-label">
+                <span data-i18n="node.depth">Depth</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="max_depth" type="number" min="1" max="5" value="2">
+            </label>
+            <button type="submit" data-i18n="node.open">Open</button>
+            <button id="impact-button" type="button" data-i18n="node.impact">Impact</button>
+          </form>
+          <div class="curation-grid">
+            <form id="manual-relation-form" class="form compact-form">
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="relation.source">Source</span>
+                  <span class="field-state required" data-i18n="field.required">Required</span>
+                </span>
+                <input name="src_id" placeholder="node_xxx">
+              </label>
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="relation.target">Target</span>
+                  <span class="field-state required" data-i18n="field.required">Required</span>
+                </span>
+                <input name="dst_id" placeholder="node_yyy">
+              </label>
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="relation.kind">Kind</span>
+                  <span class="field-state required" data-i18n="field.required">Required</span>
+                </span>
+                <input name="kind" placeholder="depends_on">
+              </label>
+              <button type="submit" data-i18n="relation.add">Add Relation</button>
+            </form>
+            <form id="merge-node-form" class="form compact-form">
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="merge.node">Node</span>
+                  <span class="field-state required" data-i18n="field.required">Required</span>
+                </span>
+                <input name="target_id" placeholder="node_xxx">
+              </label>
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="merge.into">Merge Into</span>
+                  <span class="field-state required" data-i18n="field.required">Required</span>
+                </span>
+                <input name="merged_into" placeholder="node_yyy">
+              </label>
+              <button type="submit" data-i18n="merge.submit">Merge</button>
+            </form>
+          </div>
+          <div id="node-detail" class="list"></div>
+          <div id="related" class="list"></div>
+          <div id="impact" class="list"></div>
+        </article>
+      </section>
+      </main>
+    </div>
+    <script src="/main.js"></script>
+  </body>
+</html>

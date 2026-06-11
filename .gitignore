@@ -1,0 +1,11 @@
+.gocache/
+.gomodcache/
+.docgraph/
+.docgraph-test/
+.productgraph/
+bin/
+/docgraph
+/productgraph
+.codex
+.agents
+.claude/

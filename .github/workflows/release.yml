@@ -71,10 +71,12 @@ jobs:
           cp README.md "dist/$name/"
           if [ "$GOOS" = "windows" ]; then
             (cd dist && zip -qr "$name.zip" "$name")
+            archive="$name.zip"
           else
             tar -czf "dist/$name.tar.gz" -C dist "$name"
+            archive="$name.tar.gz"
           fi
-          (cd dist && sha256sum *.tar.gz *.zip 2>/dev/null > checksums_${GOOS}_${GOARCH}.txt)
+          (cd dist && sha256sum "$archive" > "checksums_${GOOS}_${GOARCH}.txt")
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

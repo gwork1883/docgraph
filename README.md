@@ -80,6 +80,7 @@ The repository includes a GitHub Actions workflow at `.github/workflows/release.
 - Pushing a `v*` tag runs tests, builds binaries, and creates a GitHub Release.
 - Build artifacts cover `linux/windows/darwin` on `amd64/arm64`.
 - Release artifacts include platform archives and SHA-256 checksum files.
+- To rebuild an existing release manually, run the `release` workflow and set `release_tag` to the tag name, such as `v0.1.0`.
 
 Example:
 

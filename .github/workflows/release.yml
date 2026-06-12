@@ -5,9 +5,17 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build and publish, for example v0.0.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   test:
@@ -15,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -45,6 +55,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -57,8 +69,8 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME:-dev}"
-          if [ "$version" = "${GITHUB_SHA}" ]; then
+          version="${RELEASE_TAG:-${GITHUB_REF_NAME:-dev}}"
+          if [ -z "$version" ] || [ "$version" = "${GITHUB_SHA}" ]; then
             version="dev-${GITHUB_SHA::7}"
           fi
           name="docgraph_${version}_${GOOS}_${GOARCH}"
@@ -89,7 +101,7 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && startsWith(inputs.release_tag, 'v'))
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -102,13 +114,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" artifacts/* \
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/* \
               --repo "$GITHUB_REPOSITORY" \
               --clobber
           else
-            gh release create "$GITHUB_REF_NAME" artifacts/* \
+            gh release create "$RELEASE_TAG" artifacts/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "$GITHUB_REF_NAME" \
+              --title "$RELEASE_TAG" \
               --generate-notes
           fi

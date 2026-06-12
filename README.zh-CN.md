@@ -79,6 +79,7 @@ make run
 - 推送 `v*` tag：自动测试、构建并创建 GitHub Release。
 - 默认产物覆盖 `linux/windows/darwin` 的 `amd64/arm64`。
 - Release 中包含每个平台压缩包和 SHA-256 checksum 文件。
+- 如果要手动重建已有 release，运行 `release` workflow 时填写 `release_tag`，例如 `v0.1.0`。
 
 示例：
 

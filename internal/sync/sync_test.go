@@ -1205,6 +1205,94 @@ func TestSyncSourceResolvesDocumentCenterRelativeAnchors(t *testing.T) {
 	}
 }
 
+func TestSyncSourceResolvesHTMLHeadingSlugAndSuffixAliasAnchors(t *testing.T) {
+	ctx := context.Background()
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "index.html"), `<!doctype html>
+<html>
+  <head><title>mcp-remote - npm</title></head>
+  <body>
+    <p>
+      <a href="index.html#authentication-errors">Authentication errors</a>
+      <a href=".html#add">Add</a>
+    </p>
+    <h2>Authentication Errors</h2>
+    <p>Authentication error details.</p>
+    <h2>Add</h2>
+    <p>Add command details.</p>
+  </body>
+</html>`)
+
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := sqlite.Open(ctx, "sqlite://"+dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	_, err = store.CreateSource(ctx, domain.Source{
+		ID:   "src_html_heading_slug_docs",
+		Kind: "html",
+		Name: "HTML Heading Slug Docs",
+		DSN:  docsDir,
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	result, err := NewService(store).SyncSource(ctx, "src_html_heading_slug_docs")
+	if err != nil {
+		t.Fatalf("SyncSource returned error: %v", err)
+	}
+	if result.Documents != 1 || len(result.BrokenLinks) != 0 {
+		t.Fatalf("SyncSource result = %+v, want one document and no broken links", result)
+	}
+
+	graphDB := openGraphDB(t, dbPath)
+	assertGraphCount(t, ctx, graphDB, 2, `
+select count(*)
+from edges
+join nodes src on src.id = edges.src_id
+join nodes dst on dst.id = edges.dst_id
+where edges.kind = 'links_to'
+  and src.kind = 'DocSection'
+  and src.name = 'mcp-remote - npm'
+  and dst.kind = 'DocSection'
+  and dst.name in ('Authentication Errors', 'Add')
+`)
+}
+
+func TestResolveHTMLHrefCandidatesNormalizesFragmentsAndHTMLSuffixAlias(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		href   string
+		want   string
+	}{
+		{name: "root html suffix alias", source: "index.html", href: ".html#add", want: "index.html#add"},
+		{name: "nested html suffix alias", source: "guide/index.html", href: ".html#add", want: "guide/index.html#add"},
+		{name: "query before fragment", source: "index.html", href: "index.html?tab=readme#authentication-errors", want: "index.html#authentication-errors"},
+		{name: "escaped fragment", source: "index.html", href: "index.html#Authentication%20Errors", want: "index.html#Authentication Errors"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveHTMLHrefCandidates(tt.source, tt.href)
+			for _, candidate := range got {
+				if candidate == tt.want {
+					return
+				}
+			}
+			t.Fatalf("resolveHTMLHrefCandidates(%q, %q) = %+v, want candidate %q", tt.source, tt.href, got, tt.want)
+		})
+	}
+}
+
 func TestSyncSourceRejectsDuplicateRunningJob(t *testing.T) {
 	ctx := context.Background()
 	docsDir := t.TempDir()

@@ -229,23 +229,6 @@ create table if not exists search_index_meta (
   updated_at text not null default current_timestamp
 );
 
-create virtual table if not exists fts_sections using fts5(
-  title,
-  heading_path,
-  content,
-  section_id unindexed,
-  document_id unindexed
-);
-
-create virtual table if not exists fts_sections_trigram using fts5(
-  title,
-  heading_path,
-  content,
-  section_id unindexed,
-  document_id unindexed,
-  tokenize='trigram'
-);
-
 create virtual table if not exists fts_section_tokens using fts5(
   title_tokens,
   section_heading_tokens,

@@ -685,7 +685,7 @@ func TestUpdateDeleteSourceAndSyncJobsLifecycle(t *testing.T) {
 	}
 	assertCount(t, ctx, store, "documents", "source_id = 'source-life'", 0)
 	assertCount(t, ctx, store, "sections", "document_id = 'doc-life'", 0)
-	assertCount(t, ctx, store, "fts_sections", "document_id = 'doc-life'", 0)
+	assertCount(t, ctx, store, "fts_section_tokens", "document_id = 'doc-life'", 0)
 	hits, err = store.SearchSections(ctx, "membership lifecycle", 10)
 	if err != nil {
 		t.Fatalf("SearchSections after delete returned error: %v", err)
@@ -731,7 +731,7 @@ func TestReplaceDocumentReplacesSectionsAndFTSRows(t *testing.T) {
 		t.Fatalf("first ReplaceDocument returned error: %v", err)
 	}
 	assertCount(t, ctx, store, "sections", "document_id = 'doc-1'", 2)
-	assertCount(t, ctx, store, "fts_sections", "document_id = 'doc-1'", 2)
+	assertCount(t, ctx, store, "fts_section_tokens", "document_id = 'doc-1'", 2)
 
 	doc.Title = "Updated Guide"
 	doc.ContentHash = "hash-doc-v2"
@@ -753,9 +753,9 @@ func TestReplaceDocumentReplacesSectionsAndFTSRows(t *testing.T) {
 	assertCount(t, ctx, store, "sections", "document_id = 'doc-1'", 1)
 	assertCount(t, ctx, store, "sections", "id = 'section-new-1' and title = 'Current Overview'", 1)
 	assertCount(t, ctx, store, "sections", "id in ('section-old-1', 'section-old-2')", 0)
-	assertCount(t, ctx, store, "fts_sections", "document_id = 'doc-1'", 1)
-	assertCount(t, ctx, store, "fts_sections", "section_id = 'section-new-1' and title = 'Current Overview'", 1)
-	assertCount(t, ctx, store, "fts_sections", "section_id in ('section-old-1', 'section-old-2')", 0)
+	assertCount(t, ctx, store, "fts_section_tokens", "document_id = 'doc-1'", 1)
+	assertCount(t, ctx, store, "fts_section_tokens", "section_id = 'section-new-1' and title_tokens like '%'", 1)
+	assertCount(t, ctx, store, "fts_section_tokens", "section_id in ('section-old-1', 'section-old-2')", 0)
 }
 
 func TestGetDocumentBySourceExternalID(t *testing.T) {
@@ -1248,15 +1248,15 @@ func TestSearchSectionsTrigramFindsCJKMixedQueries(t *testing.T) {
 		t.Fatalf("expected doc-auth (示例系统基本配置Schema) missing from hits: %+v", result.Hits)
 	}
 
-	// Verify fts_sections_trigram has data for these sections.
+	// Verify fts_section_tokens_trigram has data for these sections.
 	var trigramCount int64
 	if err := store.readDB().QueryRowContext(ctx,
-		"select count(*) from fts_sections_trigram",
+		"select count(*) from fts_section_tokens_trigram",
 	).Scan(&trigramCount); err != nil {
-		t.Fatalf("counting fts_sections_trigram: %v", err)
+		t.Fatalf("counting fts_section_tokens_trigram: %v", err)
 	}
 	if trigramCount != 3 {
-		t.Fatalf("fts_sections_trigram has %d rows, want 3", trigramCount)
+		t.Fatalf("fts_section_tokens_trigram has %d rows, want 3", trigramCount)
 	}
 }
 

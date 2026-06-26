@@ -33,7 +33,6 @@ const (
 	sectionTokenIndexVersion    = "gse-v1"
 	sectionTokenIndexRebuilding = sectionTokenIndexVersion + ":rebuilding"
 	legacyNodeIndexVersion      = "v1"
-	legacyTrigramIndexVersion   = "v1"
 )
 
 func Open(ctx context.Context, dsn string) (*Store, error) {
@@ -311,9 +310,6 @@ func (s *Store) EnsureSearchIndexes(ctx context.Context) error {
 	if err := s.ensureLegacyNodeIndex(ctx); err != nil {
 		return err
 	}
-	if err := s.ensureLegacySectionTrigramIndex(ctx); err != nil {
-		return err
-	}
 	needsTokenBackfill, err := s.ensureSectionTokenIndexVersion(ctx)
 	if err != nil {
 		return err
@@ -351,26 +347,6 @@ func (s *Store) ensureLegacyNodeIndex(ctx context.Context) error {
 		return s.backfillNodeIndexFromOffset(ctx, 0)
 	}
 	return s.backfillNodeIndexFromOffset(ctx, ftsCount)
-}
-
-func (s *Store) ensureLegacySectionTrigramIndex(ctx context.Context) error {
-	if version, err := s.searchIndexVersion(ctx, "sections_trigram"); err != nil {
-		return err
-	} else if version == legacyTrigramIndexVersion {
-		return nil
-	}
-	sectionCount, err := s.countRows(ctx, "sections")
-	if err != nil {
-		return err
-	}
-	ftsCount, err := s.countRows(ctx, "fts_sections_trigram")
-	if err != nil {
-		return err
-	}
-	if ftsCount >= sectionCount {
-		return s.setSearchIndexVersion(ctx, "sections_trigram", legacyTrigramIndexVersion)
-	}
-	return s.backfillSectionTrigramIndexFromOffset(ctx, ftsCount)
 }
 
 func (s *Store) ensureSectionTokenIndexVersion(ctx context.Context) (bool, error) {
@@ -454,19 +430,6 @@ limit -1 offset ?
 		return err
 	}
 	return s.setSearchIndexVersion(ctx, "nodes", legacyNodeIndexVersion)
-}
-
-func (s *Store) backfillSectionTrigramIndexFromOffset(ctx context.Context, offset int64) error {
-	if _, err := s.db.ExecContext(ctx, `
-insert into fts_sections_trigram (title, heading_path, content, section_id, document_id)
-select s.title, s.heading_path, s.content, s.id, s.document_id
-from sections s
-order by s.rowid
-limit -1 offset ?
-`, offset); err != nil {
-		return err
-	}
-	return s.setSearchIndexVersion(ctx, "sections_trigram", legacyTrigramIndexVersion)
 }
 
 func (s *Store) backfillSectionTokenIndexes(ctx context.Context) error {
@@ -612,18 +575,6 @@ func (s *Store) DeleteSource(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `
-delete from fts_sections
-where document_id in (select id from documents where source_id = ?)
-`, id); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-delete from fts_sections_trigram
-where document_id in (select id from documents where source_id = ?)
-`, id); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `
 delete from fts_section_tokens
 where document_id in (select id from documents where source_id = ?)
@@ -1135,12 +1086,6 @@ on conflict(id) do update set
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `delete from fts_sections where document_id = ?`, doc.ID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `delete from fts_sections_trigram where document_id = ?`, doc.ID); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens where document_id = ?`, doc.ID); err != nil {
 		return err
 	}
@@ -1156,20 +1101,6 @@ on conflict(id) do update set
 insert into sections (id, document_id, heading_path, title, content, content_hash, ordinal)
 values (?, ?, ?, ?, ?, ?, ?)
 `, section.ID, doc.ID, section.HeadingPath, section.Title, section.Content, section.ContentHash, section.Ordinal)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `
-insert into fts_sections (title, heading_path, content, section_id, document_id)
-values (?, ?, ?, ?, ?)
-`, section.Title, section.HeadingPath, section.Content, section.ID, doc.ID)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `
-insert into fts_sections_trigram (title, heading_path, content, section_id, document_id)
-values (?, ?, ?, ?, ?)
-`, section.Title, section.HeadingPath, section.Content, section.ID, doc.ID)
 		if err != nil {
 			return err
 		}
@@ -1214,16 +1145,13 @@ func (s *Store) DeleteDocumentsNotInSource(ctx context.Context, sourceID string,
 	defer tx.Rollback()
 
 	for _, docID := range staleIDs {
-		if _, err := tx.ExecContext(ctx, `delete from fts_sections where document_id = ?`, docID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `delete from fts_sections_trigram where document_id = ?`, docID); err != nil {
-			return err
-		}
 		if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens where document_id = ?`, docID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens_trigram where document_id = ?`, docID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `delete from fts_nodes where node_id in (select id from nodes where metadata_json like ?)`, documentIDLike(docID)); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `delete from nodes where metadata_json like ?`, documentIDLike(docID)); err != nil {
@@ -3392,101 +3320,6 @@ func normalizedBM25Boost(rawScore float64, maxRawScore float64, field string) fl
 	default:
 		return rawScore
 	}
-}
-
-func (s *Store) searchSectionsMatch(ctx context.Context, matchQuery string, limit int, opts domain.SearchOptions) ([]domain.SearchHit, error) {
-	rows, err := s.readDB().QueryContext(ctx, `
-select fts_sections.section_id, fts_sections.document_id, documents.title, documents.url,
-       coalesce(document_profiles."desc", ''),
-       coalesce(document_profiles.retrieval_profile_json, '{}'),
-       exists (
-         select 1 from feedback_events fe
-         where fe.target_kind = 'document'
-           and fe.target_id = documents.id
-           and fe.feedback_kind = 'document_canonical'
-       ) as canonical,
-       sections.title, sections.heading_path, sections.content,
-       snippet(fts_sections, 2, '<mark>', '</mark>', '...', 16), rank
-from fts_sections
-join sections on sections.id = fts_sections.section_id
-join documents on documents.id = fts_sections.document_id
-left join document_profiles on document_profiles.document_id = documents.id
-where fts_sections match ?
-  and not exists (
-    select 1 from feedback_events fe
-    where fe.target_kind = 'document'
-      and fe.target_id = documents.id
-      and fe.feedback_kind = 'document_stale'
-  )
-order by canonical desc, rank
-limit ?
-`, matchQuery, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var hits []domain.SearchHit
-	for rows.Next() {
-		var hit domain.SearchHit
-		var profileJSON string
-		if err := rows.Scan(&hit.SectionID, &hit.DocumentID, &hit.DocumentTitle, &hit.DocumentURL, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content, &hit.Snippet, &hit.Rank); err != nil {
-			return nil, err
-		}
-		enrichSearchHit(&hit, opts, profileJSON, searchTerms(opts.Query), "fts")
-		hits = append(hits, hit)
-	}
-	return hits, rows.Err()
-}
-
-func (s *Store) searchSectionsTrigram(ctx context.Context, query string, limit int, opts domain.SearchOptions) ([]domain.SearchHit, error) {
-	// Split query at CJK/Latin boundaries so the trigram tokenizer can
-	// match each written script independently. Without this, "sampleapp平台默认配置schema"
-	// would be treated as a single token and miss matches.
-	trigramQuery := trigramFTSQuery(query)
-
-	rows, err := s.readDB().QueryContext(ctx, `
-select fts_sections_trigram.section_id, fts_sections_trigram.document_id, documents.title, documents.url,
-       coalesce(document_profiles."desc", ''),
-       coalesce(document_profiles.retrieval_profile_json, '{}'),
-       exists (
-         select 1 from feedback_events fe
-         where fe.target_kind = 'document'
-           and fe.target_id = documents.id
-           and fe.feedback_kind = 'document_canonical'
-       ) as canonical,
-       sections.title, sections.heading_path, sections.content,
-       snippet(fts_sections_trigram, 2, '<mark>', '</mark>', '...', 16), rank
-from fts_sections_trigram
-join sections on sections.id = fts_sections_trigram.section_id
-join documents on documents.id = fts_sections_trigram.document_id
-left join document_profiles on document_profiles.document_id = documents.id
-where fts_sections_trigram match ?
-  and not exists (
-    select 1 from feedback_events fe
-    where fe.target_kind = 'document'
-      and fe.target_id = documents.id
-      and fe.feedback_kind = 'document_stale'
-  )
-order by canonical desc, rank
-limit ?
-`, trigramQuery, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var hits []domain.SearchHit
-	for rows.Next() {
-		var hit domain.SearchHit
-		var profileJSON string
-		if err := rows.Scan(&hit.SectionID, &hit.DocumentID, &hit.DocumentTitle, &hit.DocumentURL, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content, &hit.Snippet, &hit.Rank); err != nil {
-			return nil, err
-		}
-		enrichSearchHit(&hit, opts, profileJSON, searchTerms(opts.Query), "fts_trigram")
-		hits = append(hits, hit)
-	}
-	return hits, rows.Err()
 }
 
 func (s *Store) searchSectionsLike(ctx context.Context, terms []string, limit int, opts domain.SearchOptions) ([]domain.SearchHit, error) {

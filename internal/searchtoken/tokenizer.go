@@ -62,7 +62,7 @@ func NewGSETokenizer(opts Options) (*GSETokenizer, error) {
 		if err := tokenizer.seg.LoadDict(opts.DictionaryFiles...); err != nil {
 			return nil, err
 		}
-	} else if err := tokenizer.seg.LoadDict(); err != nil {
+	} else if err := tokenizer.seg.LoadDictEmbed(); err != nil {
 		return nil, err
 	}
 	for _, entry := range opts.DictionaryEntries {

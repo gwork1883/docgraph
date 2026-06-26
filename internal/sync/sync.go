@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/ingest/confluence"
@@ -687,20 +689,28 @@ func (s *Service) syncHTMLLinks(ctx context.Context, indexed []indexedHTMLDocume
 	targets := map[string]htmlSectionRef{}
 	for _, item := range indexed {
 		docPath := filepath.ToSlash(item.scanned.Path)
+		headingAnchors := map[string]int{}
 		for i, scannedSection := range item.scanned.Sections {
 			if i >= len(item.sections) {
 				continue
 			}
 			section := item.sections[i]
+			ref := htmlSectionRef{section: section, docPath: docPath}
 			if scannedSection.Anchor != "" {
-				targets[htmlTargetKey(docPath, scannedSection.Anchor)] = htmlSectionRef{section: section, docPath: docPath}
+				targets[htmlTargetKey(docPath, scannedSection.Anchor)] = ref
+			}
+			for _, anchor := range htmlHeadingAnchorCandidates(scannedSection.Title, headingAnchors) {
+				key := htmlTargetKey(docPath, anchor)
+				if _, exists := targets[key]; !exists {
+					targets[key] = ref
+				}
 			}
 			if i == 0 {
-				targets[htmlTargetKey(docPath, "")] = htmlSectionRef{section: section, docPath: docPath}
+				targets[htmlTargetKey(docPath, "")] = ref
 				for _, anchor := range item.scanned.Anchors {
 					key := htmlTargetKey(docPath, anchor)
 					if _, exists := targets[key]; !exists {
-						targets[key] = htmlSectionRef{section: section, docPath: docPath}
+						targets[key] = ref
 					}
 				}
 			}
@@ -818,9 +828,8 @@ func resolveHTMLHref(sourceDocPath string, href string) string {
 
 func resolveHTMLHrefCandidates(sourceDocPath string, href string) []string {
 	href = strings.TrimSpace(href)
-	href = strings.SplitN(href, "?", 2)[0]
 	parts := strings.SplitN(href, "#", 2)
-	targetPath := strings.TrimSpace(parts[0])
+	targetPath := strings.TrimSpace(strings.SplitN(parts[0], "?", 2)[0])
 	anchor := ""
 	if len(parts) == 2 {
 		anchor = strings.TrimSpace(parts[1])
@@ -869,6 +878,14 @@ func htmlPathCandidates(path string) []string {
 		path = "index.html"
 	}
 	candidates := []string{path}
+	if base := strings.ToLower(filepath.Base(path)); base == ".html" || base == ".htm" {
+		dir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+		if dir == "." || dir == "" {
+			candidates = append(candidates, "index.html")
+		} else {
+			candidates = append(candidates, filepath.ToSlash(filepath.Join(dir, "index.html")))
+		}
+	}
 	if strings.HasSuffix(path, "/") || strings.HasSuffix(path, "/.") {
 		candidates = append(candidates, strings.TrimRight(path, "/.")+"/index.html")
 	}
@@ -893,7 +910,53 @@ func htmlPathCandidates(path string) []string {
 }
 
 func htmlTargetKey(docPath string, anchor string) string {
-	return filepath.ToSlash(docPath) + "#" + strings.TrimPrefix(strings.TrimSpace(anchor), "#")
+	docPath = filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(docPath))))
+	if docPath == "." || docPath == "" {
+		docPath = "index.html"
+	}
+	return docPath + "#" + normalizeHTMLAnchor(anchor)
+}
+
+func normalizeHTMLAnchor(anchor string) string {
+	anchor = strings.TrimPrefix(strings.TrimSpace(anchor), "#")
+	if anchor == "" {
+		return ""
+	}
+	if decoded, err := url.PathUnescape(anchor); err == nil {
+		return strings.TrimSpace(decoded)
+	}
+	return anchor
+}
+
+func htmlHeadingAnchorCandidates(title string, counts map[string]int) []string {
+	slug := htmlHeadingSlug(title)
+	if slug == "" {
+		return nil
+	}
+	count := counts[slug]
+	counts[slug] = count + 1
+	if count == 0 {
+		return []string{slug}
+	}
+	return []string{fmt.Sprintf("%s-%d", slug, count)}
+}
+
+func htmlHeadingSlug(title string) string {
+	var b strings.Builder
+	lastDash := true
+	for _, r := range strings.TrimSpace(title) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(unicode.ToLower(r))
+			lastDash = false
+		case unicode.IsSpace(r) || r == '-' || r == '_':
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func uniqueBrokenLinks(links []storage.BrokenLink) []storage.BrokenLink {

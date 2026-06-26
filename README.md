@@ -30,6 +30,16 @@ Search provides local retrieval across document sections and generated retrieval
 - Chinese-aware retrieval profile generation for mixed Chinese/English internal docs.
 - Optional token authentication for Web/API/MCP endpoints.
 
+## Search Quality
+
+DocGraph is built for documentation search rather than generic text lookup:
+
+- Multi-stage local retrieval combines FTS5 token search, trigram search, profile lookup, and substring fallback so short Chinese phrases, English terms, API names, and symbols can all contribute to recall.
+- Search is section-first: results point to the exact document section, heading path, snippet, source URL, and matched evidence instead of only returning whole files.
+- Generated retrieval profiles add deterministic tags, keyphrases, aliases, API references, and section distribution signals while keeping human-maintained document descriptions separate from sync-generated metadata.
+- Ranking uses local signals such as canonical document status, title and heading matches, term coverage, profile matches, exact hits, and approved knowledge relations.
+- MCP tools return bounded search summaries first and let agents fetch full sections only when needed, keeping local agent context focused and auditable.
+
 ## How It Works
 
 DocGraph turns existing documentation into a local, queryable knowledge layer:

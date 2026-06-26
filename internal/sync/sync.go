@@ -2,7 +2,9 @@ package sync
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -40,6 +42,13 @@ type Result struct {
 type indexedDocument struct {
 	doc      storage.DocumentInput
 	sections []storage.SectionInput
+	graph    bool
+}
+
+type documentSyncPlan struct {
+	replace bool
+	profile bool
+	graph   bool
 }
 
 func (s *Service) SyncSource(ctx context.Context, id string) (Result, error) {
@@ -54,11 +63,54 @@ func (s *Service) SyncSource(ctx context.Context, id string) (Result, error) {
 	result, err := s.syncSource(ctx, source)
 	if err != nil {
 		_ = s.store.FailSyncJob(ctx, job.ID, err.Error())
+		if isCredentialFailure(source.Kind, err) {
+			_ = s.store.UpdateSourceSyncState(ctx, source.ID, "paused", "credential_required")
+		}
 		return Result{}, err
 	}
 	result.JobID = job.ID
 	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, BrokenLinks: result.BrokenLinks}); err != nil {
 		return Result{}, err
+	}
+	if source.SyncStatus == "paused" {
+		_ = s.store.UpdateSourceSyncState(ctx, source.ID, "active", "")
+	}
+	return result, nil
+}
+
+func (s *Service) RunSyncJob(ctx context.Context, job storage.Job) (Result, error) {
+	if strings.TrimSpace(job.ID) == "" {
+		return Result{}, fmt.Errorf("job id is required")
+	}
+	sourceID := strings.TrimSpace(job.SourceID)
+	if sourceID == "" {
+		sourceID = sourceIDFromSyncJobPayload(job.PayloadJSON)
+	}
+	if sourceID == "" {
+		err := fmt.Errorf("sync_source job %q is missing source_id", job.ID)
+		_ = s.store.FailSyncJob(ctx, job.ID, err.Error())
+		return Result{}, err
+	}
+	source, err := s.store.GetSource(ctx, sourceID)
+	if err != nil {
+		err = fmt.Errorf("source %q not found", sourceID)
+		_ = s.store.FailSyncJob(ctx, job.ID, err.Error())
+		return Result{}, err
+	}
+	result, err := s.syncSource(ctx, source)
+	if err != nil {
+		_ = s.store.FailSyncJob(ctx, job.ID, err.Error())
+		if isCredentialFailure(source.Kind, err) {
+			_ = s.store.UpdateSourceSyncState(ctx, source.ID, "paused", "credential_required")
+		}
+		return Result{}, err
+	}
+	result.JobID = job.ID
+	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, BrokenLinks: result.BrokenLinks}); err != nil {
+		return Result{}, err
+	}
+	if source.SyncStatus == "paused" {
+		_ = s.store.UpdateSourceSyncState(ctx, source.ID, "active", "")
 	}
 	return result, nil
 }
@@ -84,6 +136,44 @@ func (s *Service) syncSource(ctx context.Context, source storage.Source) (Result
 	default:
 		return Result{}, fmt.Errorf("sync is not supported for source kind %q", source.Kind)
 	}
+}
+
+func sourceIDFromSyncJobPayload(payload string) string {
+	var value struct {
+		SourceID string `json:"source_id"`
+	}
+	if err := json.Unmarshal([]byte(payload), &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value.SourceID)
+}
+
+func isCredentialFailure(kind string, err error) bool {
+	switch kind {
+	case "confluence", "webdocs", "sftp":
+	default:
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"auth",
+		"unauthorized",
+		"forbidden",
+		"http 401",
+		"http 403",
+		"credential",
+		"sso",
+		"oidc",
+		"zero trust",
+		"login page",
+		"non-json response",
+		"redirected to",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) syncLocal(ctx context.Context, source storage.Source) (Result, error) {
@@ -118,6 +208,7 @@ type indexedHTMLDocument struct {
 	scanned  htmldocs.Document
 	doc      storage.DocumentInput
 	sections []storage.SectionInput
+	graph    bool
 }
 
 type htmlSectionRef struct {
@@ -186,19 +277,30 @@ func (s *Service) syncHTMLLikeDocs(ctx context.Context, source storage.Source, r
 				Ordinal:     scannedSection.Ordinal,
 			})
 		}
-		if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+		plan, err := s.planDocumentSync(ctx, source, doc)
+		if err != nil {
 			return Result{}, err
 		}
-		if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
-			return Result{}, err
+		if plan.replace {
+			if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
 		}
-		indexed = append(indexed, indexedHTMLDocument{scanned: scanned, doc: doc, sections: sections})
+		if plan.profile {
+			if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+		}
+		indexed = append(indexed, indexedHTMLDocument{scanned: scanned, doc: doc, sections: sections, graph: plan.graph})
 	}
 	if err := s.store.DeleteDocumentsNotInSource(ctx, source.ID, keepDocumentIDs); err != nil {
 		return Result{}, err
 	}
 
 	for _, item := range indexed {
+		if !item.graph {
+			continue
+		}
 		if err := s.syncDocumentGraph(ctx, source, item.doc, item.sections, false); err != nil {
 			return Result{}, err
 		}
@@ -212,7 +314,11 @@ func (s *Service) syncHTMLLikeDocs(ctx context.Context, source storage.Source, r
 }
 
 func (s *Service) syncConfluence(ctx context.Context, source storage.Source) (Result, error) {
-	docs, err := confluence.Load(ctx, source.DSN, source.ConfigJSON)
+	configJSON, err := s.resolveConfluenceConfig(ctx, source)
+	if err != nil {
+		return Result{}, err
+	}
+	docs, err := confluence.Load(ctx, source.DSN, configJSON)
 	if err != nil {
 		return Result{}, err
 	}
@@ -243,24 +349,64 @@ func (s *Service) syncConfluence(ctx context.Context, source storage.Source) (Re
 				Ordinal:     scannedSection.Ordinal,
 			})
 		}
-		if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+		plan, err := s.planDocumentSync(ctx, source, doc)
+		if err != nil {
 			return Result{}, err
 		}
-		if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
-			return Result{}, err
+		if plan.replace {
+			if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
 		}
-		indexed = append(indexed, indexedDocument{doc: doc, sections: sections})
+		if plan.profile {
+			if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+		}
+		indexed = append(indexed, indexedDocument{doc: doc, sections: sections, graph: plan.graph})
 	}
 	if err := s.store.DeleteDocumentsNotInSource(ctx, source.ID, keepDocumentIDs); err != nil {
 		return Result{}, err
 	}
 	for _, item := range indexed {
+		if !item.graph {
+			continue
+		}
 		if err := s.syncDocumentGraph(ctx, source, item.doc, item.sections, false); err != nil {
 			return Result{}, err
 		}
 	}
 
 	return Result{SourceID: source.ID, Documents: len(docs)}, nil
+}
+
+func (s *Service) resolveConfluenceConfig(ctx context.Context, source storage.Source) (string, error) {
+	config := map[string]any{}
+	raw := strings.TrimSpace(source.ConfigJSON)
+	if raw == "" {
+		raw = "{}"
+	}
+	if err := json.Unmarshal([]byte(raw), &config); err != nil {
+		return "", fmt.Errorf("parse confluence source config_json: %w", err)
+	}
+	credentialID, _ := config["cookie_credential_id"].(string)
+	credentialID = strings.TrimSpace(credentialID)
+	if credentialID == "" {
+		return raw, nil
+	}
+	credential, err := s.store.GetConfluenceCookieCredential(ctx, credentialID)
+	if err != nil {
+		return "", fmt.Errorf("confluence cookie credential %q not found", credentialID)
+	}
+	if strings.TrimSpace(credential.Cookie) == "" {
+		return "", fmt.Errorf("confluence cookie credential %q has no cookie", credentialID)
+	}
+	config["cookie"] = strings.TrimSpace(credential.Cookie)
+	data, err := json.Marshal(config)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func (s *Service) syncMarkdownDocs(ctx context.Context, source storage.Source, root string, urlPrefix string) (Result, error) {
@@ -294,19 +440,30 @@ func (s *Service) syncMarkdownDocs(ctx context.Context, source storage.Source, r
 				Ordinal:     scannedSection.Ordinal,
 			})
 		}
-		if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+		plan, err := s.planDocumentSync(ctx, source, doc)
+		if err != nil {
 			return Result{}, err
 		}
-		if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
-			return Result{}, err
+		if plan.replace {
+			if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
 		}
-		indexed = append(indexed, indexedDocument{doc: doc, sections: sections})
+		if plan.profile {
+			if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+		}
+		indexed = append(indexed, indexedDocument{doc: doc, sections: sections, graph: plan.graph})
 	}
 	if err := s.store.DeleteDocumentsNotInSource(ctx, source.ID, keepDocumentIDs); err != nil {
 		return Result{}, err
 	}
 
 	for _, item := range indexed {
+		if !item.graph {
+			continue
+		}
 		if err := s.syncDocumentGraph(ctx, source, item.doc, item.sections, false); err != nil {
 			return Result{}, err
 		}
@@ -346,19 +503,57 @@ func (s *Service) syncOpenAPI(ctx context.Context, source storage.Source) (Resul
 			Ordinal:     scannedSection.Ordinal,
 		})
 	}
-	if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+	plan, err := s.planDocumentSync(ctx, source, doc)
+	if err != nil {
 		return Result{}, err
 	}
-	if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
-		return Result{}, err
+	if plan.replace {
+		if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+			return Result{}, err
+		}
+	}
+	if plan.profile {
+		if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
+			return Result{}, err
+		}
 	}
 	if err := s.store.DeleteDocumentsNotInSource(ctx, source.ID, []string{doc.ID}); err != nil {
 		return Result{}, err
 	}
-	if err := s.syncDocumentGraph(ctx, source, doc, sections, true); err != nil {
-		return Result{}, err
+	if plan.graph {
+		if err := s.syncDocumentGraph(ctx, source, doc, sections, true); err != nil {
+			return Result{}, err
+		}
 	}
 	return Result{SourceID: source.ID, Documents: 1}, nil
+}
+
+func (s *Service) planDocumentSync(ctx context.Context, source storage.Source, doc storage.DocumentInput) (documentSyncPlan, error) {
+	full := documentSyncPlan{replace: true, profile: true, graph: true}
+	existing, err := s.store.GetDocumentBySourceExternalID(ctx, doc.SourceID, doc.ExternalID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return full, nil
+	}
+	if err != nil {
+		return documentSyncPlan{}, err
+	}
+	if existing.ContentHash != doc.ContentHash {
+		return full, nil
+	}
+
+	profileCurrent := false
+	existingProfile, err := s.store.GetDocumentProfile(ctx, doc.ID)
+	if err == nil && existingProfile.GeneratedFromHash == doc.ContentHash {
+		profileCurrent = true
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return documentSyncPlan{}, err
+	}
+
+	return documentSyncPlan{
+		replace: false,
+		profile: !profileCurrent,
+		graph:   true,
+	}, nil
 }
 
 func (s *Service) syncDocumentProfile(ctx context.Context, doc storage.DocumentInput, sections []storage.SectionInput) error {

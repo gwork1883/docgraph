@@ -22,6 +22,7 @@ import (
 
 func TestCLISourceSyncSearchAndContext(t *testing.T) {
 	dataDir := t.TempDir()
+	migrateDataDir(t, dataDir)
 	docsDir := t.TempDir()
 	writeCLITestFile(t, filepath.Join(docsDir, "member.md"), `# Member Benefits
 
@@ -105,8 +106,93 @@ GET /member/benefits returns available member benefits.
 	}
 }
 
+func TestLoadOrCreateDefaultConfigCreatesTokenConfigInEmptyDirectory(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	cfg, path, err := loadOrCreateDefaultConfig("")
+	if err != nil {
+		t.Fatalf("loadOrCreateDefaultConfig returned error: %v", err)
+	}
+	if path != "docgraph.yaml" {
+		t.Fatalf("config path = %q, want docgraph.yaml", path)
+	}
+	if cfg.Auth.Mode != "token" || cfg.Auth.Token == "" {
+		t.Fatalf("auth config = %+v, want generated token auth", cfg.Auth)
+	}
+	if _, err := os.Stat("docgraph.yaml"); err != nil {
+		t.Fatalf("generated config was not created: %v", err)
+	}
+	data, err := os.ReadFile("docgraph.yaml")
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+	if !strings.Contains(string(data), "web_prefix:") {
+		t.Fatalf("generated config = %s, want server.web_prefix", string(data))
+	}
+
+	loaded, _, err := loadOrCreateDefaultConfig("")
+	if err != nil {
+		t.Fatalf("second loadOrCreateDefaultConfig returned error: %v", err)
+	}
+	if loaded.Auth.Token != cfg.Auth.Token {
+		t.Fatalf("second token = %q, want original token", loaded.Auth.Token)
+	}
+}
+
+func TestLoadOrCreateDefaultConfigRespectsExistingAuthNone(t *testing.T) {
+	t.Chdir(t.TempDir())
+	writeCLITestFile(t, "docgraph.yaml", `server:
+  host: "127.0.0.1"
+  port: 8787
+  data_dir: ".docgraph"
+storage:
+  dsn: "sqlite://.docgraph/docgraph.db"
+auth:
+  mode: "none"
+`)
+
+	cfg, path, err := loadOrCreateDefaultConfig("")
+	if err != nil {
+		t.Fatalf("loadOrCreateDefaultConfig returned error: %v", err)
+	}
+	if path != "docgraph.yaml" {
+		t.Fatalf("config path = %q, want docgraph.yaml", path)
+	}
+	if cfg.Auth.Mode != "none" {
+		t.Fatalf("Auth.Mode = %q, want none", cfg.Auth.Mode)
+	}
+}
+
+func TestLoadOrCreateDefaultConfigExplicitPathDoesNotCreateDefault(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	_, _, err := loadOrCreateDefaultConfig("custom.yaml")
+	if err == nil {
+		t.Fatal("loadOrCreateDefaultConfig returned nil error for missing explicit config")
+	}
+	if _, statErr := os.Stat("docgraph.yaml"); !os.IsNotExist(statErr) {
+		t.Fatalf("default config stat error = %v, want not exist", statErr)
+	}
+}
+
+func TestCLIMigrateInitializesDatabaseForStatus(t *testing.T) {
+	dataDir := t.TempDir()
+
+	err := runDocGraphError("status", "--data", dataDir)
+	if err == nil || !strings.Contains(err.Error(), "run docgraph migrate") {
+		t.Fatalf("status before migrate error = %v, want migrate hint", err)
+	}
+
+	migrateDataDir(t, dataDir)
+	out := runDocGraph(t, "status", "--data", dataDir)
+	if !strings.Contains(out, "documents: 0") || !strings.Contains(out, "sections: 0") {
+		t.Fatalf("status after migrate = %q, want empty migrated database counts", out)
+	}
+}
+
 func TestCLISourceLifecycleUpdateJobsAndDelete(t *testing.T) {
 	dataDir := t.TempDir()
+	migrateDataDir(t, dataDir)
 	initialDocsDir := t.TempDir()
 	updatedDocsDir := t.TempDir()
 	writeCLITestFile(t, filepath.Join(initialDocsDir, "initial.md"), `# Initial Docs
@@ -184,6 +270,7 @@ cli-lifecycle-token content for updated source.
 
 func TestCLISourceSyncsAndSearchesOpenAPIKind(t *testing.T) {
 	dataDir := t.TempDir()
+	migrateDataDir(t, dataDir)
 	specPath := filepath.Join(t.TempDir(), "membership.openapi.json")
 	writeCLITestFile(t, specPath, `{
   "openapi": "3.0.3",
@@ -240,6 +327,7 @@ func TestCLISourceSyncsAndSearchesOpenAPIKind(t *testing.T) {
 
 func TestCLIGitSourceSyncSearchesUpdatesAndCleansStaleDocs(t *testing.T) {
 	dataDir := t.TempDir()
+	migrateDataDir(t, dataDir)
 	repo := initCLIGitDocsRepo(t, map[string]string{
 		"docs/member.md": `# Member Git Docs
 
@@ -292,6 +380,7 @@ CLI cligittwobeta membership content.
 
 func TestCLIGitSourceInvalidBranchRecordsFailedJob(t *testing.T) {
 	dataDir := t.TempDir()
+	migrateDataDir(t, dataDir)
 	repo := initCLIGitDocsRepo(t, map[string]string{
 		"docs/member.md": `# Member Git Docs
 
@@ -323,6 +412,7 @@ CLI invalid branch fixture.
 
 func TestCLIHTMLSourceSyncSearchesAndCleansStaleDocs(t *testing.T) {
 	dataDir := t.TempDir()
+	migrateDataDir(t, dataDir)
 	docsDir := t.TempDir()
 	writeCLITestFile(t, filepath.Join(docsDir, "index.html"), `<!doctype html>
 <html>
@@ -371,7 +461,8 @@ func TestCLIHTMLSourceSyncSearchesAndCleansStaleDocs(t *testing.T) {
 
 func TestCLIConfluenceSourceSyncSearchAndFailedJobs(t *testing.T) {
 	dataDir := t.TempDir()
-	confluenceServer := newCLIConfluenceMock(t, "Bearer cli-secret")
+	migrateDataDir(t, dataDir)
+	confluenceServer := newCLIConfluenceMock(t, "Bearer fixture-cli-value")
 
 	addOut := runDocGraph(t,
 		"source", "add",
@@ -381,7 +472,7 @@ func TestCLIConfluenceSourceSyncSearchAndFailedJobs(t *testing.T) {
 		"--dsn", confluenceServer.URL+"/wiki",
 		"--base-url", confluenceServer.URL+"/wiki",
 		"--page-id", "100",
-		"--token", "cli-secret",
+		"--token", "fixture-cli-value",
 		"--include-children",
 	)
 	var source domain.Source
@@ -410,7 +501,7 @@ func TestCLIConfluenceSourceSyncSearchAndFailedJobs(t *testing.T) {
 		"--dsn", confluenceServer.URL+"/wiki",
 		"--base-url", confluenceServer.URL+"/wiki",
 		"--page-id", "100",
-		"--token", "bad-secret",
+		"--token", "fixture-bad-value",
 	)
 	var broken domain.Source
 	decodeJSON(t, brokenOut, &broken)
@@ -647,6 +738,11 @@ func runDocGraph(t *testing.T, args ...string) string {
 func runDocGraphError(args ...string) error {
 	allArgs := append([]string{"docgraph"}, args...)
 	return run(allArgs)
+}
+
+func migrateDataDir(t *testing.T, dataDir string) {
+	t.Helper()
+	runDocGraph(t, "migrate", "--data", dataDir)
 }
 
 func captureStdout(t *testing.T, fn func()) string {

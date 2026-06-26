@@ -88,6 +88,8 @@ Acceptance criteria:
 - Starts Web UI on `http://localhost:8787`.
 - Starts REST API under `/api`.
 - Starts MCP endpoint if HTTP MCP mode is enabled.
+- Creates `docgraph.yaml` with `auth.mode: token` and a generated token when no
+  explicit config path is provided and `docgraph.yaml` does not exist.
 - Creates default data directory if missing.
 - Creates default SQLite database if missing.
 - Logs startup configuration without printing secrets.
@@ -351,6 +353,7 @@ Acceptance criteria:
 - API enforces permission filtering.
 - When `auth.mode` is `token`, every API route except `GET /api/health` rejects requests without a valid token.
 - `GET /api/health` remains accessible without a token.
+- The embedded Web UI loads without a token and prompts for the admin token before calling protected APIs.
 - Valid tokens are accepted through `X-DocGraph-Token: <token>`.
 - Valid tokens are accepted through `Authorization: Bearer <token>`.
 - Missing or invalid tokens return `401 Unauthorized`.

@@ -15,7 +15,7 @@ import (
 
 func TestFetchUsesBasicAuthAndConfiguredPageIDs(t *testing.T) {
 	client := newConfluenceTestClient(t, func(r *http.Request) *http.Response {
-		if r.Header.Get("Authorization") != "Basic "+base64.StdEncoding.EncodeToString([]byte("user@example.com:api-secret")) {
+		if r.Header.Get("Authorization") != "Basic "+base64.StdEncoding.EncodeToString([]byte("user@example.com:fixture-api-value")) {
 			return textConfluenceResponse(http.StatusUnauthorized, "unauthorized")
 		}
 		switch r.URL.Path {
@@ -28,7 +28,7 @@ func TestFetchUsesBasicAuthAndConfiguredPageIDs(t *testing.T) {
 		}
 	}, Config{
 		Username: "user@example.com",
-		APIToken: "api-secret",
+		APIToken: "fixture-api-value",
 	})
 
 	pages, err := client.FetchPages(context.Background(), []string{"100", "200"})
@@ -68,11 +68,11 @@ func TestFetchReturnsClearAuthAndNotFoundErrors(t *testing.T) {
 
 func TestFetchReturnsClearRedirectError(t *testing.T) {
 	client := newConfluenceTestClient(t, func(r *http.Request) *http.Response {
-		return redirectConfluenceResponse("https://zerotrust.example/portal.php")
-	}, Config{Token: "pat-secret"})
+		return redirectConfluenceResponse("https://identity-gateway.example/portal.php")
+	}, Config{Token: "fixture-pat-value"})
 
 	_, err := client.FetchPages(context.Background(), []string{"100"})
-	if err == nil || !strings.Contains(err.Error(), "redirected to https://zerotrust.example/portal.php") || !strings.Contains(err.Error(), "SSO/OIDC") {
+	if err == nil || !strings.Contains(err.Error(), "redirected to https://identity-gateway.example/portal.php") || !strings.Contains(err.Error(), "SSO/OIDC") {
 		t.Fatalf("FetchPages redirect error = %v, want clear SSO redirect error", err)
 	}
 }

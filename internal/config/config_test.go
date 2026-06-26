@@ -19,6 +19,9 @@ func TestDefault(t *testing.T) {
 	if cfg.Server.DataDir != ".docgraph" {
 		t.Fatalf("Server.DataDir = %q, want %q", cfg.Server.DataDir, ".docgraph")
 	}
+	if cfg.Server.WebPrefix != "" {
+		t.Fatalf("Server.WebPrefix = %q, want empty", cfg.Server.WebPrefix)
+	}
 	wantDSN := "sqlite://.docgraph/docgraph.db"
 	if cfg.Storage.DSN != wantDSN {
 		t.Fatalf("Storage.DSN = %q, want %q", cfg.Storage.DSN, wantDSN)
@@ -45,12 +48,52 @@ func TestLoadEmptyPathReturnsDefault(t *testing.T) {
 	}
 }
 
+func TestDefaultWithTokenAuthGeneratesLoadableConfig(t *testing.T) {
+	cfg, err := DefaultWithTokenAuth()
+	if err != nil {
+		t.Fatalf("DefaultWithTokenAuth returned error: %v", err)
+	}
+	if cfg.Auth.Mode != "token" {
+		t.Fatalf("Auth.Mode = %q, want token", cfg.Auth.Mode)
+	}
+	if len(cfg.Auth.Token) < 32 {
+		t.Fatalf("Auth.Token length = %d, want generated secret", len(cfg.Auth.Token))
+	}
+
+	path := filepath.Join(t.TempDir(), "docgraph.yaml")
+	if err := Write(path, cfg); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !strings.Contains(string(data), "web_prefix:") {
+		t.Fatalf("written config = %s, want server.web_prefix", string(data))
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(%q) returned error: %v", path, err)
+	}
+	if loaded != cfg {
+		t.Fatalf("loaded config = %#v, want %#v", loaded, cfg)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat returned error: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("config mode = %v, want 0600", got)
+	}
+}
+
 func TestLoadAppliesOverridesAndKeepsDefaults(t *testing.T) {
 	path := writeConfig(t, `
 server:
   host: "0.0.0.0" # listen on all interfaces
   port: 9797
   data_dir: '/var/lib/docgraph'
+  web_prefix: docgraph
 storage:
   dsn: sqlite:///var/lib/docgraph/docgraph.db
 search:
@@ -73,6 +116,9 @@ auth:
 	}
 	if cfg.Server.DataDir != "/var/lib/docgraph" {
 		t.Fatalf("Server.DataDir = %q, want %q", cfg.Server.DataDir, "/var/lib/docgraph")
+	}
+	if cfg.Server.WebPrefix != "/docgraph" {
+		t.Fatalf("Server.WebPrefix = %q, want %q", cfg.Server.WebPrefix, "/docgraph")
 	}
 	if cfg.Storage.DSN != "sqlite:///var/lib/docgraph/docgraph.db" {
 		t.Fatalf("Storage.DSN = %q", cfg.Storage.DSN)
@@ -129,6 +175,14 @@ server:
 			want: "invalid server.port",
 		},
 		{
+			name: "invalid server web prefix",
+			content: `
+server:
+  web_prefix: "doc graph"
+`,
+			want: "server.web_prefix must be a path prefix",
+		},
+		{
 			name: "malformed line",
 			content: `
 server
@@ -164,6 +218,23 @@ auth:
 				t.Fatalf("Load error = %q, want substring %q", err.Error(), tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadAcceptsPrefixAlias(t *testing.T) {
+	path := writeConfig(t, `
+server:
+  prefix: /docgraph/
+storage:
+  dsn: sqlite://db.sqlite
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(%q) returned error: %v", path, err)
+	}
+	if cfg.Server.WebPrefix != "/docgraph" {
+		t.Fatalf("Server.WebPrefix = %q, want /docgraph", cfg.Server.WebPrefix)
 	}
 }
 

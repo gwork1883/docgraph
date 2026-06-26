@@ -1,10 +1,18 @@
 let messages = {};
 let currentLang = "en";
+let authMessageKey = "";
 const syncingSourceIDs = new Set();
-const syncedSourceIDs = new Set();
+const activeSyncSourceIDs = new Set();
 const sourcesByID = new Map();
+const credentialsByID = new Map();
 const sourceArtifactPages = new Map();
 const ARTIFACT_PAGE_SIZE = 50;
+const SYNC_HISTORY_PAGE_SIZE = 20;
+const AUTH_TOKEN_STORAGE_KEY = "docgraph.auth.token";
+const WEB_PREFIX = detectWebPrefix();
+let syncHistoryOffset = 0;
+let syncSchedulesBySourceID = new Map();
+let activeSyncTab = "history";
 
 const sourceHelpKeys = {
   local: "source.dsn.help.local",
@@ -17,13 +25,27 @@ const sourceHelpKeys = {
   webdocs: "source.dsn.help.webdocs",
 };
 
+const sourceScheduleKeys = {
+  "": "source.schedule.manual",
+  manual: "source.schedule.manual",
+  hourly: "source.schedule.hourly",
+  daily: "source.schedule.daily",
+  weekly: "source.schedule.weekly",
+  "every 6h": "source.schedule.every_6h",
+  every_6h: "source.schedule.every_6h",
+};
+
 async function init() {
   await loadI18n(detectLanguage());
   bindEvents();
   syncRouteFromHash();
   updateSourceFormForKind();
-  await loadStatus();
-  await loadSources();
+  const status = await loadStatus();
+  if (status === "unauthorized") {
+    return;
+  }
+  hideLogin();
+  await loadAppData();
 }
 
 function detectLanguage() {
@@ -37,7 +59,7 @@ async function loadI18n(lang) {
   document.documentElement.lang = currentLang;
   document.querySelector("#language-select").value = currentLang;
   try {
-    const response = await fetch(`/i18n/${currentLang}.json`);
+    const response = await fetch(appPath(`/i18n/${currentLang}.json`));
     messages = response.ok ? await response.json() : {};
   } catch {
     messages = {};
@@ -58,6 +80,7 @@ function applyI18n(root = document) {
   root.querySelectorAll("[data-i18n-html]").forEach((el) => {
     el.innerHTML = t(el.dataset.i18nHtml);
   });
+  renderAuthMessage();
   updateSourceFormForKind();
 }
 
@@ -73,9 +96,13 @@ function bindEvents() {
   document.querySelector("#language-select").addEventListener("change", async (event) => {
     localStorage.setItem("docgraph.lang", event.currentTarget.value);
     await loadI18n(event.currentTarget.value);
-    await loadStatus();
-    await loadSources();
+    const status = await loadStatus();
+    if (status !== "unauthorized") {
+      await loadAppData();
+    }
   });
+  document.querySelector("#auth-form")?.addEventListener("submit", onAuthSubmit);
+  document.querySelector("#logout-button")?.addEventListener("click", onLogoutClick);
   document.querySelectorAll("[data-route]").forEach((button) => {
     button.addEventListener("click", () => navigate(button.dataset.route));
   });
@@ -83,12 +110,29 @@ function bindEvents() {
 
   document.querySelector("#source-add-button")?.addEventListener("click", () => openSourceDialog());
   document.querySelector("[data-close-source-dialog]")?.addEventListener("click", closeSourceDialog);
+  document.querySelector("#credential-add-button")?.addEventListener("click", () => openCredentialDialog());
+  document.querySelector("[data-close-credential-dialog]")?.addEventListener("click", closeCredentialDialog);
+  document.querySelector("#sync-task-tabs")?.addEventListener("click", onSyncTaskTabClick);
+  document.querySelector("#sync-history-refresh")?.addEventListener("click", () => loadSyncJobHistory());
+  document.querySelector("#sync-schedule-add-button")?.addEventListener("click", () => openSyncScheduleDialog());
+  document.querySelector("[data-close-sync-schedule-dialog]")?.addEventListener("click", closeSyncScheduleDialog);
   document.querySelector('#source-form select[name="kind"]').addEventListener("change", updateSourceFormForKind);
 
   document.querySelector("#source-form").addEventListener("submit", onSourceSubmit);
+  document.querySelector("#credential-form")?.addEventListener("submit", onCredentialSubmit);
+  document.querySelector("#sync-task-filters")?.addEventListener("submit", onSyncTaskFiltersSubmit);
+  document.querySelector("#sync-job-history")?.addEventListener("click", onSyncJobHistoryClick);
+  document.querySelector("#sync-job-pagination")?.addEventListener("click", onSyncJobPaginationClick);
+  document.querySelector("#sync-schedules")?.addEventListener("click", onSyncSchedulesClick);
+  document.querySelector("#sync-schedule-form")?.addEventListener("submit", onSyncScheduleSubmit);
+  document.querySelector('#sync-schedule-form select[name="source_id"]')?.addEventListener("change", updateSyncScheduleCredentialField);
   document.querySelector("#sources").addEventListener("click", onSourcesClick);
+  document.querySelector("#credentials")?.addEventListener("click", onCredentialsClick);
   document.querySelector("#search-form").addEventListener("submit", onSearchSubmit);
   document.querySelector("#results").addEventListener("click", onSearchFeedbackClick);
+  document.querySelector("#relation-proposals-refresh")?.addEventListener("click", () => loadKnowledgeRelationProposals());
+  document.querySelector("#relation-proposal-filters")?.addEventListener("submit", onKnowledgeRelationProposalFiltersSubmit);
+  document.querySelector("#relation-proposals")?.addEventListener("click", onKnowledgeRelationProposalClick);
   document.querySelector("#node-search-form").addEventListener("submit", onNodeSearchSubmit);
   document.querySelector("#node-search-results").addEventListener("click", onNodeSearchResultsClick);
   document.querySelector("#node-form").addEventListener("submit", onNodeSubmit);
@@ -104,7 +148,7 @@ function syncRouteFromHash() {
 }
 
 function navigate(route, updateHash = true) {
-  const knownRoutes = new Set(["dashboard", "connectors", "search", "nodes"]);
+  const knownRoutes = new Set(["dashboard", "connectors", "sync-tasks", "credentials", "search", "governance", "nodes"]);
   const nextRoute = knownRoutes.has(route) ? route : "dashboard";
   document.querySelectorAll("[data-view]").forEach((view) => {
     view.classList.toggle("active", view.dataset.view === nextRoute);
@@ -114,6 +158,16 @@ function navigate(route, updateHash = true) {
   });
   if (updateHash && location.hash !== `#${nextRoute}`) {
     history.replaceState(null, "", `#${nextRoute}`);
+  }
+  if (nextRoute === "sync-tasks" && sourcesByID.size > 0) {
+    loadSyncTasksView().catch((error) => {
+      if (!isAuthError(error)) console.error(error);
+    });
+  }
+  if (nextRoute === "governance") {
+    loadKnowledgeRelationProposals().catch((error) => {
+      if (!isAuthError(error)) console.error(error);
+    });
   }
 }
 
@@ -127,6 +181,7 @@ function updateSourceFormForKind() {
   if (help) {
     help.textContent = t(sourceHelpKeys[kind] || "source.dsn.help.local");
   }
+  populateCredentialSelect();
 }
 
 function openSourceDialog(source = null) {
@@ -151,9 +206,35 @@ function closeSourceDialog() {
   }
 }
 
+function openCredentialDialog(credential = null) {
+  const dialog = document.querySelector("#credential-dialog");
+  const form = document.querySelector("#credential-form");
+  if (!dialog || !form) return;
+  resetCredentialForm(form);
+  if (credential) {
+    fillCredentialForm(form, credential);
+  }
+  updateCredentialDialogMode(Boolean(credential));
+  if (dialog?.showModal) {
+    dialog.showModal();
+  }
+}
+
+function closeCredentialDialog() {
+  const dialog = document.querySelector("#credential-dialog");
+  if (dialog?.open) {
+    dialog.close();
+  }
+}
+
 function resetSourceForm(form) {
   form.reset();
   form.elements.source_id.value = "";
+}
+
+function resetCredentialForm(form) {
+  form.reset();
+  form.elements.credential_id.value = "";
 }
 
 function updateSourceDialogMode(editing) {
@@ -170,10 +251,32 @@ function updateSourceDialogMode(editing) {
   }
 }
 
+function updateCredentialDialogMode(editing) {
+  const title = document.querySelector("[data-credential-dialog-title]");
+  const submit = document.querySelector("[data-credential-submit-label]");
+  const key = editing ? "credentials.edit" : "credentials.add";
+  if (title) {
+    title.dataset.i18n = key;
+    title.textContent = t(key);
+  }
+  if (submit) {
+    submit.dataset.i18n = editing ? "credentials.save" : "credentials.add";
+    submit.textContent = t(editing ? "credentials.save" : "credentials.add");
+  }
+}
+
 async function loadStatus() {
   const health = document.querySelector("#health");
   try {
-    const response = await fetch("/api/status");
+    const response = await apiFetch("/api/status", { skipAuthRedirect: true });
+    if (response.status === 401) {
+      const hadToken = Boolean(getAuthToken());
+      clearAuthToken();
+      health.textContent = t("auth.required_status");
+      health.className = "status warn";
+      showLogin(hadToken ? "auth.session_expired" : "auth.required");
+      return "unauthorized";
+    }
     if (!response.ok) {
       throw new Error(`status ${response.status}`);
     }
@@ -192,19 +295,69 @@ async function loadStatus() {
     document.querySelectorAll("#stats dd").forEach((dd, index) => {
       dd.textContent = values[index] ?? 0;
     });
+    return "ok";
   } catch (error) {
     health.textContent = t("health.error");
     health.className = "status warn";
+    return "error";
   }
 }
 
+async function loadAppData() {
+  try {
+    await loadCredentials();
+    await loadSources();
+    if (currentRoute() === "sync-tasks") {
+      await loadSyncTasksView();
+    }
+    if (currentRoute() === "governance") {
+      await loadKnowledgeRelationProposals();
+    }
+  } catch (error) {
+    if (!isAuthError(error)) {
+      console.error(error);
+    }
+  }
+}
+
+function currentRoute() {
+  return String(location.hash || "#dashboard").replace(/^#/, "") || "dashboard";
+}
+
+async function apiFetch(path, options = {}) {
+  const { skipAuthRedirect = false, ...fetchOptions } = options;
+  const headers = new Headers(fetchOptions.headers || {});
+  const token = getAuthToken();
+  if (isAPIPath(path) && token) {
+    headers.set("X-DocGraph-Token", token);
+  }
+  const response = await fetch(appPath(path), {
+    ...fetchOptions,
+    headers,
+  });
+  if (response.status === 401 && isAPIPath(path) && !skipAuthRedirect) {
+    clearAuthToken();
+    showLogin("auth.session_expired");
+  }
+  return response;
+}
+
 async function request(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  const headers = new Headers(options.headers || {});
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  const response = await apiFetch(path, {
     ...options,
+    headers,
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
+    if (response.status === 401) {
+      const error = new Error(t("auth.required"));
+      error.auth = true;
+      throw error;
+    }
     if (response.status === 409) {
       throw new Error(t("source.sync_in_progress"));
     }
@@ -213,20 +366,222 @@ async function request(path, options = {}) {
   return body;
 }
 
+async function onAuthSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const token = String(new FormData(form).get("token") || "").trim();
+  if (!token) {
+    showLogin("auth.required");
+    return;
+  }
+  setAuthToken(token);
+  setAuthMessage("auth.checking");
+  const status = await loadStatus();
+  if (status === "unauthorized") {
+    clearAuthToken();
+    showLogin("auth.invalid");
+    return;
+  }
+  hideLogin();
+  await loadAppData();
+}
+
+async function onLogoutClick() {
+  clearAuthToken();
+  const status = await loadStatus();
+  if (status === "unauthorized") {
+    showLogin("auth.logged_out");
+    return;
+  }
+  hideLogin();
+  await loadAppData();
+}
+
+function isAPIPath(path) {
+  return String(path || "").startsWith("/api/");
+}
+
+function appPath(path) {
+  const value = String(path || "");
+  if (!value.startsWith("/")) {
+    return value;
+  }
+  return `${WEB_PREFIX}${value}`;
+}
+
+function detectWebPrefix() {
+  const script = document.currentScript;
+  const src = script?.getAttribute("src") || "";
+  try {
+    const url = new URL(src, document.baseURI);
+    const path = url.pathname;
+    if (!path.endsWith("/main.js")) {
+      return "";
+    }
+    const prefix = path.slice(0, -"/main.js".length);
+    return prefix === "/" ? "" : prefix;
+  } catch {
+    return "";
+  }
+}
+
+function getAuthToken() {
+  return sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
+}
+
+function setAuthToken(token) {
+  sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+  renderLogoutButton();
+}
+
+function clearAuthToken() {
+  sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  renderLogoutButton();
+}
+
+function showLogin(messageKey = "") {
+  const gate = document.querySelector("#auth-gate");
+  const shell = document.querySelector(".app-shell");
+  if (gate) {
+    gate.hidden = false;
+  }
+  shell?.classList.add("auth-locked");
+  setAuthMessage(messageKey);
+  renderLogoutButton();
+  window.requestAnimationFrame(() => {
+    document.querySelector("#auth-token")?.focus();
+  });
+}
+
+function hideLogin() {
+  const gate = document.querySelector("#auth-gate");
+  const shell = document.querySelector(".app-shell");
+  if (gate) {
+    gate.hidden = true;
+  }
+  shell?.classList.remove("auth-locked");
+  setAuthMessage("");
+  renderLogoutButton();
+}
+
+function setAuthMessage(messageKey) {
+  authMessageKey = messageKey;
+  renderAuthMessage();
+}
+
+function renderAuthMessage() {
+  const message = document.querySelector("#auth-message");
+  if (!message) return;
+  message.textContent = authMessageKey ? t(authMessageKey) : "";
+}
+
+function renderLogoutButton() {
+  const button = document.querySelector("#logout-button");
+  if (!button) return;
+  button.hidden = !getAuthToken();
+}
+
+function isAuthError(error) {
+  return Boolean(error?.auth);
+}
+
+async function loadCredentials() {
+  const container = document.querySelector("#credentials");
+  const body = await request("/api/confluence-cookie-credentials");
+  credentialsByID.clear();
+  const credentials = body.credentials || [];
+  credentials.forEach((credential) => credentialsByID.set(credential.id, credential));
+  populateCredentialSelect();
+  if (!container) return;
+  if (!credentials.length) {
+    container.innerHTML = `<p class="muted">${escapeHTML(t("credentials.empty"))}</p>`;
+    return;
+  }
+  container.innerHTML = credentials.map(renderCredential).join("");
+}
+
+function renderCredential(credential) {
+  const statusKey = `credentials.status.${credential.status || "unknown"}`;
+  return `
+    <div class="item">
+      <strong>${escapeHTML(credential.name || "")}</strong>
+      <small>${escapeHTML(credential.base_url || "")}</small>
+      <div class="source-meta">
+        <span>${escapeHTML(t("credentials.status"))}: ${escapeHTML(t(statusKey))}</span>
+        <span>${escapeHTML(t("credentials.source_count", { count: credential.source_count || 0 }))}</span>
+        ${credential.cookie_preview ? `<span>${escapeHTML(credential.cookie_preview)}</span>` : ""}
+        ${credential.updated_at ? `<span>${escapeHTML(formatJobTime(credential.updated_at))}</span>` : ""}
+      </div>
+      ${credential.last_error ? `<small class="warn-text">${escapeHTML(credential.last_error)}</small>` : ""}
+      <div class="source-actions">
+        <button type="button" data-edit-credential="${escapeAttr(credential.id)}">${escapeHTML(t("credentials.edit"))}</button>
+        <button type="button" data-attach-credential="${escapeAttr(credential.id)}">${escapeHTML(t("credentials.attach"))}</button>
+        <button type="button" data-resume-credential="${escapeAttr(credential.id)}">${escapeHTML(t("credentials.resume"))}</button>
+        <button type="button" data-delete-credential="${escapeAttr(credential.id)}">${escapeHTML(t("source.delete"))}</button>
+      </div>
+    </div>
+  `;
+}
+
+function populateCredentialSelect() {
+  const selects = document.querySelectorAll('#source-form select[name="cookie_credential_id"], #sync-schedule-form select[name="cookie_credential_id"]');
+  selects.forEach((select) => {
+    const current = select.value;
+    const options = [`<option value="">${escapeHTML(t("source.cookie_credential.none"))}</option>`];
+    credentialsByID.forEach((credential) => {
+      options.push(`<option value="${escapeAttr(credential.id)}">${escapeHTML(credential.name || credential.base_url || credential.id)}</option>`);
+    });
+    select.innerHTML = options.join("");
+    if (current && credentialsByID.has(current)) {
+      select.value = current;
+    }
+  });
+}
+
+function populateSyncSourceSelects() {
+  const filter = document.querySelector("#sync-source-filter");
+  if (filter) {
+    const current = filter.value;
+    const options = [`<option value="">${escapeHTML(t("sync.source.all"))}</option>`];
+    sourcesByID.forEach((source) => {
+      options.push(`<option value="${escapeAttr(source.id)}">${escapeHTML(source.name || source.id)}</option>`);
+    });
+    filter.innerHTML = options.join("");
+    if (current && sourcesByID.has(current)) {
+      filter.value = current;
+    }
+  }
+  const scheduleSelect = document.querySelector('#sync-schedule-form select[name="source_id"]');
+  if (scheduleSelect) {
+    const current = scheduleSelect.value;
+    const options = [];
+    sourcesByID.forEach((source) => {
+      options.push(`<option value="${escapeAttr(source.id)}">${escapeHTML(source.name || source.id)} (${escapeHTML(source.kind || "")})</option>`);
+    });
+    scheduleSelect.innerHTML = options.join("");
+    if (current && sourcesByID.has(current)) {
+      scheduleSelect.value = current;
+    }
+  }
+}
+
 async function loadSources() {
   const container = document.querySelector("#sources");
   const body = await request("/api/sources");
   container.innerHTML = "";
   sourcesByID.clear();
+  activeSyncSourceIDs.clear();
   if (!body.sources?.length) {
+    populateSyncSourceSelects();
     container.innerHTML = `<p class="muted">${escapeHTML(t("sources.empty"))}</p>`;
     return;
   }
+  await loadActiveSyncSourceIDs();
   const sources = [...body.sources].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")) || String(b.id || "").localeCompare(String(a.id || "")));
   sources.forEach((source) => {
     sourcesByID.set(source.id, source);
-    const syncing = syncingSourceIDs.has(source.id);
-    const synced = syncedSourceIDs.has(source.id);
+    const syncing = syncingSourceIDs.has(source.id) || activeSyncSourceIDs.has(source.id);
+    const paused = source.sync_status === "paused";
     const item = document.createElement("div");
     item.className = "item";
     item.innerHTML = `
@@ -234,18 +589,34 @@ async function loadSources() {
       <small>${escapeHTML(source.kind)} · ${escapeHTML(source.id)}</small>
       ${source.created_at ? `<small>${escapeHTML(formatJobTime(source.created_at))}</small>` : ""}
       <small>${escapeHTML(source.dsn)}</small>
+      <div class="source-meta">
+        <span>${escapeHTML(t("source.schedule"))}: ${escapeHTML(formatSourceSchedule(source.sync_schedule))}</span>
+        <span class="${escapeAttr(paused ? "source-state warn" : "source-state")}">${escapeHTML(formatSourceSyncStatus(source))}</span>
+      </div>
       <div class="source-actions">
         <button data-edit="${escapeAttr(source.id)}" type="button">${escapeHTML(t("source.edit"))}</button>
-        <button data-sync="${escapeAttr(source.id)}" type="button" ${syncing || synced ? "disabled" : ""}>${escapeHTML(t(syncing ? "source.syncing" : synced ? "source.synced" : "source.sync"))}</button>
-        <button data-jobs="${escapeAttr(source.id)}" type="button">${escapeHTML(t("source.jobs"))}</button>
+        <button data-sync="${escapeAttr(source.id)}" type="button" ${syncing ? "disabled" : ""}>${escapeHTML(t(syncing ? "source.syncing" : "source.sync"))}</button>
+        <button data-sync-tasks-source="${escapeAttr(source.id)}" type="button">${escapeHTML(t("sync.view_tasks"))}</button>
         <button data-artifacts="${escapeAttr(source.id)}" type="button">${escapeHTML(t("source.artifacts"))}</button>
         <button data-delete="${escapeAttr(source.id)}" type="button">${escapeHTML(t("source.delete"))}</button>
       </div>
-      <div class="source-jobs" data-jobs-list="${escapeAttr(source.id)}"></div>
       <div class="source-artifacts" data-artifacts-list="${escapeAttr(source.id)}"></div>
     `;
     container.appendChild(item);
   });
+  populateSyncSourceSelects();
+}
+
+async function loadActiveSyncSourceIDs() {
+  const statuses = ["queued", "running"];
+  await Promise.all(statuses.map(async (status) => {
+    const body = await request(`/api/jobs?kind=sync_source&status=${encodeURIComponent(status)}&limit=100`);
+    (body.jobs || []).forEach((job) => {
+      if (job.source_id) {
+        activeSyncSourceIDs.add(job.source_id);
+      }
+    });
+  }));
 }
 
 async function onSourceSubmit(event) {
@@ -270,6 +641,35 @@ async function onSourceSubmit(event) {
   }
 }
 
+async function onCredentialSubmit(event) {
+  event.preventDefault();
+  const formElement = event.currentTarget;
+  const form = new FormData(formElement);
+  const credentialID = String(form.get("credential_id") || "").trim();
+  const cookie = String(form.get("cookie") || "").trim();
+  const payload = {
+    name: String(form.get("name") || "").trim(),
+    base_url: String(form.get("base_url") || "").trim(),
+    notes: String(form.get("notes") || "").trim(),
+  };
+  if (cookie) {
+    payload.cookie = cookie;
+  }
+  try {
+    await request(credentialID ? `/api/confluence-cookie-credentials/${encodeURIComponent(credentialID)}` : "/api/confluence-cookie-credentials", {
+      method: credentialID ? "PUT" : "POST",
+      body: JSON.stringify(payload),
+    });
+    formElement.reset();
+    updateCredentialDialogMode(false);
+    closeCredentialDialog();
+    await loadCredentials();
+    await loadSources();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
 function buildSourcePayload(form) {
   const kind = String(form.get("kind") || "local").trim();
   return {
@@ -278,6 +678,7 @@ function buildSourcePayload(form) {
     dsn: String(form.get("dsn") || "").trim(),
     product_hint: String(form.get("product_hint") || "").trim(),
     module_hint: String(form.get("module_hint") || "").trim(),
+    sync_schedule: String(form.get("sync_schedule") || "").trim(),
     config_json: JSON.stringify(buildSourceConfig(form, kind)),
   };
 }
@@ -313,6 +714,7 @@ function buildSourceConfig(form, kind) {
     addString("page_id");
     addString("space_key");
     addString("token");
+    addString("cookie_credential_id");
     addString("cookie");
     if (form.get("include_children") === "on") {
       config.include_children = true;
@@ -339,6 +741,7 @@ function fillSourceForm(form, source) {
   form.elements.dsn.value = source.dsn || "";
   form.elements.product_hint.value = source.product_hint || "";
   form.elements.module_hint.value = source.module_hint || "";
+  setFormValue(form, "sync_schedule", normalizeSourceScheduleValue(source.sync_schedule));
   setFormValue(form, "branch", config.branch);
   setFormValue(form, "source_path", config.path);
   setFormValue(form, "cache", config.cache);
@@ -352,6 +755,7 @@ function fillSourceForm(form, source) {
   setFormValue(form, "page_id", config.page_id);
   setFormValue(form, "space_key", config.space_key);
   setFormValue(form, "token", config.token);
+  setFormValue(form, "cookie_credential_id", config.cookie_credential_id);
   setFormValue(form, "max_pages", config.max_pages);
   setFormValue(form, "max_depth", config.max_depth);
   setFormValue(form, "bearer_token", config.bearer_token);
@@ -368,13 +772,82 @@ function fillSourceForm(form, source) {
   }
 }
 
+function fillCredentialForm(form, credential) {
+  form.elements.credential_id.value = credential.id || "";
+  form.elements.name.value = credential.name || "";
+  form.elements.base_url.value = credential.base_url || "";
+  form.elements.cookie.value = "";
+  form.elements.notes.value = credential.notes || "";
+}
+
+async function onCredentialsClick(event) {
+  const button = event.target.closest("button[data-edit-credential], button[data-delete-credential], button[data-attach-credential], button[data-resume-credential]");
+  if (!button) return;
+
+  if (button.dataset.editCredential) {
+    const credential = credentialsByID.get(button.dataset.editCredential);
+    if (credential) {
+      openCredentialDialog(credential);
+    }
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    if (button.dataset.deleteCredential) {
+      await request(`/api/confluence-cookie-credentials/${encodeURIComponent(button.dataset.deleteCredential)}`, { method: "DELETE" });
+    } else if (button.dataset.attachCredential) {
+      await request(`/api/confluence-cookie-credentials/${encodeURIComponent(button.dataset.attachCredential)}/attach-sources`, { method: "POST", body: "{}" });
+    } else if (button.dataset.resumeCredential) {
+      await request(`/api/confluence-cookie-credentials/${encodeURIComponent(button.dataset.resumeCredential)}/resume-sources`, { method: "POST", body: "{}" });
+    }
+    await loadCredentials();
+    await loadSources();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function setFormValue(form, name, value) {
   if (!form.elements[name]) return;
   form.elements[name].value = value == null ? "" : String(value);
 }
 
+function normalizeSourceScheduleValue(value) {
+  const schedule = String(value || "").trim();
+  if (schedule === "every_6h") {
+    return "every 6h";
+  }
+  return schedule === "manual" ? "" : schedule;
+}
+
+function formatSourceSchedule(value) {
+  const schedule = String(value || "").trim();
+  const key = sourceScheduleKeys[schedule] || "";
+  if (key) {
+    return t(key);
+  }
+  return schedule || t("source.schedule.manual");
+}
+
+function formatSourceSyncStatus(source) {
+  const status = String(source.sync_status || "active").trim();
+  if (status !== "paused") {
+    return `${t("source.status")}: ${t("source.status.active")}`;
+  }
+  const reason = String(source.sync_status_reason || "credential_required").trim();
+  const reasonLabel = reason === "credential_required" ? t("source.status.credential_required") : humanizeToken(reason);
+  const pausedAt = String(source.sync_paused_at || "").trim();
+  if (pausedAt) {
+    return `${t("source.status")}: ${reasonLabel} · ${t("source.status.paused_at", { time: formatJobTime(pausedAt) })}`;
+  }
+  return `${t("source.status")}: ${reasonLabel}`;
+}
+
 async function onSourcesClick(event) {
-  const button = event.target.closest("button[data-edit], button[data-sync], button[data-jobs], button[data-delete-job], button[data-artifacts], button[data-artifact-page], button[data-delete], button[data-open-node], button[data-save-desc]");
+  const button = event.target.closest("button[data-edit], button[data-sync], button[data-sync-tasks-source], button[data-artifacts], button[data-artifact-page], button[data-delete], button[data-open-node], button[data-save-desc]");
   if (!button) return;
 
   if (button.dataset.edit) {
@@ -445,30 +918,15 @@ async function onSourcesClick(event) {
     return;
   }
 
-  if (button.dataset.jobs) {
-    button.disabled = true;
-    try {
-      await loadSourceJobs(button.dataset.jobs);
-    } catch (error) {
-      alert(error.message);
-    } finally {
-      button.disabled = false;
+  if (button.dataset.syncTasksSource) {
+    const filter = document.querySelector("#sync-source-filter");
+    if (filter) {
+      filter.value = button.dataset.syncTasksSource;
     }
-    return;
-  }
-
-  if (button.dataset.deleteJob) {
-    button.disabled = true;
-    const sourceID = button.dataset.sourceId || "";
-    try {
-      await request(`/api/sources/${encodeURIComponent(sourceID)}/jobs/${encodeURIComponent(button.dataset.deleteJob)}`, { method: "DELETE" });
-      await loadSourceJobs(sourceID);
-      await loadStatus();
-    } catch (error) {
-      alert(error.message);
-    } finally {
-      button.disabled = false;
-    }
+    switchSyncTaskTab("history");
+    syncHistoryOffset = 0;
+    navigate("sync-tasks");
+    await loadSyncTasksView();
     return;
   }
 
@@ -490,7 +948,7 @@ async function onSourcesClick(event) {
   }
 
   const sourceID = button.dataset.sync;
-  if (!sourceID || syncingSourceIDs.has(sourceID) || syncedSourceIDs.has(sourceID)) {
+  if (!sourceID || syncingSourceIDs.has(sourceID) || activeSyncSourceIDs.has(sourceID)) {
     alert(t("source.sync_in_progress"));
     return;
   }
@@ -498,9 +956,15 @@ async function onSourcesClick(event) {
   button.disabled = true;
   button.textContent = t("source.syncing");
   try {
-    await request(`/api/sources/${sourceID}/sync`, { method: "POST", body: "{}" });
-    syncedSourceIDs.add(sourceID);
-    button.textContent = t("source.synced");
+    await request("/api/sync-tasks", {
+      method: "POST",
+      body: JSON.stringify({ source_id: sourceID }),
+    });
+    activeSyncSourceIDs.add(sourceID);
+    button.textContent = t("source.syncing");
+    syncingSourceIDs.delete(sourceID);
+    await loadSources();
+    await loadSyncTasksView();
     await loadStatus();
   } catch (error) {
     syncingSourceIDs.delete(sourceID);
@@ -508,45 +972,6 @@ async function onSourcesClick(event) {
     button.textContent = t("source.sync");
     alert(error.message);
   }
-}
-
-async function loadSourceJobs(sourceID) {
-  const body = await request(`/api/sources/${encodeURIComponent(sourceID)}/jobs?limit=10`);
-  const container = document.querySelector(`[data-jobs-list="${CSS.escape(sourceID)}"]`);
-  if (!container) return;
-  container.innerHTML = renderSourceJobs(sourceID, body.jobs || []);
-}
-
-function renderSourceJobs(sourceID, jobs) {
-  if (!jobs.length) {
-    return `<p class="muted">${escapeHTML(t("jobs.empty"))}</p>`;
-  }
-  return `
-    <div class="job-list">
-      ${jobs.map((job) => renderSourceJob(sourceID, job)).join("")}
-    </div>
-  `;
-}
-
-function renderSourceJob(sourceID, job) {
-  const payload = parsePayload(job.payload_json);
-  const brokenLinks = Array.isArray(payload.broken_links) ? payload.broken_links : [];
-  const error = String(job.last_error || "").trim();
-  return `
-    <div class="job-row">
-      <div class="job-main">
-        <strong>${escapeHTML(job.status || "")}</strong>
-        <small>${escapeHTML(job.id || "")} · ${escapeHTML(formatJobTime(job.updated_at || job.created_at))}</small>
-      </div>
-      <div class="job-meta">
-        <span>${escapeHTML(t("jobs.documents"))}: ${escapeHTML(payload.documents ?? 0)}</span>
-        <span>${escapeHTML(t("jobs.broken_links"))}: ${escapeHTML(brokenLinks.length)}</span>
-      </div>
-      ${error ? `<p class="job-error">${escapeHTML(error)}</p>` : ""}
-      ${brokenLinks.length ? renderBrokenLinks(brokenLinks) : ""}
-      <button type="button" data-source-id="${escapeAttr(sourceID)}" data-delete-job="${escapeAttr(job.id || "")}">${escapeHTML(t("jobs.delete"))}</button>
-    </div>
-  `;
 }
 
 function renderBrokenLinks(links) {
@@ -558,6 +983,314 @@ function renderBrokenLinks(links) {
       `).join("")}
     </details>
   `;
+}
+
+async function loadSyncTasksView() {
+  populateSyncSourceSelects();
+  if (activeSyncTab === "schedules") {
+    await loadSyncSchedules();
+    return;
+  }
+  await loadSyncJobHistory();
+}
+
+async function onSyncTaskTabClick(event) {
+  const button = event.target.closest("button[data-sync-tab]");
+  if (!button) return;
+  switchSyncTaskTab(button.dataset.syncTab || "history");
+  try {
+    await loadSyncTasksView();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function switchSyncTaskTab(tab) {
+  activeSyncTab = tab === "schedules" ? "schedules" : "history";
+  document.querySelectorAll("[data-sync-tab]").forEach((button) => {
+    const active = button.dataset.syncTab === activeSyncTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-sync-tab-panel]").forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.syncTabPanel === activeSyncTab);
+  });
+}
+
+async function onSyncTaskFiltersSubmit(event) {
+  event.preventDefault();
+  syncHistoryOffset = 0;
+  await loadSyncJobHistory();
+}
+
+async function onSyncJobPaginationClick(event) {
+  const button = event.target.closest("button[data-sync-page-offset]");
+  if (!button) return;
+  syncHistoryOffset = Math.max(0, parseInt(button.dataset.syncPageOffset, 10) || 0);
+  button.disabled = true;
+  try {
+    await loadSyncJobHistory();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function onSyncJobHistoryClick(event) {
+  const button = event.target.closest("button[data-delete-sync-job], button[data-sync-history-source]");
+  if (!button) return;
+  if (button.dataset.syncHistorySource) {
+    const filter = document.querySelector("#sync-source-filter");
+    if (filter) {
+      filter.value = button.dataset.syncHistorySource;
+    }
+    syncHistoryOffset = 0;
+    await loadSyncJobHistory();
+    return;
+  }
+  const sourceID = button.dataset.sourceId || "";
+  const jobID = button.dataset.deleteSyncJob || "";
+  if (!sourceID || !jobID) return;
+  button.disabled = true;
+  try {
+    await request(`/api/sources/${encodeURIComponent(sourceID)}/jobs/${encodeURIComponent(jobID)}`, { method: "DELETE" });
+    await loadSyncJobHistory();
+    await loadStatus();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadSyncJobHistory() {
+  const container = document.querySelector("#sync-job-history");
+  const pagination = document.querySelector("#sync-job-pagination");
+  if (!container || !pagination) return;
+  const form = document.querySelector("#sync-task-filters");
+  const data = form ? new FormData(form) : new FormData();
+  const limit = parseInt(data.get("limit"), 10) || SYNC_HISTORY_PAGE_SIZE;
+  const params = new URLSearchParams();
+  params.set("kind", "sync_source");
+  params.set("limit", String(limit));
+  params.set("offset", String(syncHistoryOffset));
+  const sourceID = String(data.get("source_id") || "").trim();
+  const status = String(data.get("status") || "").trim();
+  if (sourceID) params.set("source_id", sourceID);
+  if (status) params.set("status", status);
+  const body = await request(`/api/jobs?${params.toString()}`);
+  container.innerHTML = renderSyncJobHistory(body.jobs || []);
+  pagination.innerHTML = renderSyncPagination(body);
+}
+
+function renderSyncJobHistory(jobs) {
+  if (!jobs.length) {
+    return `<p class="muted">${escapeHTML(t("jobs.empty"))}</p>`;
+  }
+  return jobs.map(renderSyncJobRow).join("");
+}
+
+function renderSyncJobRow(job) {
+  const source = sourcesByID.get(job.source_id);
+  const sourceName = source?.name || job.source_id || "";
+  const payload = parsePayload(job.payload_json);
+  const result = parsePayload(job.result_json);
+  const summary = { ...payload, ...result };
+  const brokenLinks = Array.isArray(summary.broken_links) ? summary.broken_links : [];
+  const error = String(job.last_error || "").trim();
+  return `
+    <div class="job-row">
+      <div class="job-main">
+        <strong>${escapeHTML(formatJobStatus(job.status))}</strong>
+        <small>${escapeHTML(formatJobTime(job.updated_at || job.created_at))}</small>
+      </div>
+      <small>${escapeHTML(sourceName)} · ${escapeHTML(job.id || "")}</small>
+      <div class="job-meta">
+        <span>${escapeHTML(t("jobs.documents"))}: ${escapeHTML(summary.documents ?? 0)}</span>
+        <span>${escapeHTML(t("jobs.broken_links"))}: ${escapeHTML(brokenLinks.length)}</span>
+        <span>${escapeHTML(t("sync.attempts"))}: ${escapeHTML(job.attempts ?? 0)}</span>
+      </div>
+      ${error ? `<p class="job-error">${escapeHTML(error)}</p>` : ""}
+      ${brokenLinks.length ? renderBrokenLinks(brokenLinks) : ""}
+      <div class="item-actions">
+        <button type="button" data-sync-history-source="${escapeAttr(job.source_id || "")}">${escapeHTML(t("sync.filter_source"))}</button>
+        <button type="button" data-source-id="${escapeAttr(job.source_id || "")}" data-delete-sync-job="${escapeAttr(job.id || "")}">${escapeHTML(t("jobs.delete"))}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderSyncPagination(body) {
+  const limit = body.limit || SYNC_HISTORY_PAGE_SIZE;
+  const offset = body.offset || 0;
+  const total = body.total || 0;
+  const count = Array.isArray(body.jobs) ? body.jobs.length : 0;
+  if (total <= limit && offset === 0) return "";
+  const start = total === 0 ? 0 : offset + 1;
+  const end = Math.min(offset + count, total);
+  const prevOffset = Math.max(0, offset - limit);
+  const nextOffset = offset + limit;
+  return `
+    <button type="button" data-sync-page-offset="${prevOffset}" ${offset > 0 ? "" : "disabled"}>${escapeHTML(t("artifacts.prev_page"))}</button>
+    <span>${escapeHTML(t("artifacts.showing", { start, end, total }))}</span>
+    <button type="button" data-sync-page-offset="${nextOffset}" ${body.has_more ? "" : "disabled"}>${escapeHTML(t("artifacts.next_page"))}</button>
+  `;
+}
+
+async function loadSyncSchedules() {
+  const container = document.querySelector("#sync-schedules");
+  if (!container) return;
+  const body = await request("/api/sync-schedules");
+  const schedules = body.schedules || [];
+  syncSchedulesBySourceID = new Map(schedules.map((schedule) => [schedule.source_id, schedule]));
+  container.innerHTML = schedules.length ? schedules.map(renderSyncSchedule).join("") : `<p class="muted">${escapeHTML(t("sync.schedules.empty"))}</p>`;
+}
+
+function renderSyncSchedule(schedule) {
+  const statusParts = [];
+  statusParts.push(schedule.enabled ? formatSourceSchedule(schedule.sync_schedule) : t("source.schedule.manual"));
+  if (schedule.in_progress) statusParts.push(t("sync.status.running"));
+  if (schedule.paused) statusParts.push(t("source.status.credential_required"));
+  return `
+    <div class="item">
+      <strong>${escapeHTML(schedule.source_name || schedule.source_id)}</strong>
+      <small>${escapeHTML(schedule.source_kind || "")} · ${escapeHTML(schedule.source_id || "")}</small>
+      <div class="source-meta">
+        <span>${escapeHTML(t("source.schedule"))}: ${escapeHTML(statusParts.join(" · "))}</span>
+        <span>${escapeHTML(t("sync.last_run"))}: ${escapeHTML(formatJobTime(schedule.last_run_at) || "-")}</span>
+        <span>${escapeHTML(t("sync.next_run"))}: ${escapeHTML(formatJobTime(schedule.next_run_at) || "-")}</span>
+      </div>
+      ${schedule.last_error ? `<p class="job-error">${escapeHTML(schedule.last_error)}</p>` : ""}
+      <div class="source-actions">
+        <button type="button" data-run-schedule="${escapeAttr(schedule.source_id || "")}" ${schedule.in_progress ? "disabled" : ""}>${escapeHTML(t("sync.run_now"))}</button>
+        <button type="button" data-edit-schedule="${escapeAttr(schedule.source_id || "")}">${escapeHTML(t("sync.schedule.edit"))}</button>
+        <button type="button" data-delete-schedule="${escapeAttr(schedule.source_id || "")}" ${schedule.enabled ? "" : "disabled"}>${escapeHTML(t("sync.schedule.delete"))}</button>
+      </div>
+    </div>
+  `;
+}
+
+function openSyncScheduleDialog(schedule = null) {
+  const dialog = document.querySelector("#sync-schedule-dialog");
+  const form = document.querySelector("#sync-schedule-form");
+  if (!dialog || !form) return;
+  populateSyncSourceSelects();
+  populateCredentialSelect();
+  form.reset();
+  if (schedule) {
+    setFormValue(form, "source_id", schedule.source_id);
+    setFormValue(form, "sync_schedule", normalizeSourceScheduleValue(schedule.sync_schedule) || "daily");
+    setFormValue(form, "cookie_credential_id", schedule.cookie_credential_id);
+  }
+  updateSyncScheduleDialogMode(Boolean(schedule));
+  updateSyncScheduleCredentialField();
+  if (dialog.showModal) {
+    dialog.showModal();
+  }
+}
+
+function closeSyncScheduleDialog() {
+  const dialog = document.querySelector("#sync-schedule-dialog");
+  if (dialog?.open) {
+    dialog.close();
+  }
+}
+
+function updateSyncScheduleDialogMode(editing) {
+  const title = document.querySelector("[data-sync-schedule-dialog-title]");
+  const submit = document.querySelector("[data-sync-schedule-submit-label]");
+  const key = editing ? "sync.schedule.edit" : "sync.schedule.add";
+  if (title) {
+    title.dataset.i18n = key;
+    title.textContent = t(key);
+  }
+  if (submit) {
+    submit.dataset.i18n = "sync.schedule.save";
+    submit.textContent = t("sync.schedule.save");
+  }
+}
+
+function updateSyncScheduleCredentialField() {
+  const form = document.querySelector("#sync-schedule-form");
+  const sourceID = form?.elements.source_id?.value || "";
+  const source = sourcesByID.get(sourceID);
+  const field = form?.querySelector('select[name="cookie_credential_id"]')?.closest(".field");
+  if (!field) return;
+  field.hidden = source?.kind !== "confluence";
+}
+
+async function onSyncSchedulesClick(event) {
+  const button = event.target.closest("button[data-edit-schedule], button[data-delete-schedule], button[data-run-schedule]");
+  if (!button) return;
+  const sourceID = button.dataset.editSchedule || button.dataset.deleteSchedule || button.dataset.runSchedule || "";
+  if (!sourceID) return;
+  if (button.dataset.editSchedule) {
+    openSyncScheduleDialog(syncSchedulesBySourceID.get(sourceID));
+    return;
+  }
+  button.disabled = true;
+  try {
+    if (button.dataset.deleteSchedule) {
+      await request(`/api/sync-schedules/${encodeURIComponent(sourceID)}`, { method: "DELETE" });
+      await loadSources();
+    } else if (button.dataset.runSchedule) {
+      const schedule = syncSchedulesBySourceID.get(sourceID) || {};
+      await request("/api/sync-tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          source_id: sourceID,
+          cookie_credential_id: selectedCredentialForSource(sourceID, schedule.cookie_credential_id),
+        }),
+      });
+    }
+    await loadSyncTasksView();
+    await loadStatus();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function onSyncScheduleSubmit(event) {
+  event.preventDefault();
+  const formElement = event.currentTarget;
+  const form = new FormData(formElement);
+  const sourceID = String(form.get("source_id") || "").trim();
+  const payload = {
+    source_id: sourceID,
+    sync_schedule: String(form.get("sync_schedule") || "").trim(),
+  };
+  const credentialID = selectedCredentialForSource(sourceID, String(form.get("cookie_credential_id") || "").trim());
+  if (credentialID) {
+    payload.cookie_credential_id = credentialID;
+  }
+  try {
+    await request("/api/sync-schedules", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    closeSyncScheduleDialog();
+    await loadSources();
+    await loadSyncSchedules();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function selectedCredentialForSource(sourceID, credentialID) {
+  const source = sourcesByID.get(sourceID);
+  if (source?.kind !== "confluence") {
+    return "";
+  }
+  return credentialsByID.has(credentialID) ? credentialID : "";
+}
+
+function formatJobStatus(status) {
+  const key = `sync.status.${String(status || "").trim()}`;
+  const label = t(key);
+  return label === key ? humanizeToken(status) : label;
 }
 
 function parsePayload(value) {
@@ -573,6 +1306,13 @@ function formatJobTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value || "";
   return date.toLocaleString(currentLang === "zh-CN" ? "zh-CN" : "en-US");
+}
+
+function humanizeToken(value) {
+  return String(value || "")
+    .trim()
+    .replaceAll("_", " ")
+    .replace(/\s+/g, " ");
 }
 
 function renderSourceArtifacts(body, page, limit) {
@@ -688,6 +1428,8 @@ async function onSearchSubmit(event) {
       const path = [hit.document_title, hit.heading_path].filter(Boolean).join(" / ");
       const tags = hit.profile?.top_tags || [];
       const matchedFields = hit.query_match?.matched_fields || [];
+      const relationMatches = renderRelationMatches(hit.relation_matches || []);
+      const scoreBreakdown = renderScoreBreakdown(hit.score_breakdown, hit.rank);
       item.innerHTML = `
         <a class="result-title" href="${escapeAttr(hit.document_url || "#")}" ${hit.document_url ? 'target="_blank" rel="noreferrer"' : ""}>${escapeHTML(title)}</a>
         <div class="result-url">${escapeHTML(url)}</div>
@@ -695,6 +1437,8 @@ async function onSearchSubmit(event) {
         ${hit.desc ? `<p class="result-desc">${escapeHTML(hit.desc)}</p>` : ""}
         ${tags.length ? `<div class="result-tags">${tags.slice(0, 6).map((tag) => `<span>${escapeHTML(tag)}</span>`).join("")}</div>` : ""}
         ${matchedFields.length ? `<small class="result-match">${escapeHTML(t("search.matched_fields"))}: ${escapeHTML(matchedFields.join(", "))}</small>` : ""}
+        ${relationMatches}
+        ${scoreBreakdown}
         <p class="result-snippet">${safeSnippetHTML(hit.snippet || hit.content || "")}</p>
         <div class="result-actions">
           <button type="button" data-feedback-canonical>${escapeHTML(t("feedback.canonical"))}</button>
@@ -710,6 +1454,68 @@ async function onSearchSubmit(event) {
     container.innerHTML = "";
     alert(error.message);
   }
+}
+
+function renderRelationMatches(matches) {
+  if (!matches.length) return "";
+  return `
+    <div class="relation-match-list">
+      <strong>${escapeHTML(t("search.relation_matches"))}</strong>
+      ${matches.slice(0, 4).map((match) => `
+        <div class="relation-match">
+          <span>${escapeHTML(match.relation_type || "")}</span>
+          <small>${escapeHTML(match.effect || "context_link")} · ${escapeHTML(match.direction || "")} · ${escapeHTML(match.target_document_id || "")}</small>
+          ${match.reason ? `<p>${escapeHTML(match.reason)}</p>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderScoreBreakdown(score, rank) {
+  if (!score && rank === undefined) return "";
+  const total = Number(score?.total ?? rank ?? 0);
+  if (!score) {
+    return `<div class="result-score"><span>Total ${formatScore(total)}</span></div>`;
+  }
+  const parts = [
+    ["unicode", score.unicode_bm25_boost],
+    ["trigram", score.trigram_bm25_boost],
+    ["title", score.title_boost],
+    ["section", score.section_boost],
+    ["symbol", score.symbol_boost],
+    ["exact", score.exact_match_boost],
+    ["canonical", score.canonical_boost],
+    ["coverage", score.coverage_boost],
+    ["fallback", score.fallback_boost],
+  ].filter(([, value]) => Number(value || 0) !== 0);
+  const terms = score.matched_terms || [];
+  const symbols = score.matched_symbols || [];
+  const fields = score.matched_fields || [];
+  return `
+    <details class="result-score">
+      <summary>
+        <span>Score</span>
+        <strong>${formatScore(total)}</strong>
+        ${parts.length ? `<small>${parts.map(([name, value]) => `${escapeHTML(name)} ${formatScore(value)}`).join(" · ")}</small>` : ""}
+      </summary>
+      <div class="score-grid">
+        ${parts.map(([name, value]) => `
+          <span>${escapeHTML(name)}</span>
+          <strong>${formatScore(value)}</strong>
+        `).join("")}
+      </div>
+      ${fields.length ? `<p><b>fields</b> ${escapeHTML(fields.join(", "))}</p>` : ""}
+      ${symbols.length ? `<p><b>symbols</b> ${escapeHTML(symbols.slice(0, 12).join(", "))}</p>` : ""}
+      ${terms.length ? `<p><b>terms</b> ${escapeHTML(terms.slice(0, 16).join(", "))}</p>` : ""}
+    </details>
+  `;
+}
+
+function formatScore(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return "0";
+  return n.toFixed(Math.abs(n) >= 10 ? 1 : 2);
 }
 
 async function onSearchFeedbackClick(event) {
@@ -732,6 +1538,98 @@ async function onSearchFeedbackClick(event) {
   } catch (error) {
     button.disabled = false;
     button.textContent = previous;
+    alert(error.message);
+  }
+}
+
+async function onKnowledgeRelationProposalFiltersSubmit(event) {
+  event.preventDefault();
+  await loadKnowledgeRelationProposals();
+}
+
+async function loadKnowledgeRelationProposals() {
+  const container = document.querySelector("#relation-proposals");
+  const form = document.querySelector("#relation-proposal-filters");
+  if (!container || !form) return;
+  container.innerHTML = `<p class="muted">${escapeHTML(t("governance.loading"))}</p>`;
+  const data = new FormData(form);
+  const params = new URLSearchParams();
+  const status = String(data.get("status") || "pending").trim();
+  const documentId = String(data.get("document_id") || "").trim();
+  if (status) params.set("status", status);
+  if (documentId) params.set("document_id", documentId);
+  params.set("limit", "100");
+  try {
+    const body = await request(`/api/knowledge-relation-proposals?${params.toString()}`);
+    const proposals = body.proposals || [];
+    if (!proposals.length) {
+      container.innerHTML = `<p class="muted">${escapeHTML(t("governance.empty"))}</p>`;
+      return;
+    }
+    container.innerHTML = proposals.map(renderKnowledgeRelationProposal).join("");
+  } catch (error) {
+    container.innerHTML = "";
+    alert(error.message);
+  }
+}
+
+function renderKnowledgeRelationProposal(proposal) {
+  const evidence = formatEvidence(proposal.evidence_json);
+  const pending = proposal.status === "pending";
+  return `
+    <div class="item relation-proposal" data-proposal-id="${escapeAttr(proposal.id)}">
+      <div class="relation-proposal-main">
+        <strong>${escapeHTML(proposal.relation_type)} · ${escapeHTML(t(`governance.status.${proposal.status}`))}</strong>
+        <small>${escapeHTML(proposal.from_document_id)} -> ${escapeHTML(proposal.to_document_id)}</small>
+        <small>${escapeHTML(proposal.proposed_effect || "context_link")} · ${escapeHTML(proposal.direction || "directed")} · ${escapeHTML(proposal.created_by_type || "")}${proposal.created_by_ref ? `:${escapeHTML(proposal.created_by_ref)}` : ""}</small>
+      </div>
+      <p>${escapeHTML(proposal.reason || "")}</p>
+      ${proposal.from_anchor || proposal.to_anchor ? `<small>${escapeHTML([proposal.from_anchor, proposal.to_anchor].filter(Boolean).join(" -> "))}</small>` : ""}
+      ${evidence ? `<pre class="relation-evidence">${escapeHTML(evidence)}</pre>` : ""}
+      ${proposal.review_note ? `<small>${escapeHTML(t("governance.review_note"))}: ${escapeHTML(proposal.review_note)}</small>` : ""}
+      ${pending ? `
+        <div class="result-actions">
+          <button type="button" data-proposal-approve>${escapeHTML(t("governance.approve"))}</button>
+          <button type="button" data-proposal-reject>${escapeHTML(t("governance.reject"))}</button>
+        </div>
+      ` : ""}
+    </div>
+  `;
+}
+
+function formatEvidence(raw) {
+  raw = String(raw || "").trim();
+  if (!raw || raw === "{}") return "";
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+async function onKnowledgeRelationProposalClick(event) {
+  const approve = event.target.closest("button[data-proposal-approve]");
+  const reject = event.target.closest("button[data-proposal-reject]");
+  if (!approve && !reject) return;
+  const item = event.target.closest("[data-proposal-id]");
+  const proposalId = item?.dataset.proposalId || "";
+  if (!proposalId) return;
+  const action = approve ? "approve" : "reject";
+  const note = window.prompt(t(action === "approve" ? "governance.approve_note" : "governance.reject_note"), "");
+  if (note === null) return;
+  const button = approve || reject;
+  button.disabled = true;
+  try {
+    await request(`/api/knowledge-relation-proposals/${encodeURIComponent(proposalId)}/${action}`, {
+      method: "POST",
+      body: JSON.stringify({
+        reviewed_by: "web",
+        review_note: note,
+      }),
+    });
+    await loadKnowledgeRelationProposals();
+  } catch (error) {
+    button.disabled = false;
     alert(error.message);
   }
 }

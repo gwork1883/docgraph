@@ -38,7 +38,9 @@ func run(args []string) error {
 		fmt.Println(version)
 		return nil
 	case "init":
-		return runInit(args[2:])
+		return runMigrate(args[2:])
+	case "migrate":
+		return runMigrate(args[2:])
 	case "serve":
 		return runServe(args[2:])
 	case "status":
@@ -65,15 +67,15 @@ func run(args []string) error {
 	}
 }
 
-func runInit(args []string) error {
-	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+func runMigrate(args []string) error {
+	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config file path")
 	dataDir := fs.String("data", "", "data directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, _, err := loadOrCreateDefaultConfig(*cfgPath)
 	if err != nil {
 		return err
 	}
@@ -82,7 +84,7 @@ func runInit(args []string) error {
 		cfg.Storage.DSN = "sqlite://" + filepath.ToSlash(filepath.Join(*dataDir, "docgraph.db"))
 	}
 
-	return app.Init(context.Background(), cfg)
+	return app.Migrate(context.Background(), cfg)
 }
 
 func runServe(args []string) error {
@@ -95,7 +97,7 @@ func runServe(args []string) error {
 		return err
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, configPath, err := loadOrCreateDefaultConfig(*cfgPath)
 	if err != nil {
 		return err
 	}
@@ -114,7 +116,33 @@ func runServe(args []string) error {
 	defer stop()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if configPath != "" && *cfgPath == "" {
+		logger.Info("using config", "path", configPath)
+	}
 	return app.Serve(ctx, cfg, logger)
+}
+
+func loadOrCreateDefaultConfig(explicitPath string) (config.Config, string, error) {
+	if explicitPath != "" {
+		cfg, err := config.Load(explicitPath)
+		return cfg, explicitPath, err
+	}
+
+	if _, err := os.Stat(config.DefaultPath); err == nil {
+		cfg, err := config.Load(config.DefaultPath)
+		return cfg, config.DefaultPath, err
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return config.Config{}, "", err
+	}
+
+	cfg, err := config.DefaultWithTokenAuth()
+	if err != nil {
+		return config.Config{}, "", err
+	}
+	if err := config.Write(config.DefaultPath, cfg); err != nil {
+		return config.Config{}, "", err
+	}
+	return cfg, config.DefaultPath, nil
 }
 
 func runStatus(args []string) error {
@@ -137,7 +165,7 @@ func runStatus(args []string) error {
 	status, err := app.Status(context.Background(), cfg)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("database is not initialized; run docgraph init")
+			return fmt.Errorf("database is not initialized; run docgraph migrate")
 		}
 		return err
 	}
@@ -172,13 +200,13 @@ func runMCP(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := storage.Open(ctx, cfg.Storage.DSN)
+	store, err := storage.OpenExisting(ctx, cfg.Storage.DSN)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
 
-	if err := store.Migrate(ctx); err != nil {
+	if err := store.CheckSchema(ctx); err != nil {
 		return err
 	}
 
@@ -190,13 +218,14 @@ func printUsage() {
 
 Usage:
   docgraph version
-  docgraph init [--config docgraph.yaml] [--data ./.docgraph]
+  docgraph migrate [--config docgraph.yaml] [--data ./.docgraph]
+  docgraph init [--config docgraph.yaml] [--data ./.docgraph] (alias for migrate)
   docgraph serve [--config docgraph.yaml] [--host 127.0.0.1] [--port 8787] [--data ./.docgraph]
   docgraph status [--config docgraph.yaml] [--data ./.docgraph]
   docgraph mcp [--config docgraph.yaml] [--data ./.docgraph]
-  docgraph source add --name "Docs" --dsn /path/to/docs [--data ./.docgraph]
+  docgraph source add --name "Docs" --dsn /path/to/docs [--sync-schedule hourly] [--data ./.docgraph]
   docgraph source list [--data ./.docgraph]
-  docgraph source update --id src_xxx [--name "Docs"] [--dsn /path/to/docs] [--product Product] [--module Module] [--data ./.docgraph]
+  docgraph source update --id src_xxx [--name "Docs"] [--dsn /path/to/docs] [--product Product] [--module Module] [--sync-schedule manual] [--data ./.docgraph]
   docgraph source delete --id src_xxx [--data ./.docgraph]
   docgraph source sync --id src_xxx [--data ./.docgraph]
   docgraph source jobs --id src_xxx [--limit 20] [--data ./.docgraph]

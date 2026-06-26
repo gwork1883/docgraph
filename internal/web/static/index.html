@@ -4,16 +4,35 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>DocGraph</title>
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="styles.css">
   </head>
   <body>
+    <section id="auth-gate" class="auth-gate" hidden>
+      <form id="auth-form" class="auth-panel">
+        <img class="auth-mark" src="icon.png" alt="DocGraph" width="48" height="48">
+        <h1 data-i18n="auth.title">DocGraph Login</h1>
+        <p data-i18n="auth.description">Enter the server access token to continue.</p>
+        <label class="field">
+          <span class="field-label">
+            <span data-i18n="auth.token">Access Token</span>
+            <span class="field-state required" data-i18n="field.required">Required</span>
+          </span>
+          <input id="auth-token" name="token" type="password" autocomplete="current-password" required data-i18n-placeholder="auth.token.placeholder" placeholder="X-DocGraph-Token">
+        </label>
+        <p id="auth-message" class="auth-message" role="status"></p>
+        <button type="submit" data-i18n="auth.continue">Continue</button>
+      </form>
+    </section>
     <div class="app-shell">
       <aside class="sidebar" aria-label="Primary">
-        <img class="brand-mark" src="/icon.png" alt="DocGraph" width="48" height="48">
+        <img class="brand-mark" src="icon.png" alt="DocGraph" width="48" height="48">
         <nav class="nav">
           <button type="button" class="nav-item active" data-route="dashboard" data-i18n="nav.dashboard">Dashboard</button>
           <button type="button" class="nav-item" data-route="connectors" data-i18n="nav.connectors">Connectors</button>
+          <button type="button" class="nav-item" data-route="sync-tasks" data-i18n="nav.sync_tasks">Sync Tasks</button>
+          <button type="button" class="nav-item" data-route="credentials" data-i18n="nav.credentials">Credentials</button>
           <button type="button" class="nav-item" data-route="search" data-i18n="nav.search">Search</button>
+          <button type="button" class="nav-item" data-route="governance" data-i18n="nav.governance">Governance</button>
           <button type="button" class="nav-item" data-route="nodes" data-i18n="nav.nodes">Nodes</button>
         </nav>
       </aside>
@@ -32,6 +51,7 @@
             </select>
           </label>
           <span id="health" class="status" data-i18n="health.checking">Checking</span>
+          <button id="logout-button" class="secondary-button auth-logout" type="button" data-i18n="auth.logout" hidden>Logout</button>
         </div>
       </header>
 
@@ -122,6 +142,20 @@
               </span>
               <input name="module_hint" placeholder="Benefits" data-i18n-placeholder="source.module.placeholder">
               <small class="field-help" data-i18n="source.module.help"></small>
+            </label>
+            <label class="field" data-kinds="all">
+              <span class="field-label">
+                <span data-i18n="source.schedule">Schedule</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <select name="sync_schedule">
+                <option value="" data-i18n="source.schedule.manual">Manual</option>
+                <option value="hourly" data-i18n="source.schedule.hourly">Hourly</option>
+                <option value="daily" data-i18n="source.schedule.daily">Daily</option>
+                <option value="weekly" data-i18n="source.schedule.weekly">Weekly</option>
+                <option value="every 6h" data-i18n="source.schedule.every_6h">Every 6h</option>
+              </select>
+              <small class="field-help" data-i18n="source.schedule.help">Manual sources sync only when you click Sync.</small>
             </label>
             <label class="field" data-kinds="git">
               <span class="field-label">
@@ -253,6 +287,16 @@
               </span>
               <input name="bearer_token" type="password" autocomplete="off" placeholder="eyJ...">
             </label>
+            <label class="field" data-kinds="confluence">
+              <span class="field-label">
+                <span data-i18n="source.cookie_credential">Unified Cookie</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <select name="cookie_credential_id">
+                <option value="" data-i18n="source.cookie_credential.none">Do not use a unified cookie</option>
+              </select>
+              <small class="field-help" data-i18n="source.cookie_credential.help">Use a centrally managed Confluence cookie for this source.</small>
+            </label>
             <label class="field" data-kinds="confluence webdocs">
               <span class="field-label">
                 <span data-i18n="source.cookie">Cookie</span>
@@ -289,6 +333,157 @@
         </article>
       </section>
 
+      <section class="view" data-view="sync-tasks">
+        <div id="sync-task-tabs" class="tab-bar" role="tablist" aria-label="Sync tasks">
+          <button type="button" class="tab-button active" data-sync-tab="history" role="tab" aria-selected="true" data-i18n="sync.tab.history">History</button>
+          <button type="button" class="tab-button" data-sync-tab="schedules" role="tab" aria-selected="false" data-i18n="sync.tab.schedules">Schedules</button>
+        </div>
+        <div class="sync-tab-panels">
+          <article class="panel wide sync-tab-panel active" data-sync-tab-panel="history">
+            <div class="section-heading">
+              <h2 data-i18n="sync.history.title">Sync History</h2>
+              <button id="sync-history-refresh" type="button" data-i18n="sync.refresh">Refresh</button>
+            </div>
+            <form id="sync-task-filters" class="form sync-filter-form">
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="sync.source">Source</span>
+                  <span class="field-state optional" data-i18n="field.optional">Optional</span>
+                </span>
+                <select id="sync-source-filter" name="source_id">
+                  <option value="" data-i18n="sync.source.all">All sources</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="sync.status">Status</span>
+                  <span class="field-state optional" data-i18n="field.optional">Optional</span>
+                </span>
+                <select name="status">
+                  <option value="" data-i18n="sync.status.all">All statuses</option>
+                  <option value="queued" data-i18n="sync.status.queued">Queued</option>
+                  <option value="running" data-i18n="sync.status.running">Running</option>
+                  <option value="completed" data-i18n="sync.status.completed">Completed</option>
+                  <option value="failed" data-i18n="sync.status.failed">Failed</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="sync.page_size">Page Size</span>
+                  <span class="field-state optional" data-i18n="field.optional">Optional</span>
+                </span>
+                <select name="limit">
+                  <option value="10">10</option>
+                  <option value="20" selected>20</option>
+                  <option value="50">50</option>
+                </select>
+              </label>
+              <button type="submit" data-i18n="sync.apply_filters">Apply</button>
+            </form>
+            <div id="sync-job-history" class="job-list"></div>
+            <div id="sync-job-pagination" class="artifact-pagination"></div>
+          </article>
+
+          <article class="panel wide sync-tab-panel" data-sync-tab-panel="schedules">
+            <div class="section-heading">
+              <h2 data-i18n="sync.schedules.title">Scheduled Syncs</h2>
+              <button id="sync-schedule-add-button" type="button" data-i18n="sync.schedule.add">Add Schedule</button>
+            </div>
+            <dialog id="sync-schedule-dialog" class="modal">
+              <div class="modal-panel">
+                <div class="modal-header">
+                  <h2 data-sync-schedule-dialog-title data-i18n="sync.schedule.add">Add Schedule</h2>
+                  <button class="secondary-button" type="button" data-close-sync-schedule-dialog data-i18n="source.close">Close</button>
+                </div>
+                <form id="sync-schedule-form" class="form">
+                  <label class="field">
+                    <span class="field-label">
+                      <span data-i18n="sync.source">Source</span>
+                      <span class="field-state required" data-i18n="field.required">Required</span>
+                    </span>
+                    <select name="source_id" required></select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">
+                      <span data-i18n="source.schedule">Schedule</span>
+                      <span class="field-state required" data-i18n="field.required">Required</span>
+                    </span>
+                    <select name="sync_schedule" required>
+                      <option value="hourly" data-i18n="source.schedule.hourly">Hourly</option>
+                      <option value="daily" data-i18n="source.schedule.daily">Daily</option>
+                      <option value="weekly" data-i18n="source.schedule.weekly">Weekly</option>
+                      <option value="every 6h" data-i18n="source.schedule.every_6h">Every 6h</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">
+                      <span data-i18n="source.cookie_credential">Unified Cookie</span>
+                      <span class="field-state optional" data-i18n="field.optional">Optional</span>
+                    </span>
+                    <select name="cookie_credential_id">
+                      <option value="" data-i18n="source.cookie_credential.none">Do not use a unified cookie</option>
+                    </select>
+                  </label>
+                  <button type="submit" data-sync-schedule-submit-label data-i18n="sync.schedule.save">Save Schedule</button>
+                </form>
+              </div>
+            </dialog>
+            <div id="sync-schedules" class="list"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" data-view="credentials">
+        <article class="panel wide">
+          <div class="section-heading">
+            <h2 data-i18n="credentials.title">Confluence Cookie Credentials</h2>
+            <button id="credential-add-button" type="button" data-i18n="credentials.add">Add Cookie</button>
+          </div>
+          <dialog id="credential-dialog" class="modal">
+            <div class="modal-panel">
+              <div class="modal-header">
+                <h2 data-credential-dialog-title data-i18n="credentials.add">Add Cookie</h2>
+                <button class="secondary-button" type="button" data-close-credential-dialog data-i18n="source.close">Close</button>
+              </div>
+              <form id="credential-form" class="form">
+                <input name="credential_id" type="hidden">
+                <label class="field">
+                  <span class="field-label">
+                    <span data-i18n="credentials.name">Name</span>
+                    <span class="field-state required" data-i18n="field.required">Required</span>
+                  </span>
+                  <input name="name" required placeholder="Company Wiki" data-i18n-placeholder="credentials.name.placeholder">
+                </label>
+                <label class="field">
+                  <span class="field-label">
+                    <span data-i18n="credentials.base_url">Base URL</span>
+                    <span class="field-state required" data-i18n="field.required">Required</span>
+                  </span>
+                  <input name="base_url" required placeholder="https://confluence.example/wiki">
+                </label>
+                <label class="field">
+                  <span class="field-label">
+                    <span data-i18n="credentials.cookie">Cookie</span>
+                    <span class="field-state required" data-i18n="field.required">Required</span>
+                  </span>
+                  <textarea name="cookie" rows="4" autocomplete="off" placeholder="SESSION=...; token=..."></textarea>
+                  <small class="field-help" data-i18n="credentials.cookie.help">Leave blank while editing to keep the existing cookie.</small>
+                </label>
+                <label class="field">
+                  <span class="field-label">
+                    <span data-i18n="credentials.notes">Notes</span>
+                    <span class="field-state optional" data-i18n="field.optional">Optional</span>
+                  </span>
+                  <input name="notes" placeholder="Zero Trust browser session">
+                </label>
+                <button type="submit" data-credential-submit-label data-i18n="credentials.add">Add Cookie</button>
+              </form>
+            </div>
+          </dialog>
+          <div id="credentials" class="list"></div>
+        </article>
+      </section>
+
       <section class="view" data-view="search">
         <div class="search-page">
           <div class="search-hero">
@@ -312,6 +507,39 @@
           <div id="search-summary" class="search-summary"></div>
           <div id="results" class="search-results"></div>
         </div>
+      </section>
+
+      <section class="view" data-view="governance">
+        <article class="panel wide">
+          <div class="section-heading">
+            <h2 data-i18n="governance.title">Knowledge Relation Approval</h2>
+            <button id="relation-proposals-refresh" type="button" data-i18n="governance.refresh">Refresh</button>
+          </div>
+          <form id="relation-proposal-filters" class="form inline-form">
+            <label class="field">
+              <span class="field-label">
+                <span data-i18n="governance.status">Status</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <select name="status">
+                <option value="pending" data-i18n="governance.status.pending">Pending</option>
+                <option value="all" data-i18n="governance.status.all">All</option>
+                <option value="approved" data-i18n="governance.status.approved">Approved</option>
+                <option value="rejected" data-i18n="governance.status.rejected">Rejected</option>
+                <option value="cancelled" data-i18n="governance.status.cancelled">Cancelled</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">
+                <span data-i18n="governance.document">Document</span>
+                <span class="field-state optional" data-i18n="field.optional">Optional</span>
+              </span>
+              <input name="document_id" placeholder="doc_xxx">
+            </label>
+            <button type="submit" data-i18n="governance.apply">Apply</button>
+          </form>
+          <div id="relation-proposals" class="list relation-proposals"></div>
+        </article>
       </section>
 
       <section class="view" data-view="nodes">
@@ -418,6 +646,6 @@
       </section>
       </main>
     </div>
-    <script src="/main.js"></script>
+    <script src="main.js"></script>
   </body>
 </html>

@@ -28,7 +28,7 @@ Search provides local retrieval across document sections and generated retrieval
 - MCP tools: `doc_search`, `doc_context`, `doc_get_node`, `doc_get_section`, `doc_related`, and `doc_impact`.
 - Document-backed knowledge graph with nodes, edges, provenance, sync history, and feedback markers.
 - Chinese-aware retrieval profile generation for mixed Chinese/English internal docs.
-- Optional token authentication for Web/API/SSE endpoints.
+- Optional token authentication for Web/API/MCP endpoints.
 
 ## How It Works
 
@@ -46,11 +46,12 @@ All data stays in the configured local data directory unless you explicitly expo
 
 ```bash
 go build -buildvcs=false -o bin/docgraph ./cmd/docgraph
-./bin/docgraph init --data ./.docgraph
-./bin/docgraph serve --data ./.docgraph --host 127.0.0.1 --port 8787
+./bin/docgraph serve
 ```
 
-Open `http://127.0.0.1:8787`, then add and sync documentation sources from the Web UI.
+The first `serve` run creates `docgraph.yaml`, generates a local admin token, migrates the SQLite database, and starts the server. Open `http://127.0.0.1:8787`, enter the token from `docgraph.yaml`, then add and sync documentation sources from the Web UI. `docgraph init` remains available when you want to pre-create or check the config and database without starting the server.
+
+When serving DocGraph behind a reverse proxy path prefix, set `server.web_prefix` in `docgraph.yaml`. For example, `web_prefix: docgraph` serves the Web UI, REST API, and HTTP MCP endpoints under `/docgraph/`; an empty value keeps the default root routes. See `scripts/nginx-docgraph.conf` and `scripts/nginx-docgraph-location.conf` for nginx examples that preserve the prefix when proxying to DocGraph.
 
 You can also add a local documentation source from the CLI:
 
@@ -97,7 +98,9 @@ DocGraph supports stdio MCP:
 ./bin/docgraph mcp --data ./.docgraph
 ```
 
-HTTP/SSE MCP setup is documented in [docs/mcp-setup.md](docs/mcp-setup.md).
+Streamable HTTP MCP is available at `/mcp` when `docgraph serve` is running.
+Legacy HTTP/SSE compatibility endpoints remain available at `/mcp/sse`. Setup
+details are documented in [docs/mcp-setup.md](docs/mcp-setup.md).
 
 ## Runtime Dependencies
 

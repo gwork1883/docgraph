@@ -61,6 +61,18 @@ type ResponseError struct {
 	Message string `json:"message"`
 }
 
+const (
+	protocolVersion2024 = "2024-11-05"
+	protocolVersion2025 = "2025-11-25"
+)
+
+var supportedProtocolVersions = map[string]bool{
+	protocolVersion2025: true,
+	"2025-06-18":        true,
+	"2025-03-26":        true,
+	protocolVersion2024: true,
+}
+
 func (s *Server) Run(ctx context.Context) error {
 	scanner := bufio.NewScanner(s.in)
 	writer := bufio.NewWriter(s.out)
@@ -105,7 +117,7 @@ func handle(ctx context.Context, h *Handler, req Request) Response {
 	switch req.Method {
 	case "initialize":
 		resp.Result = map[string]any{
-			"protocolVersion": "2024-11-05",
+			"protocolVersion": negotiateProtocolVersion(req.Params),
 			"capabilities": map[string]any{
 				"tools": map[string]any{},
 			},
@@ -129,6 +141,22 @@ func handle(ctx context.Context, h *Handler, req Request) Response {
 	return resp
 }
 
+func negotiateProtocolVersion(params json.RawMessage) string {
+	if len(params) == 0 {
+		return protocolVersion2024
+	}
+	var init struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(params, &init); err != nil || strings.TrimSpace(init.ProtocolVersion) == "" {
+		return protocolVersion2024
+	}
+	if supportedProtocolVersions[init.ProtocolVersion] {
+		return init.ProtocolVersion
+	}
+	return protocolVersion2025
+}
+
 type toolCallParams struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
@@ -144,14 +172,16 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 	switch call.Name {
 	case "doc_search":
 		var args struct {
-			Query                  string `json:"query"`
-			Limit                  int    `json:"limit"`
-			MaxSearches            int    `json:"max_searches"`
-			MaxResults             int    `json:"max_results"`
-			MaxSectionsPerDocument int    `json:"max_sections_per_document"`
-			ProfileDetail          string `json:"profile_detail"`
-			MaxCharsPerResult      int    `json:"max_chars_per_result"`
-			Detail                 string `json:"detail"`
+			Query                  string   `json:"query"`
+			Limit                  int      `json:"limit"`
+			MaxSearches            int      `json:"max_searches"`
+			MaxResults             int      `json:"max_results"`
+			MaxSectionsPerDocument int      `json:"max_sections_per_document"`
+			ProfileDetail          string   `json:"profile_detail"`
+			MaxCharsPerResult      int      `json:"max_chars_per_result"`
+			Detail                 string   `json:"detail"`
+			UseRelationExpansion   *bool    `json:"use_relation_expansion"`
+			RelationTypes          []string `json:"relation_types"`
 		}
 		if err := json.Unmarshal(call.Arguments, &args); err != nil {
 			return nil, fmt.Errorf("invalid doc_search arguments: %w", err)
@@ -164,14 +194,21 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 		if detail == "" {
 			detail = "summary"
 		}
+		useRelationExpansion := true
+		if args.UseRelationExpansion != nil {
+			useRelationExpansion = *args.UseRelationExpansion
+		}
 		opts := storage.SearchOptions{
 			Query:                  args.Query,
 			Limit:                  clampBudget(maxResults, 8, 30),
-			MaxSearches:            clampBudget(args.MaxSearches, 3, 5),
+			MaxSearches:            clampBudget(args.MaxSearches, 5, 5),
 			MaxSectionsPerDocument: clampBudget(args.MaxSectionsPerDocument, 2, 5),
 			ProfileDetail:          strings.TrimSpace(args.ProfileDetail),
 			MaxCharsPerResult:      clampBudget(args.MaxCharsPerResult, 1000, 4000),
 			Detail:                 detail,
+			UseRelationExpansion:   useRelationExpansion,
+			RelationDepth:          1,
+			RelationTypes:          args.RelationTypes,
 		}
 		// In summary mode, profile_detail and max_chars_per_result are irrelevant
 		if detail == "summary" {
@@ -285,6 +322,99 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 			return nil, err
 		}
 		return toolResult(section), nil
+	case "doc_propose_relation":
+		if h.store == nil {
+			return nil, fmt.Errorf("graph storage is not configured")
+		}
+		var args struct {
+			RelationType   string          `json:"relation_type"`
+			FromDocumentID string          `json:"from_document_id"`
+			FromAnchor     string          `json:"from_anchor"`
+			ToDocumentID   string          `json:"to_document_id"`
+			ToAnchor       string          `json:"to_anchor"`
+			Direction      string          `json:"direction"`
+			Reason         string          `json:"reason"`
+			Evidence       json.RawMessage `json:"evidence"`
+			EvidenceJSON   string          `json:"evidence_json"`
+			ProposedEffect string          `json:"proposed_effect"`
+			Confidence     float64         `json:"confidence"`
+			CreatedByRef   string          `json:"created_by_ref"`
+		}
+		if err := json.Unmarshal(call.Arguments, &args); err != nil {
+			return nil, fmt.Errorf("invalid doc_propose_relation arguments: %w", err)
+		}
+		evidenceJSON := strings.TrimSpace(args.EvidenceJSON)
+		if evidenceJSON == "" && len(args.Evidence) > 0 {
+			evidenceJSON = string(args.Evidence)
+		}
+		proposal, err := h.store.CreateKnowledgeRelationProposal(ctx, storage.KnowledgeRelationProposalInput{
+			RelationType:   strings.TrimSpace(args.RelationType),
+			FromDocumentID: strings.TrimSpace(args.FromDocumentID),
+			FromAnchor:     strings.TrimSpace(args.FromAnchor),
+			ToDocumentID:   strings.TrimSpace(args.ToDocumentID),
+			ToAnchor:       strings.TrimSpace(args.ToAnchor),
+			Direction:      strings.TrimSpace(args.Direction),
+			Reason:         strings.TrimSpace(args.Reason),
+			EvidenceJSON:   evidenceJSON,
+			ProposedEffect: strings.TrimSpace(args.ProposedEffect),
+			Confidence:     args.Confidence,
+			CreatedByType:  "mcp_agent",
+			CreatedByRef:   strings.TrimSpace(args.CreatedByRef),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return toolResult(map[string]any{"proposal": proposal, "status": proposal.Status}), nil
+	case "doc_list_relation_proposals":
+		if h.store == nil {
+			return nil, fmt.Errorf("graph storage is not configured")
+		}
+		var args struct {
+			Status     string `json:"status"`
+			DocumentID string `json:"document_id"`
+			Limit      int    `json:"limit"`
+			Offset     int    `json:"offset"`
+		}
+		if err := json.Unmarshal(call.Arguments, &args); err != nil {
+			return nil, fmt.Errorf("invalid doc_list_relation_proposals arguments: %w", err)
+		}
+		proposals, err := h.store.ListKnowledgeRelationProposals(ctx, storage.KnowledgeRelationProposalListOptions{
+			Status:     strings.TrimSpace(args.Status),
+			DocumentID: strings.TrimSpace(args.DocumentID),
+			Limit:      clampBudget(args.Limit, 20, 100),
+			Offset:     args.Offset,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return toolResult(map[string]any{"proposals": proposals}), nil
+	case "doc_get_relation_context":
+		if h.store == nil {
+			return nil, fmt.Errorf("graph storage is not configured")
+		}
+		var args struct {
+			DocumentID      string   `json:"document_id"`
+			RelationTypes   []string `json:"relation_types"`
+			IncludeDisabled bool     `json:"include_disabled"`
+			Limit           int      `json:"limit"`
+		}
+		if err := json.Unmarshal(call.Arguments, &args); err != nil {
+			return nil, fmt.Errorf("invalid doc_get_relation_context arguments: %w", err)
+		}
+		documentID := strings.TrimSpace(args.DocumentID)
+		if documentID == "" {
+			return nil, fmt.Errorf("document_id is required")
+		}
+		relations, err := h.store.ListKnowledgeRelations(ctx, storage.KnowledgeRelationListOptions{
+			DocumentID:      documentID,
+			RelationTypes:   args.RelationTypes,
+			IncludeDisabled: args.IncludeDisabled,
+			Limit:           clampBudget(args.Limit, 20, 100),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return toolResult(map[string]any{"document_id": documentID, "relations": relations}), nil
 	default:
 		return nil, fmt.Errorf("unknown tool %q", call.Name)
 	}
@@ -386,6 +516,15 @@ func tools() []map[string]any {
 						"type":        "string",
 						"enum":        []string{"summary", "content"},
 						"description": "Output detail level. 'summary' (default) = lightweight results with section IDs, titles, heading paths, and FTS snippets — ideal for scanning and identifying relevant sections before deep reading with doc_get_section. 'content' = full text content per section (previous behavior). Default 'summary'.",
+					},
+					"use_relation_expansion": map[string]any{
+						"type":        "boolean",
+						"description": "Whether to use approved knowledge relations for one-hop retrieval expansion and result explanations. Default true.",
+					},
+					"relation_types": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string", "enum": []string{"related_to", "schema_reference", "deprecated_by", "should_ignore"}},
+						"description": "Optional approved relation types to use for expansion/explanations. Empty means all supported relation types.",
 					},
 				},
 				"required": []string{"query"},
@@ -542,6 +681,123 @@ func tools() []map[string]any {
 					},
 				},
 				"required": []string{"id"},
+			},
+		},
+		{
+			"name":        "doc_propose_relation",
+			"description": "Submit a knowledge relation proposal for Web approval. This does not change retrieval behavior until a reviewer approves it. Use when you identify that two documents should be linked, one document supersedes another, or an old document should be ignored/demoted.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"relation_type": map[string]any{
+						"type":        "string",
+						"enum":        []string{"related_to", "schema_reference", "deprecated_by", "should_ignore"},
+						"description": "Type of relation being proposed.",
+					},
+					"from_document_id": map[string]any{
+						"type":        "string",
+						"description": "Source document ID for the relation.",
+					},
+					"from_anchor": map[string]any{
+						"type":        "string",
+						"description": "Optional heading, fragment, or phrase in the source document.",
+					},
+					"to_document_id": map[string]any{
+						"type":        "string",
+						"description": "Target document ID for the relation.",
+					},
+					"to_anchor": map[string]any{
+						"type":        "string",
+						"description": "Optional heading, fragment, or phrase in the target document.",
+					},
+					"direction": map[string]any{
+						"type":        "string",
+						"enum":        []string{"directed", "undirected"},
+						"description": "Relation direction. Default directed.",
+					},
+					"reason": map[string]any{
+						"type":        "string",
+						"description": "Required explanation for the reviewer. Include why this relation improves retrieval or avoids stale guidance.",
+					},
+					"evidence": map[string]any{
+						"type":        "object",
+						"description": "Optional structured evidence, such as query, snippets, or session notes.",
+					},
+					"proposed_effect": map[string]any{
+						"type":        "string",
+						"enum":        []string{"context_link", "boost", "demote", "ignore"},
+						"description": "Expected retrieval effect after approval. Defaults from relation_type.",
+					},
+					"confidence": map[string]any{
+						"type":        "number",
+						"minimum":     0,
+						"maximum":     1,
+						"description": "Optional proposer confidence.",
+					},
+					"created_by_ref": map[string]any{
+						"type":        "string",
+						"description": "Optional client/session identifier for audit.",
+					},
+				},
+				"required": []string{"relation_type", "from_document_id", "to_document_id", "reason"},
+			},
+		},
+		{
+			"name":        "doc_list_relation_proposals",
+			"description": "List knowledge relation proposals, usually pending Web approval. This is read-only and does not approve changes.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"status": map[string]any{
+						"type":        "string",
+						"enum":        []string{"pending", "approved", "rejected", "cancelled", "all"},
+						"description": "Proposal status filter. Default all.",
+					},
+					"document_id": map[string]any{
+						"type":        "string",
+						"description": "Optional document ID filter for proposals touching a document.",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"minimum":     1,
+						"maximum":     100,
+						"description": "Maximum proposals to return. Default 20.",
+					},
+					"offset": map[string]any{
+						"type":        "integer",
+						"minimum":     0,
+						"description": "Pagination offset.",
+					},
+				},
+			},
+		},
+		{
+			"name":        "doc_get_relation_context",
+			"description": "Fetch approved knowledge relations for a document. Use this after doc_search or doc_get_section to understand linked schema references, related docs, deprecation, or ignore/demotion guidance.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"document_id": map[string]any{
+						"type":        "string",
+						"description": "Document ID to inspect.",
+					},
+					"relation_types": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string", "enum": []string{"related_to", "schema_reference", "deprecated_by", "should_ignore"}},
+						"description": "Optional relation type filter.",
+					},
+					"include_disabled": map[string]any{
+						"type":        "boolean",
+						"description": "Whether to include disabled relations. Default false.",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"minimum":     1,
+						"maximum":     100,
+						"description": "Maximum relations to return. Default 20.",
+					},
+				},
+				"required": []string{"document_id"},
 			},
 		},
 	}

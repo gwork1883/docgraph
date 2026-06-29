@@ -8,7 +8,7 @@ DATA ?= .docgraph
 HOST ?= 127.0.0.1
 PORT ?= 8787
 
-.PHONY: help tidy fmt test build build-release run dev status clean
+.PHONY: help tidy fmt test build build-release build-static package migrate run dev status clean
 
 help:
 	@echo "Targets:"
@@ -17,6 +17,8 @@ help:
 	@echo "  make test     Run all tests"
 	@echo "  make build    Build ./bin/docgraph-dev"
 	@echo "  make build-release Build ./bin/docgraph"
+	@echo "  make package   Build release + package binary and data as tar.gz"
+	@echo "  make migrate  Build and initialize/upgrade local schema"
 	@echo "  make run      Build and run Web/API server with dev binary"
 	@echo "  make dev      Same as run, with local .docgraph data"
 	@echo "  make status   Show DocGraph status with dev binary"
@@ -39,12 +41,26 @@ build-release:
 	mkdir -p bin
 	$(GOENV) $(GO) build -buildvcs=false -o $(RELEASE_BIN) ./cmd/docgraph
 
-run: build
+build-static:
+	mkdir -p bin
+	CGO_ENABLED=0 $(GOENV) $(GO) build -buildvcs=false -o $(RELEASE_BIN) ./cmd/docgraph
+
+package: build-static
+	@if [ ! -d "$(DATA)" ]; then echo "ERROR: data dir '$(DATA)' not found. Run the server first to create it."; exit 1; fi
+	@if [ ! -f "docgraph.yaml" ]; then echo "ERROR: docgraph.yaml not found in current directory."; exit 1; fi
+	@cp scripts/run.sh run.sh
+	tar -czf docgraph-package.tar.gz $(RELEASE_BIN) $(DATA) docgraph.yaml run.sh
+	@rm run.sh
+
+migrate: build
+	./$(DEV_BIN) migrate --data $(DATA)
+
+run: migrate
 	./$(DEV_BIN) serve --host $(HOST) --port $(PORT) --data $(DATA)
 
 dev: run
 
-status: build
+status: migrate
 	./$(DEV_BIN) status --data $(DATA)
 
 clean:

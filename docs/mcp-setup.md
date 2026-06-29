@@ -4,7 +4,11 @@ This guide explains how to connect DocGraph to an MCP-compatible client.
 
 ## Transports
 
-DocGraph supports two MCP transports: **stdio** (standalone process) and **SSE** (via the HTTP server).
+DocGraph supports three MCP transports:
+
+- **stdio**: standalone local process.
+- **Streamable HTTP**: recommended HTTP transport at `/mcp`.
+- **legacy SSE**: deprecated HTTP+SSE compatibility endpoints retained for older clients.
 
 ### stdio Transport
 
@@ -15,10 +19,41 @@ docgraph mcp --data ./.docgraph
 Use `--config docgraph.yaml` when you want DocGraph to load a specific
 configuration file instead of the default config search path.
 
-### SSE Transport
+### Streamable HTTP Transport
+
+When DocGraph is running as an HTTP server (`docgraph serve`), MCP is available
+over Streamable HTTP at one endpoint:
+
+| Method | Endpoint | Purpose                    |
+|--------|----------|----------------------------|
+| POST   | `/mcp`   | Send JSON-RPC MCP messages |
+| GET    | `/mcp`   | Reserved for server streams; currently returns `405` |
+
+Every client request is a separate HTTP POST containing one JSON-RPC message.
+DocGraph currently returns one `application/json` response for JSON-RPC requests
+and `202 Accepted` for notifications.
+
+Example with `curl`:
+
+```bash
+curl -X POST http://127.0.0.1:8787/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  -d '{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"dev"}}}'
+
+curl -X POST http://127.0.0.1:8787/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  -d '{"jsonrpc":"2.0","id":"tools","method":"tools/list"}'
+```
+
+### Legacy SSE Transport
 
 When DocGraph is running as an HTTP server (`docgraph serve`), MCP is also
-available over Server-Sent Events (SSE) at the following endpoints:
+available over the older HTTP+SSE transport at the following compatibility
+endpoints:
 
 | Method | Endpoint                           | Purpose                             |
 |--------|------------------------------------|-------------------------------------|
@@ -94,9 +129,28 @@ built binary:
 }
 ```
 
-### SSE Mode
+### Streamable HTTP Mode
 
-For SSE, run `docgraph serve` first, then configure the MCP client to use
+For HTTP MCP clients that support Streamable HTTP directly, run `docgraph serve`
+first and configure the client URL as:
+
+```json
+{
+  "mcpServers": {
+    "docgraph": {
+      "transport": "streamable-http",
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+Some clients use `http` instead of `streamable-http` as the transport name. The
+important part is that the URL points at `/mcp`, not `/mcp/sse`.
+
+### Legacy SSE Mode
+
+For older SSE-only clients, run `docgraph serve` first, then configure the MCP client to use
 `mcp-remote` as a proxy between the client's stdio transport and DocGraph's
 SSE endpoint:
 
@@ -116,7 +170,7 @@ SSE endpoint:
 }
 ```
 
-If your client supports URL-based SSE natively (without a proxy):
+If your client supports URL-based legacy SSE natively (without a proxy):
 
 ```json
 {
@@ -274,10 +328,10 @@ the source URL separately.
 authentication. Protect access by controlling who can launch the local command
 and who can read the configured data directory.
 
-**SSE transport:** runs through the HTTP server and respects the server's token
-auth configuration (`auth.mode: token` / `auth.token: your-token`). When auth is
-enabled, include the `Authorization: Bearer <token>` header in the MCP client
-configuration.
+**Streamable HTTP and legacy SSE transports:** run through the HTTP server and
+respect the server's token auth configuration (`auth.mode: token` /
+`auth.token: your-token`). When auth is enabled, include the
+`Authorization: Bearer <token>` header in the MCP client configuration.
 
 ## Troubleshooting
 

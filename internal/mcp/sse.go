@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,18 +17,25 @@ import (
 type SSEServer struct {
 	handler  *Handler
 	logger   *slog.Logger
+	basePath string
 	sessions map[string]*sseSession
 	mu       sync.Mutex
 }
 
 // NewSSEServer creates an SSE MCP server wrapping the given handler.
 func NewSSEServer(handler *Handler, logger *slog.Logger) *SSEServer {
+	return NewSSEServerWithBasePath(handler, logger, "")
+}
+
+func NewSSEServerWithBasePath(handler *Handler, logger *slog.Logger, basePath string) *SSEServer {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
+	basePath = strings.TrimRight(basePath, "/")
 	return &SSEServer{
 		handler:  handler,
 		logger:   logger,
+		basePath: basePath,
 		sessions: make(map[string]*sseSession),
 	}
 }
@@ -43,8 +51,13 @@ const sessionTimeout = 5 * time.Minute
 
 // RegisterRoutes adds the MCP SSE routes to an http.ServeMux.
 func (s *SSEServer) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /mcp/sse", s.handleSSE)
-	mux.HandleFunc("POST /mcp/sse/messages", s.handleMessages)
+	s.RegisterRoutesWithPrefix(mux, "")
+}
+
+func (s *SSEServer) RegisterRoutesWithPrefix(mux *http.ServeMux, prefix string) {
+	base := strings.TrimRight(prefix, "/")
+	mux.HandleFunc("GET "+base+"/mcp/sse", s.handleSSE)
+	mux.HandleFunc("POST "+base+"/mcp/sse/messages", s.handleMessages)
 }
 
 func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -85,7 +98,11 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	// Send endpoint event so client knows where to POST messages.
-	endpointURL := fmt.Sprintf("/mcp/sse/messages?sessionId=%s", sessionID)
+	basePath := strings.TrimSuffix(r.URL.Path, "/mcp/sse")
+	if basePath == r.URL.Path {
+		basePath = s.basePath
+	}
+	endpointURL := fmt.Sprintf("%s/mcp/sse/messages?sessionId=%s", basePath, sessionID)
 	writeSSEEvent(w, flusher, "endpoint", endpointURL)
 	flusher.Flush()
 

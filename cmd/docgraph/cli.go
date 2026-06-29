@@ -14,6 +14,7 @@ import (
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage"
 	syncsvc "github.com/docgraph/docgraph/internal/sync"
+	"github.com/docgraph/docgraph/internal/syncschedule"
 )
 
 func runSource(args []string) error {
@@ -47,6 +48,7 @@ func runSourceAdd(args []string) error {
 	dsn := fs.String("dsn", "", "source DSN or local path")
 	product := fs.String("product", "", "product hint")
 	module := fs.String("module", "", "module hint")
+	syncSchedule := fs.String("sync-schedule", "", "automatic sync schedule: manual, hourly, daily, weekly, or every 6h")
 	branch := fs.String("branch", "", "git branch")
 	sourcePath := fs.String("path", "", "git source path")
 	cache := fs.String("cache", "", "explicit clone directory for remote Git sources")
@@ -79,6 +81,9 @@ func runSourceAdd(args []string) error {
 	}
 	if *dsn == "" {
 		return fmt.Errorf("--dsn is required")
+	}
+	if _, _, err := syncschedule.Parse(*syncSchedule); err != nil {
+		return err
 	}
 
 	store, closeStore, err := openStoreFromFlags(*cfgPath, *dataDir)
@@ -119,8 +124,9 @@ func runSourceAdd(args []string) error {
 			"strict_host_key":  *strictHostKey,
 			"is_spa":           *isSPA,
 		}),
-		ProductHint: strings.TrimSpace(*product),
-		ModuleHint:  strings.TrimSpace(*module),
+		ProductHint:  strings.TrimSpace(*product),
+		ModuleHint:   strings.TrimSpace(*module),
+		SyncSchedule: strings.TrimSpace(*syncSchedule),
 	})
 	if err != nil {
 		return err
@@ -159,6 +165,7 @@ func runSourceUpdate(args []string) error {
 	dsn := fs.String("dsn", "", "source DSN or local path")
 	product := fs.String("product", "", "product hint")
 	module := fs.String("module", "", "module hint")
+	syncSchedule := fs.String("sync-schedule", "", "automatic sync schedule: manual, hourly, daily, weekly, or every 6h")
 	branch := fs.String("branch", "", "git branch")
 	sourcePath := fs.String("path", "", "git source path")
 	cache := fs.String("cache", "", "explicit clone directory for remote Git sources")
@@ -215,6 +222,12 @@ func runSourceUpdate(args []string) error {
 	}
 	if strings.TrimSpace(*module) != "" {
 		source.ModuleHint = strings.TrimSpace(*module)
+	}
+	if strings.TrimSpace(*syncSchedule) != "" {
+		if _, _, err := syncschedule.Parse(*syncSchedule); err != nil {
+			return err
+		}
+		source.SyncSchedule = strings.TrimSpace(*syncSchedule)
 	}
 	if strings.TrimSpace(*branch) != "" || strings.TrimSpace(*sourcePath) != "" || strings.TrimSpace(*cache) != "" || strings.TrimSpace(*include) != "" || strings.TrimSpace(*exclude) != "" || strings.TrimSpace(*urlPrefix) != "" || strings.TrimSpace(*identityFile) != "" || strings.TrimSpace(*password) != "" || strings.TrimSpace(*passphrase) != "" || strings.TrimSpace(*knownHosts) != "" || *strictHostKey {
 		source.ConfigJSON = mergeSourceConfigJSON(source.ConfigJSON, map[string]string{
@@ -614,11 +627,11 @@ func openStoreFromFlags(cfgPath, dataDir string) (storage.Store, func(), error) 
 		cfg.Storage.DSN = "sqlite://" + filepath.ToSlash(filepath.Join(dataDir, "docgraph.db"))
 	}
 
-	store, err := storage.Open(context.Background(), cfg.Storage.DSN)
+	store, err := storage.OpenExisting(context.Background(), cfg.Storage.DSN)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := store.Migrate(context.Background()); err != nil {
+	if err := store.CheckSchema(context.Background()); err != nil {
 		_ = store.Close()
 		return nil, nil, err
 	}

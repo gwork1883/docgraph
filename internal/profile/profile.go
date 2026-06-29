@@ -351,7 +351,7 @@ func shouldSkipTerm(term string) bool {
 
 func looksImportant(term string) bool {
 	lower := strings.ToLower(term)
-	keywords := []string{"error", "错误", "响应", "权限", "auth", "token", "401", "403", "500", "api", "接口", "code"}
+	keywords := []string{"error", "错误", "响应", "配置", "auth", "token", "401", "403", "500", "api", "接口", "code"}
 	for _, keyword := range keywords {
 		if strings.Contains(lower, keyword) {
 			return true

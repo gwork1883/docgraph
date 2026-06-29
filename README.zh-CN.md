@@ -27,7 +27,17 @@ Search 页面提供面向文档 section 和 profile 的本地检索。
 - 支持 local、git、static、html、sftp、confluence、openapi、webdocs 等来源。
 - 支持 `doc_search`、`doc_context`、`doc_get_node`、`doc_get_section`、`doc_related`、`doc_impact` MCP 工具。
 - 支持中文检索辅助 profile、本地知识图谱节点/边、同步任务历史和反馈标注。
-- 支持 token 模式保护 Web/API/SSE 入口。
+- 支持 token 模式保护 Web/API/MCP 入口。
+
+## 搜索优势
+
+DocGraph 的搜索面向文档消费和 agent 上下文获取，不只是普通全文匹配：
+
+- 多阶段本地召回结合 FTS5 分词检索、trigram 检索、profile 检索和子串兜底，让中文短语、英文术语、API 名称和符号都能参与召回。
+- 结果以 section 为核心，返回具体文档、标题路径、片段、来源 URL 和命中证据，而不是只给整篇文件。
+- 检索 profile 会确定性生成标签、关键短语、别名、API 引用和 section 分布信号，同时把人工维护的文档描述与同步生成的元数据分开。
+- 排序会综合 canonical 状态、标题和 heading 命中、词项覆盖、profile 命中、精确匹配以及已批准的知识关系。
+- MCP 工具默认先返回有边界的搜索摘要，agent 需要时再按 section 拉取全文，避免一次性塞入过多本地上下文。
 
 ## 工作原理
 
@@ -45,11 +55,12 @@ DocGraph 会把已有文档转换成本地可查询的知识层：
 
 ```bash
 go build -buildvcs=false -o bin/docgraph ./cmd/docgraph
-./bin/docgraph init --data ./.docgraph
-./bin/docgraph serve --data ./.docgraph --host 127.0.0.1 --port 8787
+./bin/docgraph serve
 ```
 
-打开 `http://127.0.0.1:8787` 后，可以在 Web UI 中添加和同步文档来源。
+首次 `serve` 会创建 `docgraph.yaml`、生成本地管理秘钥、迁移 SQLite 数据库并启动服务。打开 `http://127.0.0.1:8787`，输入 `docgraph.yaml` 里的 token 后，可以在 Web UI 中添加和同步文档来源。`docgraph init` 仍然保留，用于只预创建或检查配置和数据库、不启动服务的运维场景。
+
+如果需要把 DocGraph 部署在反向代理的路径前缀后面，可以在 `docgraph.yaml` 里设置 `server.web_prefix`。例如 `web_prefix: docgraph` 会把 Web UI、REST API 和 HTTP MCP 端点都放到 `/docgraph/` 下；留空则保持默认根路径。nginx 示例见 `scripts/nginx-docgraph.conf` 和 `scripts/nginx-docgraph-location.conf`，示例会保留前缀转发给 DocGraph。
 
 也可以通过 CLI 添加本地文档：
 
@@ -96,7 +107,8 @@ DocGraph 支持 stdio MCP：
 ./bin/docgraph mcp --data ./.docgraph
 ```
 
-也可以通过 HTTP/SSE 方式使用，配置参考 [docs/mcp-setup.md](docs/mcp-setup.md)。
+运行 `docgraph serve` 时，也可以通过 `/mcp` 使用 Streamable HTTP MCP；
+旧的 HTTP/SSE 兼容入口仍保留在 `/mcp/sse`。配置参考 [docs/mcp-setup.md](docs/mcp-setup.md)。
 
 ## 运行时依赖
 

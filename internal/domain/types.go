@@ -5,29 +5,74 @@ import "errors"
 var ErrSyncInProgress = errors.New("sync already in progress")
 
 type Source struct {
+	ID               string `json:"id"`
+	Kind             string `json:"kind"`
+	Name             string `json:"name"`
+	DSN              string `json:"dsn"`
+	ConfigJSON       string `json:"config_json"`
+	ProductHint      string `json:"product_hint"`
+	ModuleHint       string `json:"module_hint"`
+	SyncSchedule     string `json:"sync_schedule"`
+	SyncStatus       string `json:"sync_status"`
+	SyncStatusReason string `json:"sync_status_reason"`
+	SyncPausedAt     string `json:"sync_paused_at"`
+	CreatedAt        string `json:"created_at"`
+	UpdatedAt        string `json:"updated_at"`
+}
+
+type ConfluenceCookieCredential struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	BaseURL         string `json:"base_url"`
+	Cookie          string `json:"cookie,omitempty"`
+	Notes           string `json:"notes"`
+	Status          string `json:"status"`
+	LastValidatedAt string `json:"last_validated_at"`
+	LastError       string `json:"last_error"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+type SyncJob struct {
 	ID           string `json:"id"`
 	Kind         string `json:"kind"`
-	Name         string `json:"name"`
-	DSN          string `json:"dsn"`
-	ConfigJSON   string `json:"config_json"`
-	ProductHint  string `json:"product_hint"`
-	ModuleHint   string `json:"module_hint"`
-	SyncSchedule string `json:"sync_schedule"`
+	Status       string `json:"status"`
+	SourceID     string `json:"source_id"`
+	TargetKind   string `json:"target_kind"`
+	TargetID     string `json:"target_id"`
+	PayloadJSON  string `json:"payload_json"`
+	ProgressJSON string `json:"progress_json"`
+	ResultJSON   string `json:"result_json"`
+	WorkerID     string `json:"worker_id"`
+	Attempts     int    `json:"attempts"`
+	RunAfter     string `json:"run_after"`
+	LockedUntil  string `json:"locked_until"`
+	LastError    string `json:"last_error"`
 	CreatedAt    string `json:"created_at"`
 	UpdatedAt    string `json:"updated_at"`
 }
 
-type SyncJob struct {
-	ID          string `json:"id"`
-	Kind        string `json:"kind"`
-	Status      string `json:"status"`
-	PayloadJSON string `json:"payload_json"`
-	Attempts    int    `json:"attempts"`
-	RunAfter    string `json:"run_after"`
-	LockedUntil string `json:"locked_until"`
-	LastError   string `json:"last_error"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+type Job = SyncJob
+
+type JobInput struct {
+	Kind         string
+	SourceID     string
+	TargetKind   string
+	TargetID     string
+	PayloadJSON  string
+	ProgressJSON string
+	ResultJSON   string
+	RunAfter     string
+}
+
+type JobListOptions struct {
+	SourceID   string
+	Kind       string
+	Status     string
+	TargetKind string
+	TargetID   string
+	Limit      int
+	Offset     int
 }
 
 type ResultPayload struct {
@@ -99,6 +144,8 @@ type SearchHit struct {
 	Profile          *SearchHitProfile `json:"profile,omitempty"`
 	RetrievalProfile any               `json:"retrieval_profile,omitempty"`
 	QueryMatch       *QueryMatch       `json:"query_match,omitempty"`
+	ScoreBreakdown   *ScoreBreakdown   `json:"score_breakdown,omitempty"`
+	RelationMatches  []RelationMatch   `json:"relation_matches,omitempty"`
 }
 
 type SearchHitProfile struct {
@@ -124,6 +171,22 @@ type QueryMatch struct {
 	ScoreExplanation string   `json:"score_explanation,omitempty"`
 }
 
+type ScoreBreakdown struct {
+	UnicodeBM25Boost float64  `json:"unicode_bm25_boost,omitempty"`
+	TrigramBM25Boost float64  `json:"trigram_bm25_boost,omitempty"`
+	TitleBoost       float64  `json:"title_boost,omitempty"`
+	SectionBoost     float64  `json:"section_boost,omitempty"`
+	SymbolBoost      float64  `json:"symbol_boost,omitempty"`
+	ExactMatchBoost  float64  `json:"exact_match_boost,omitempty"`
+	CanonicalBoost   float64  `json:"canonical_boost,omitempty"`
+	CoverageBoost    float64  `json:"coverage_boost,omitempty"`
+	FallbackBoost    float64  `json:"fallback_boost,omitempty"`
+	Total            float64  `json:"total"`
+	MatchedFields    []string `json:"matched_fields,omitempty"`
+	MatchedTerms     []string `json:"matched_terms,omitempty"`
+	MatchedSymbols   []string `json:"matched_symbols,omitempty"`
+}
+
 type SearchOptions struct {
 	Query                  string
 	Limit                  int
@@ -132,6 +195,9 @@ type SearchOptions struct {
 	ProfileDetail          string
 	MaxCharsPerResult      int
 	Detail                 string // "summary" (default) or "content"
+	UseRelationExpansion   bool
+	RelationDepth          int
+	RelationTypes          []string
 }
 
 type SearchAttempt struct {
@@ -146,6 +212,104 @@ type SearchResult struct {
 	SearchesUsed int             `json:"searches_used"`
 	Attempts     []SearchAttempt `json:"attempts"`
 	Hits         []SearchHit     `json:"hits"`
+}
+
+type KnowledgeRelationProposalInput struct {
+	ID             string
+	RelationType   string
+	FromDocumentID string
+	FromAnchor     string
+	ToDocumentID   string
+	ToAnchor       string
+	Direction      string
+	Reason         string
+	EvidenceJSON   string
+	ProposedEffect string
+	Confidence     float64
+	CreatedByType  string
+	CreatedByRef   string
+}
+
+type KnowledgeRelationProposal struct {
+	ID             string  `json:"id"`
+	RelationType   string  `json:"relation_type"`
+	FromDocumentID string  `json:"from_document_id"`
+	FromAnchor     string  `json:"from_anchor"`
+	ToDocumentID   string  `json:"to_document_id"`
+	ToAnchor       string  `json:"to_anchor"`
+	Direction      string  `json:"direction"`
+	Reason         string  `json:"reason"`
+	EvidenceJSON   string  `json:"evidence_json"`
+	ProposedEffect string  `json:"proposed_effect"`
+	Confidence     float64 `json:"confidence"`
+	CreatedByType  string  `json:"created_by_type"`
+	CreatedByRef   string  `json:"created_by_ref"`
+	Status         string  `json:"status"`
+	ReviewedBy     string  `json:"reviewed_by"`
+	ReviewNote     string  `json:"review_note"`
+	ReviewedAt     string  `json:"reviewed_at"`
+	CreatedAt      string  `json:"created_at"`
+	UpdatedAt      string  `json:"updated_at"`
+}
+
+type KnowledgeRelationProposalListOptions struct {
+	Status     string
+	DocumentID string
+	Limit      int
+	Offset     int
+}
+
+type KnowledgeRelationInput struct {
+	ID                     string
+	RelationType           string
+	FromDocumentID         string
+	FromAnchor             string
+	ToDocumentID           string
+	ToAnchor               string
+	Direction              string
+	Effect                 string
+	Weight                 float64
+	Reason                 string
+	EvidenceJSON           string
+	ApprovedFromProposalID string
+	CreatedBy              string
+}
+
+type KnowledgeRelation struct {
+	ID                     string  `json:"id"`
+	RelationType           string  `json:"relation_type"`
+	FromDocumentID         string  `json:"from_document_id"`
+	FromAnchor             string  `json:"from_anchor"`
+	ToDocumentID           string  `json:"to_document_id"`
+	ToAnchor               string  `json:"to_anchor"`
+	Direction              string  `json:"direction"`
+	Effect                 string  `json:"effect"`
+	Weight                 float64 `json:"weight"`
+	Reason                 string  `json:"reason"`
+	EvidenceJSON           string  `json:"evidence_json"`
+	ApprovedFromProposalID string  `json:"approved_from_proposal_id"`
+	CreatedBy              string  `json:"created_by"`
+	DisabledAt             string  `json:"disabled_at"`
+	CreatedAt              string  `json:"created_at"`
+	UpdatedAt              string  `json:"updated_at"`
+}
+
+type KnowledgeRelationListOptions struct {
+	DocumentID      string
+	RelationTypes   []string
+	IncludeDisabled bool
+	Limit           int
+}
+
+type RelationMatch struct {
+	RelationID       string  `json:"relation_id"`
+	RelationType     string  `json:"relation_type"`
+	SourceDocumentID string  `json:"source_document_id"`
+	TargetDocumentID string  `json:"target_document_id"`
+	Direction        string  `json:"direction"`
+	Effect           string  `json:"effect"`
+	Weight           float64 `json:"weight"`
+	Reason           string  `json:"reason"`
 }
 
 type DocumentSummary struct {
@@ -199,6 +363,24 @@ type SourceArtifacts struct {
 	Sections  []SectionSummary     `json:"sections"`
 	Nodes     []Node               `json:"nodes"`
 	Edges     []EdgeSummary        `json:"edges"`
+}
+
+type QueryObservationInput struct {
+	ID              string
+	QueryText       string
+	NormalizedQuery string
+	Source          string
+	ResultCount     int
+	LatencyMS       int64
+	CacheHit        bool
+	Results         []SearchResultObservationInput
+}
+
+type SearchResultObservationInput struct {
+	DocumentID string
+	SectionID  string
+	Rank       int
+	Score      float64
 }
 
 type NodeInput struct {

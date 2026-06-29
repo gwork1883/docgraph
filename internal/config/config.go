@@ -2,6 +2,8 @@ package config
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,9 +20,10 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Host    string
-	Port    int
-	DataDir string
+	Host      string
+	Port      int
+	DataDir   string
+	WebPrefix string
 }
 
 type StorageConfig struct {
@@ -36,20 +39,63 @@ type AuthConfig struct {
 	Token string
 }
 
+const DefaultPath = "docgraph.yaml"
+
 func Default() Config {
 	dataDir := ".docgraph"
 	dbPath := filepath.ToSlash(filepath.Join(dataDir, "docgraph.db"))
 	return Config{
 		Server: ServerConfig{
-			Host:    "127.0.0.1",
-			Port:    8787,
-			DataDir: dataDir,
+			Host:      "127.0.0.1",
+			Port:      8787,
+			DataDir:   dataDir,
+			WebPrefix: "",
 		},
 		Storage: StorageConfig{DSN: "sqlite://" + dbPath},
 		Search:  BackendConfig{DSN: "sqlite://" + dbPath},
 		Vector:  BackendConfig{DSN: "none://"},
 		Auth:    AuthConfig{Mode: "none"},
 	}
+}
+
+func DefaultWithTokenAuth() (Config, error) {
+	cfg := Default()
+	token, err := GenerateToken()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Auth = AuthConfig{Mode: "token", Token: token}
+	return cfg, nil
+}
+
+func GenerateToken() (string, error) {
+	var data [32]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data[:]), nil
+}
+
+func Write(path string, cfg Config) error {
+	if path == "" {
+		return fmt.Errorf("config path is required")
+	}
+	data := fmt.Sprintf(`server:
+  host: %q
+  port: %d
+  data_dir: %q
+  web_prefix: %q
+storage:
+  dsn: %q
+search:
+  dsn: %q
+vector:
+  dsn: %q
+auth:
+  mode: %q
+  token: %q
+`, cfg.Server.Host, cfg.Server.Port, cfg.Server.DataDir, cfg.Server.WebPrefix, cfg.Storage.DSN, cfg.Search.DSN, cfg.Vector.DSN, cfg.Auth.Mode, cfg.Auth.Token)
+	return os.WriteFile(path, []byte(data), 0o600)
 }
 
 func Load(path string) (Config, error) {
@@ -105,7 +151,33 @@ func Load(path string) (Config, error) {
 	if cfg.Auth.Mode == "token" && cfg.Auth.Token == "" {
 		return Config{}, fmt.Errorf("auth.token is required when auth.mode is token")
 	}
+	prefix, err := NormalizeWebPrefix(cfg.Server.WebPrefix)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Server.WebPrefix = prefix
 	return cfg, nil
+}
+
+func NormalizeWebPrefix(value string) (string, error) {
+	prefix := strings.TrimSpace(value)
+	if prefix == "" || prefix == "/" {
+		return "", nil
+	}
+	if strings.ContainsAny(prefix, "?#") || strings.Contains(prefix, " ") {
+		return "", fmt.Errorf("server.web_prefix must be a path prefix, for example docgraph or /docgraph")
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	prefix = strings.TrimRight(prefix, "/")
+	if prefix == "" {
+		return "", nil
+	}
+	if strings.Contains(prefix, "//") {
+		return "", fmt.Errorf("server.web_prefix must not contain empty path segments")
+	}
+	return prefix, nil
 }
 
 func stripComment(line string) string {
@@ -129,6 +201,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Server.Port = port
 		case "data_dir":
 			cfg.Server.DataDir = value
+		case "prefix", "web_prefix":
+			cfg.Server.WebPrefix = value
 		default:
 			return fmt.Errorf("unknown server key %q", key)
 		}

@@ -127,11 +127,12 @@ Serves Web UI and external integrations.
 API authentication is configured at process startup. MVP supports two modes:
 
 - `none`: no API token check, intended for localhost development.
-- `token`: every non-health HTTP route requires a shared API token.
+- `token`: API and HTTP MCP routes require a shared API token.
 
 `GET /api/health` is intentionally exempt from token auth so local process managers,
 load balancers, and scripts can check liveness without holding DocGraph credentials.
-All other API and Web routes are protected when `auth.mode` is `token`.
+Embedded static Web UI assets remain loadable without a token; the Web UI stores
+the entered admin token in browser session storage and sends it with API requests.
 
 Clients may provide the token with either header:
 

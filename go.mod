@@ -3,6 +3,7 @@ module github.com/docgraph/docgraph
 go 1.25.0
 
 require (
+	github.com/go-ego/gse v1.0.2
 	github.com/go-rod/rod v0.116.2
 	github.com/pkg/sftp v1.13.10
 	golang.org/x/crypto v0.52.0
@@ -18,6 +19,7 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/vcaesar/cedar v0.30.0 // indirect
 	github.com/ysmood/fetchup v0.2.3 // indirect
 	github.com/ysmood/goob v0.4.0 // indirect
 	github.com/ysmood/got v0.40.0 // indirect

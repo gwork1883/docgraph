@@ -15,11 +15,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/docgraph/docgraph/internal/domain"
 	"github.com/docgraph/docgraph/internal/ingest/confluence"
+	"github.com/docgraph/docgraph/internal/ingest/htmldocs"
 	"github.com/docgraph/docgraph/internal/ingest/webdocs"
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage/sqlite"
@@ -171,15 +173,119 @@ GET /member/benefits returns available member benefits.
 	}
 }
 
+func TestSyncSourceWritesSectionEntitiesForLocalMarkdown(t *testing.T) {
+	ctx := context.Background()
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "entities.md"), `# Entity API
+
+## Filter
+
+interface | /entity/v1/entities:filter-filter-count
+method | POST
+
+## Storage
+
+/storage/任意片段/meta
+/EntityV1/BatchGetEntityMeta
+`)
+
+	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	if _, err := store.CreateSource(ctx, domain.Source{
+		ID:   "src_local_entities",
+		Kind: "local",
+		Name: "Entity Docs",
+		DSN:  "file://" + docsDir,
+	}); err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if _, err := NewService(store).SyncSource(ctx, "src_local_entities"); err != nil {
+		t.Fatalf("SyncSource returned error: %v", err)
+	}
+
+	artifacts, err := store.ListSourceArtifacts(ctx, "src_local_entities", 10, 0)
+	if err != nil {
+		t.Fatalf("ListSourceArtifacts returned error: %v", err)
+	}
+	if len(artifacts.Documents) != 1 {
+		t.Fatalf("documents = %+v, want one document", artifacts.Documents)
+	}
+	entities, err := store.ListDocumentEntities(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities returned error: %v", err)
+	}
+	if !sectionEntitiesContain(entities, "api_endpoint", "POST", "/entity/v1/entities:filter-filter-count", "", "table", 0.85) {
+		t.Fatalf("entities = %+v, want table-derived POST endpoint", entities)
+	}
+	if !sectionEntitiesContain(entities, "path_literal", "", "/storage/任意片段/meta", "", "text", 0.40) {
+		t.Fatalf("entities = %+v, want path-only storage literal", entities)
+	}
+	if !sectionEntitiesContain(entities, "path_literal", "", "/EntityV1/BatchGetEntityMeta", "", "text", 0.40) {
+		t.Fatalf("entities = %+v, want CamelCase path literal", entities)
+	}
+	if sectionEntitiesContain(entities, "api_endpoint", "GET", "/storage/任意片段/meta", "", "", 0) {
+		t.Fatalf("entities = %+v, did not want default GET endpoint for path-only evidence", entities)
+	}
+
+	profile, err := store.GetDocumentProfile(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("GetDocumentProfile returned error: %v", err)
+	}
+	var generated struct {
+		APIRefs []string `json:"api_refs"`
+	}
+	if err := json.Unmarshal([]byte(profile.RetrievalProfileJSON), &generated); err != nil {
+		t.Fatalf("unmarshal retrieval profile: %v", err)
+	}
+	if !stringValuesContain(generated.APIRefs, "/EntityV1/BatchGetEntityMeta") {
+		t.Fatalf("profile API refs = %+v, want stored CamelCase path ref", generated.APIRefs)
+	}
+
+	if err := store.ReplaceSectionEntities(ctx, artifacts.Documents[0].ID, nil); err != nil {
+		t.Fatalf("clear ReplaceSectionEntities returned error: %v", err)
+	}
+	cleared, err := store.ListDocumentEntities(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities after clear returned error: %v", err)
+	}
+	if len(cleared) != 0 {
+		t.Fatalf("cleared entities = %+v, want none", cleared)
+	}
+	backfill, err := NewService(store).BackfillSectionEntities(ctx, SectionEntityBackfillOptions{SourceID: "src_local_entities"})
+	if err != nil {
+		t.Fatalf("BackfillSectionEntities returned error: %v", err)
+	}
+	if backfill.Documents != 1 || backfill.Entities == 0 || backfill.APIEndpoints == 0 || backfill.PathLiterals == 0 {
+		t.Fatalf("backfill result = %+v, want restored endpoint and path entities", backfill)
+	}
+	restored, err := store.ListDocumentEntities(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities after backfill returned error: %v", err)
+	}
+	if !sectionEntitiesContain(restored, "api_endpoint", "POST", "/entity/v1/entities:filter-filter-count", "", "table", 0.85) {
+		t.Fatalf("restored entities = %+v, want table-derived POST endpoint", restored)
+	}
+}
+
 func TestSyncSourceGeneratesProfileAndPreservesAdministratorDesc(t *testing.T) {
 	ctx := context.Background()
 	docsDir := t.TempDir()
 	docPath := filepath.Join(docsDir, "auth.md")
-	writeFile(t, docPath, `# 权限接口
+	writeFile(t, docPath, `# 配置接口
 
 ## 错误响应
 
-权限接口的几种错误响应包括 401 响应和 403 响应。
+配置接口的几种错误响应包括 401 响应和 403 响应。
 `)
 
 	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
@@ -229,11 +335,11 @@ func TestSyncSourceGeneratesProfileAndPreservesAdministratorDesc(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpdateDocumentProfileDesc returned error: %v", err)
 	}
-	writeFile(t, docPath, `# 权限接口
+	writeFile(t, docPath, `# 配置接口
 
 ## 错误响应
 
-权限接口的几种错误响应包括 401 响应、403 响应和 500 响应。
+配置接口的几种错误响应包括 401 响应、403 响应和 500 响应。
 `)
 	if _, err := service.SyncSource(ctx, "src_profiles"); err != nil {
 		t.Fatalf("second SyncSource returned error: %v", err)
@@ -252,6 +358,108 @@ func TestSyncSourceGeneratesProfileAndPreservesAdministratorDesc(t *testing.T) {
 	if updatedProfile.GeneratedFromHash != updatedArtifacts.Documents[0].ContentHash || updatedProfile.GeneratedFromHash == profile.GeneratedFromHash {
 		t.Fatalf("generated hash after resync = %q, old %q, document hash %q", updatedProfile.GeneratedFromHash, profile.GeneratedFromHash, updatedArtifacts.Documents[0].ContentHash)
 	}
+}
+
+func TestSyncSourceSkipsUnchangedLocalDocumentWrites(t *testing.T) {
+	ctx := context.Background()
+	docsDir := t.TempDir()
+	docPath := filepath.Join(docsDir, "guide.md")
+	writeFile(t, docPath, `# Stable Guide
+
+stableunchangedtoken keeps search available.
+`)
+
+	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	if _, err := store.CreateSource(ctx, domain.Source{
+		ID:   "src_unchanged_skip",
+		Kind: "local",
+		Name: "Unchanged Docs",
+		DSN:  "file://" + docsDir,
+	}); err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	service := NewService(store)
+	if _, err := service.SyncSource(ctx, "src_unchanged_skip"); err != nil {
+		t.Fatalf("first SyncSource returned error: %v", err)
+	}
+	firstArtifacts, err := store.ListSourceArtifacts(ctx, "src_unchanged_skip", 10, 0)
+	if err != nil {
+		t.Fatalf("first ListSourceArtifacts returned error: %v", err)
+	}
+	if len(firstArtifacts.Documents) != 1 {
+		t.Fatalf("first documents = %+v, want one document", firstArtifacts.Documents)
+	}
+	docID := firstArtifacts.Documents[0].ID
+	firstIndexedAt := firstArtifacts.Documents[0].IndexedAt
+	firstHash := firstArtifacts.Documents[0].ContentHash
+	firstProfile, err := store.GetDocumentProfile(ctx, docID)
+	if err != nil {
+		t.Fatalf("first GetDocumentProfile returned error: %v", err)
+	}
+	assertSearchContains(t, ctx, store, "stableunchangedtoken", "Stable Guide")
+
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := service.SyncSource(ctx, "src_unchanged_skip"); err != nil {
+		t.Fatalf("unchanged SyncSource returned error: %v", err)
+	}
+	unchangedArtifacts, err := store.ListSourceArtifacts(ctx, "src_unchanged_skip", 10, 0)
+	if err != nil {
+		t.Fatalf("unchanged ListSourceArtifacts returned error: %v", err)
+	}
+	if len(unchangedArtifacts.Documents) != 1 {
+		t.Fatalf("unchanged documents = %+v, want one document", unchangedArtifacts.Documents)
+	}
+	if unchangedArtifacts.Documents[0].IndexedAt != firstIndexedAt {
+		t.Fatalf("unchanged IndexedAt = %q, want preserved %q", unchangedArtifacts.Documents[0].IndexedAt, firstIndexedAt)
+	}
+	unchangedProfile, err := store.GetDocumentProfile(ctx, docID)
+	if err != nil {
+		t.Fatalf("unchanged GetDocumentProfile returned error: %v", err)
+	}
+	if unchangedProfile.GeneratedFromHash != firstProfile.GeneratedFromHash {
+		t.Fatalf("unchanged profile hash = %q, want preserved %q", unchangedProfile.GeneratedFromHash, firstProfile.GeneratedFromHash)
+	}
+	assertSearchContains(t, ctx, store, "stableunchangedtoken", "Stable Guide")
+
+	time.Sleep(1100 * time.Millisecond)
+	writeFile(t, docPath, `# Stable Guide
+
+stablechangedtoken replaces the old search term.
+`)
+	if _, err := service.SyncSource(ctx, "src_unchanged_skip"); err != nil {
+		t.Fatalf("changed SyncSource returned error: %v", err)
+	}
+	changedArtifacts, err := store.ListSourceArtifacts(ctx, "src_unchanged_skip", 10, 0)
+	if err != nil {
+		t.Fatalf("changed ListSourceArtifacts returned error: %v", err)
+	}
+	if changedArtifacts.Documents[0].ContentHash == firstHash {
+		t.Fatalf("changed content hash = %q, want different from %q", changedArtifacts.Documents[0].ContentHash, firstHash)
+	}
+	if changedArtifacts.Documents[0].IndexedAt == firstIndexedAt {
+		t.Fatalf("changed IndexedAt = %q, want updated timestamp", changedArtifacts.Documents[0].IndexedAt)
+	}
+	changedProfile, err := store.GetDocumentProfile(ctx, docID)
+	if err != nil {
+		t.Fatalf("changed GetDocumentProfile returned error: %v", err)
+	}
+	if changedProfile.GeneratedFromHash != changedArtifacts.Documents[0].ContentHash || changedProfile.GeneratedFromHash == firstProfile.GeneratedFromHash {
+		t.Fatalf("changed profile hash = %q, first %q, document hash %q", changedProfile.GeneratedFromHash, firstProfile.GeneratedFromHash, changedArtifacts.Documents[0].ContentHash)
+	}
+	assertSearchEmpty(t, ctx, store, "stableunchangedtoken")
+	assertSearchContains(t, ctx, store, "stablechangedtoken", "Stable Guide")
 }
 
 func TestSyncSourceIndexesStaticDocsMixedFormatsAndRemovesDeletedDocs(t *testing.T) {
@@ -548,6 +756,89 @@ where edges.kind = 'contains'
 `)
 }
 
+func TestSyncSourceGraphUsesStoredSectionEntities(t *testing.T) {
+	ctx := context.Background()
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "entities.md"), `# Entity API
+
+## Filter
+
+interface | /entity/v1/entities:filter-filter-count
+method | POST
+
+## Storage
+
+/storage/任意片段/meta
+`)
+
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := sqlite.Open(ctx, "sqlite://"+dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	_, err = store.CreateSource(ctx, domain.Source{
+		ID:   "src_entity_graph",
+		Kind: "local",
+		Name: "Entity Docs",
+		DSN:  "file://" + docsDir,
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	service := NewService(store)
+	for i := 0; i < 2; i++ {
+		if _, err := service.SyncSource(ctx, "src_entity_graph"); err != nil {
+			t.Fatalf("SyncSource run %d returned error: %v", i+1, err)
+		}
+	}
+
+	graphDB := openGraphDB(t, dbPath)
+	assertGraphCount(t, ctx, graphDB, 1, `
+select count(*)
+from nodes
+where kind = 'API'
+  and name = 'POST /entity/v1/entities:filter-filter-count'
+`)
+	assertGraphCount(t, ctx, graphDB, 1, `
+select count(*)
+from edges
+join nodes src on src.id = edges.src_id
+join nodes dst on dst.id = edges.dst_id
+where edges.kind = 'mentions'
+  and src.kind = 'DocSection'
+  and src.name = 'Filter'
+  and dst.kind = 'API'
+  and dst.name = 'POST /entity/v1/entities:filter-filter-count'
+  and edges.evidence_section_id is not null
+`)
+	assertGraphCount(t, ctx, graphDB, 0, `
+select count(*)
+from nodes
+where kind = 'API'
+  and name like '%/storage/任意片段/meta'
+`)
+	assertGraphCount(t, ctx, graphDB, 0, `
+select count(*)
+from edges
+join nodes src on src.id = edges.src_id
+join nodes dst on dst.id = edges.dst_id
+where edges.kind = 'exposes_api'
+  and src.kind = 'Document'
+  and dst.kind = 'API'
+  and dst.name = 'POST /entity/v1/entities:filter-filter-count'
+`)
+}
+
 func TestSyncSourceIndexesOpenAPIIntoSQLite(t *testing.T) {
 	ctx := context.Background()
 	specPath := filepath.Join(t.TempDir(), "membership.openapi.json")
@@ -628,6 +919,68 @@ func TestSyncSourceIndexesOpenAPIIntoSQLite(t *testing.T) {
 	}
 }
 
+func TestSyncSourceWritesSectionEntitiesForOpenAPI(t *testing.T) {
+	ctx := context.Background()
+	specPath := filepath.Join(t.TempDir(), "entity.openapi.json")
+	writeFile(t, specPath, `{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Entity API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/entity/v1/entities": {
+      "get": {
+        "operationId": "ListEntities",
+        "summary": "List entities"
+      }
+    }
+  }
+}`)
+
+	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	if _, err := store.CreateSource(ctx, domain.Source{
+		ID:   "src_openapi_entities",
+		Kind: "openapi",
+		Name: "Entity API",
+		DSN:  "file://" + specPath,
+	}); err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if _, err := NewService(store).SyncSource(ctx, "src_openapi_entities"); err != nil {
+		t.Fatalf("SyncSource returned error: %v", err)
+	}
+
+	artifacts, err := store.ListSourceArtifacts(ctx, "src_openapi_entities", 10, 0)
+	if err != nil {
+		t.Fatalf("ListSourceArtifacts returned error: %v", err)
+	}
+	if len(artifacts.Documents) != 1 {
+		t.Fatalf("documents = %+v, want one document", artifacts.Documents)
+	}
+	entities, err := store.ListDocumentEntities(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities returned error: %v", err)
+	}
+	if !sectionEntitiesContain(entities, "api_endpoint", "GET", "/entity/v1/entities", "ListEntities", "openapi", 1.0) {
+		t.Fatalf("entities = %+v, want authoritative OpenAPI endpoint", entities)
+	}
+	if !sectionEntitiesContain(entities, "operation_candidate", "", "", "ListEntities", "text", 0.55) {
+		t.Fatalf("entities = %+v, want operation candidate from operationId", entities)
+	}
+}
+
 func TestSyncSourceCreatesOpenAPIGraphAPIAndEvidenceEdges(t *testing.T) {
 	ctx := context.Background()
 	specPath := filepath.Join(t.TempDir(), "membership.openapi.json")
@@ -687,6 +1040,12 @@ select count(*)
 from nodes
 where kind = 'API'
   and (name = 'GET /member/benefits' or canonical_name in ('GET /member/benefits', 'get /member/benefits'))
+`)
+	assertGraphCount(t, ctx, graphDB, 0, `
+select count(*)
+from nodes
+where kind = 'API'
+  and name = 'getMemberBenefits'
 `)
 	assertGraphCount(t, ctx, graphDB, 1, `
 select count(*)
@@ -1056,6 +1415,77 @@ where edges.kind = 'links_to'
 	assertSearchContains(t, ctx, store, "htmlsyncapitoken", "Member HTML Docs")
 }
 
+func TestSyncHTMLReplacesWhenParsedSectionsChangeDespiteSameSourceHash(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := sqlite.Open(ctx, "sqlite://"+dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	source, err := store.CreateSource(ctx, domain.Source{
+		ID:   "src_same_raw_hash",
+		Kind: "html",
+		Name: "HTML Docs",
+		DSN:  "unused",
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	service := NewService(store)
+	first := htmldocs.Document{
+		Path:  "index.html",
+		Title: "Parser Sensitive",
+		Hash:  "same-source-hash",
+		Sections: []htmldocs.Section{{
+			Title:       "Overview",
+			HeadingPath: []string{"Overview"},
+			Content:     "old parsed text oldparsedtoken GET /entity/v1/old",
+			Hash:        "old-section-hash",
+			Ordinal:     0,
+		}},
+	}
+	if _, err := service.syncHTMLLikeDocs(ctx, source, "", []htmldocs.Document{first}); err != nil {
+		t.Fatalf("first syncHTMLLikeDocs returned error: %v", err)
+	}
+
+	second := first
+	second.Sections = []htmldocs.Section{{
+		Title:       "Overview",
+		HeadingPath: []string{"Overview"},
+		Content:     "new parsed text newparsedtoken GET /entity/v1/new",
+		Hash:        "new-section-hash",
+		Ordinal:     0,
+	}}
+	if _, err := service.syncHTMLLikeDocs(ctx, source, "", []htmldocs.Document{second}); err != nil {
+		t.Fatalf("second syncHTMLLikeDocs returned error: %v", err)
+	}
+	assertSearchContains(t, ctx, store, "newparsedtoken", "Parser Sensitive")
+	assertSearchEmpty(t, ctx, store, "oldparsedtoken")
+	oldEntities, err := store.SearchEntities(ctx, "/entity/v1/old", 10)
+	if err != nil {
+		t.Fatalf("SearchEntities old path returned error: %v", err)
+	}
+	if len(oldEntities) != 0 {
+		t.Fatalf("old entities = %+v, want replaced entity rows removed", oldEntities)
+	}
+	newEntities, err := store.SearchEntities(ctx, "/entity/v1/new", 10)
+	if err != nil {
+		t.Fatalf("SearchEntities new path returned error: %v", err)
+	}
+	if !sectionEntitiesContain(newEntities, "api_endpoint", "GET", "/entity/v1/new", "", "text", 0.95) {
+		t.Fatalf("new entities = %+v, want replacement endpoint", newEntities)
+	}
+}
+
 func TestSyncSourceResolvesDocumentCenterRelativeAnchors(t *testing.T) {
 	ctx := context.Background()
 	docsDir := t.TempDir()
@@ -1099,6 +1529,94 @@ func TestSyncSourceResolvesDocumentCenterRelativeAnchors(t *testing.T) {
 	}
 	if result.Documents != 1 || len(result.BrokenLinks) != 0 {
 		t.Fatalf("SyncSource result = %+v, want one document and no broken links", result)
+	}
+}
+
+func TestSyncSourceResolvesHTMLHeadingSlugAndSuffixAliasAnchors(t *testing.T) {
+	ctx := context.Background()
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "index.html"), `<!doctype html>
+<html>
+  <head><title>mcp-remote - npm</title></head>
+  <body>
+    <p>
+      <a href="index.html#authentication-errors">Authentication errors</a>
+      <a href=".html#add">Add</a>
+    </p>
+    <h2>Authentication Errors</h2>
+    <p>Authentication error details.</p>
+    <h2>Add</h2>
+    <p>Add command details.</p>
+  </body>
+</html>`)
+
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := sqlite.Open(ctx, "sqlite://"+dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	_, err = store.CreateSource(ctx, domain.Source{
+		ID:   "src_html_heading_slug_docs",
+		Kind: "html",
+		Name: "HTML Heading Slug Docs",
+		DSN:  docsDir,
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	result, err := NewService(store).SyncSource(ctx, "src_html_heading_slug_docs")
+	if err != nil {
+		t.Fatalf("SyncSource returned error: %v", err)
+	}
+	if result.Documents != 1 || len(result.BrokenLinks) != 0 {
+		t.Fatalf("SyncSource result = %+v, want one document and no broken links", result)
+	}
+
+	graphDB := openGraphDB(t, dbPath)
+	assertGraphCount(t, ctx, graphDB, 2, `
+select count(*)
+from edges
+join nodes src on src.id = edges.src_id
+join nodes dst on dst.id = edges.dst_id
+where edges.kind = 'links_to'
+  and src.kind = 'DocSection'
+  and src.name = 'mcp-remote - npm'
+  and dst.kind = 'DocSection'
+  and dst.name in ('Authentication Errors', 'Add')
+`)
+}
+
+func TestResolveHTMLHrefCandidatesNormalizesFragmentsAndHTMLSuffixAlias(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		href   string
+		want   string
+	}{
+		{name: "root html suffix alias", source: "index.html", href: ".html#add", want: "index.html#add"},
+		{name: "nested html suffix alias", source: "guide/index.html", href: ".html#add", want: "guide/index.html#add"},
+		{name: "query before fragment", source: "index.html", href: "index.html?tab=readme#authentication-errors", want: "index.html#authentication-errors"},
+		{name: "escaped fragment", source: "index.html", href: "index.html#Authentication%20Errors", want: "index.html#Authentication Errors"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveHTMLHrefCandidates(tt.source, tt.href)
+			for _, candidate := range got {
+				if candidate == tt.want {
+					return
+				}
+			}
+			t.Fatalf("resolveHTMLHrefCandidates(%q, %q) = %+v, want candidate %q", tt.source, tt.href, got, tt.want)
+		})
 	}
 }
 
@@ -1306,15 +1824,111 @@ where edges.kind = 'exposes_api'
 `)
 }
 
+func TestSyncSourceConfluenceUsesCookieCredential(t *testing.T) {
+	ctx := context.Background()
+	server := newConfluenceCookieMockServer(t, "TEST_COOKIE=fixture-sync")
+
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := sqlite.Open(ctx, "sqlite://"+dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	_, err = store.CreateConfluenceCookieCredential(ctx, domain.ConfluenceCookieCredential{
+		ID:      "cred_confluence_cookie",
+		Name:    "Confluence Cookie",
+		BaseURL: server.URL + "/wiki",
+		Cookie:  "TEST_COOKIE=fixture-sync",
+	})
+	if err != nil {
+		t.Fatalf("CreateConfluenceCookieCredential returned error: %v", err)
+	}
+	_, err = store.CreateSource(ctx, domain.Source{
+		ID:   "src_confluence_cookie",
+		Kind: "confluence",
+		Name: "Confluence Cookie Docs",
+		DSN:  server.URL + "/wiki",
+		ConfigJSON: confluenceTestConfig(t, map[string]any{
+			"base_url":             server.URL + "/wiki",
+			"page_id":              "100",
+			"cookie":               "TEST_COOKIE=fixture-bad",
+			"cookie_credential_id": "cred_confluence_cookie",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	result, err := NewService(store).SyncSource(ctx, "src_confluence_cookie")
+	if err != nil {
+		t.Fatalf("SyncSource returned error: %v", err)
+	}
+	if result.SourceID != "src_confluence_cookie" || result.Documents != 1 || result.JobID == "" {
+		t.Fatalf("sync result = %+v, want one Confluence document", result)
+	}
+	source, err := store.GetSource(ctx, "src_confluence_cookie")
+	if err != nil {
+		t.Fatalf("GetSource returned error: %v", err)
+	}
+	if strings.Contains(source.ConfigJSON, "TEST_COOKIE=fixture-sync") {
+		t.Fatalf("source ConfigJSON was backfilled with raw credential cookie: %s", source.ConfigJSON)
+	}
+	assertSearchContains(t, ctx, store, "confluencesyncrootalpha", "Member Confluence Root")
+}
+
+func TestSyncSourceConfluenceMissingCredentialWritesFailedJob(t *testing.T) {
+	ctx := context.Background()
+	store := openSyncTestStore(t, ctx)
+	_, err := store.CreateSource(ctx, domain.Source{
+		ID:   "src_confluence_missing_credential",
+		Kind: "confluence",
+		Name: "Missing Credential Confluence",
+		DSN:  "https://confluence.example/wiki",
+		ConfigJSON: confluenceTestConfig(t, map[string]any{
+			"base_url":             "https://confluence.example/wiki",
+			"page_id":              "100",
+			"cookie_credential_id": "missing",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if _, err := NewService(store).SyncSource(ctx, "src_confluence_missing_credential"); err == nil {
+		t.Fatalf("SyncSource returned nil error, want missing credential error")
+	}
+	source, err := store.GetSource(ctx, "src_confluence_missing_credential")
+	if err != nil {
+		t.Fatalf("GetSource returned error: %v", err)
+	}
+	if source.SyncStatus != "paused" || source.SyncStatusReason != "credential_required" {
+		t.Fatalf("source sync state = (%q, %q), want paused credential_required", source.SyncStatus, source.SyncStatusReason)
+	}
+	jobs, err := store.ListSyncJobs(ctx, source.ID, 10)
+	if err != nil {
+		t.Fatalf("ListSyncJobs returned error: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].Status != "failed" || !strings.Contains(jobs[0].LastError, "credential") {
+		t.Fatalf("jobs = %+v, want failed credential job", jobs)
+	}
+}
+
 func TestSyncSourceConfluenceFailuresWriteFailedJobs(t *testing.T) {
 	ctx := context.Background()
-	server, _ := newConfluenceMockServer(t, "Bearer good-secret")
+	server, _ := newConfluenceMockServer(t, "Bearer fixture-good-value")
 
 	tests := []struct {
 		name       string
 		sourceID   string
 		configJSON string
 		wantErr    string
+		wantStatus string
 	}{
 		{
 			name:     "auth failure",
@@ -1322,9 +1936,10 @@ func TestSyncSourceConfluenceFailuresWriteFailedJobs(t *testing.T) {
 			configJSON: confluenceTestConfig(t, map[string]any{
 				"base_url": server.URL + "/wiki",
 				"page_id":  "100",
-				"token":    "bad-secret",
+				"token":    "fixture-bad-value",
 			}),
-			wantErr: "auth",
+			wantErr:    "auth",
+			wantStatus: "paused",
 		},
 		{
 			name:     "missing page",
@@ -1332,9 +1947,10 @@ func TestSyncSourceConfluenceFailuresWriteFailedJobs(t *testing.T) {
 			configJSON: confluenceTestConfig(t, map[string]any{
 				"base_url": server.URL + "/wiki",
 				"page_id":  "404",
-				"token":    "good-secret",
+				"token":    "fixture-good-value",
 			}),
-			wantErr: "404",
+			wantErr:    "404",
+			wantStatus: "active",
 		},
 	}
 
@@ -1374,6 +1990,16 @@ func TestSyncSourceConfluenceFailuresWriteFailedJobs(t *testing.T) {
 			if len(jobs) != 1 || jobs[0].Status != "failed" || !strings.Contains(jobs[0].LastError, tt.wantErr) {
 				t.Fatalf("failed jobs = %+v, want one failed job mentioning %q", jobs, tt.wantErr)
 			}
+			source, err := store.GetSource(ctx, tt.sourceID)
+			if err != nil {
+				t.Fatalf("GetSource returned error: %v", err)
+			}
+			if source.SyncStatus != tt.wantStatus {
+				t.Fatalf("source SyncStatus = %q, want %q", source.SyncStatus, tt.wantStatus)
+			}
+			if tt.wantStatus == "paused" && source.SyncStatusReason != "credential_required" {
+				t.Fatalf("paused source SyncStatusReason = %q, want credential_required", source.SyncStatusReason)
+			}
 		})
 	}
 }
@@ -1383,6 +2009,40 @@ func searchHitsContain(hits []domain.SearchHit, text string) bool {
 		if strings.Contains(hit.Content, text) {
 			return true
 		}
+	}
+	return false
+}
+
+func stringValuesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sectionEntitiesContain(entities []domain.SectionEntity, kind string, method string, path string, operation string, source string, minConfidence float64) bool {
+	for _, entity := range entities {
+		if kind != "" && entity.Kind != kind {
+			continue
+		}
+		if method != "" && entity.Method != method {
+			continue
+		}
+		if path != "" && entity.Path != path {
+			continue
+		}
+		if operation != "" && entity.Operation != operation {
+			continue
+		}
+		if source != "" && entity.Source != source {
+			continue
+		}
+		if minConfidence > 0 && entity.Confidence < minConfidence {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -1465,6 +2125,44 @@ func newConfluenceMockServer(t *testing.T, wantAuth string) (*confluenceMockServ
 	})
 	t.Cleanup(restore)
 	return &confluenceMockServer{URL: "https://confluence.example"}, &childRequests
+}
+
+func newConfluenceCookieMockServer(t *testing.T, wantCookie string) *confluenceMockServer {
+	t.Helper()
+
+	restore := confluence.SetHTTPClientFactoryForTest(func() *http.Client {
+		return &http.Client{Transport: confluenceRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.Header.Get("Cookie") != wantCookie {
+				return confluenceTextResponse(http.StatusUnauthorized, "unauthorized"), nil
+			}
+			switch r.URL.Path {
+			case "/wiki/rest/api/content/100":
+				return confluencePageResponse(t, "100", "Member Confluence Root", 3, `<h1>Overview</h1><p>Root confluencesyncrootalpha content.</p>`), nil
+			default:
+				return confluenceTextResponse(http.StatusNotFound, "not found"), nil
+			}
+		})}
+	})
+	t.Cleanup(restore)
+	return &confluenceMockServer{URL: "https://confluence.example"}
+}
+
+func openSyncTestStore(t *testing.T, ctx context.Context) *sqlite.Store {
+	t.Helper()
+
+	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	return store
 }
 
 type confluenceRoundTripFunc func(*http.Request) (*http.Response, error)

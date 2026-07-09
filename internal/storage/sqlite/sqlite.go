@@ -2,11 +2,15 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -15,61 +19,268 @@ import (
 
 	"github.com/docgraph/docgraph/internal/domain"
 	"github.com/docgraph/docgraph/internal/ids"
+	"github.com/docgraph/docgraph/internal/searchtoken"
 	"github.com/docgraph/docgraph/internal/storage/sqlschema"
+	"github.com/docgraph/docgraph/internal/technical/extract"
 )
 
 type Store struct {
-	db  *sql.DB
-	dsn string
+	db     *sql.DB
+	reader *sql.DB
+	dsn    string
 }
 
+const (
+	sectionTokenIndexVersion    = "gse-v1"
+	sectionTokenIndexRebuilding = sectionTokenIndexVersion + ":rebuilding"
+	legacyNodeIndexVersion      = "v1"
+)
+
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	return open(ctx, dsn, true)
+}
+
+func OpenExisting(ctx context.Context, dsn string) (*Store, error) {
+	return open(ctx, dsn, false)
+}
+
+func open(ctx context.Context, dsn string, create bool) (*Store, error) {
 	path, err := pathFromDSN(dsn)
 	if err != nil {
 		return nil, err
+	}
+	if !create {
+		if _, err := os.Stat(path); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	db, err := openSQLiteHandle(ctx, path, 1, "writer")
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(time.Hour)
-
-	if err := db.PingContext(ctx); err != nil {
+	reader, err := openSQLiteHandle(ctx, path, 8, "reader")
+	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 
-	return &Store{db: db, dsn: dsn}, nil
+	return &Store{db: db, reader: reader, dsn: dsn}, nil
 }
 
 func (s *Store) Close() error {
+	if s.reader == nil {
+		return s.db.Close()
+	}
+	if err := s.reader.Close(); err != nil {
+		_ = s.db.Close()
+		return err
+	}
 	return s.db.Close()
+}
+
+func openSQLiteHandle(ctx context.Context, path string, maxOpenConns int, role string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite %s handle: %w", role, err)
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxOpenConns)
+	db.SetConnMaxLifetime(time.Hour)
+
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping sqlite %s handle: %w", role, err)
+	}
+	if err := applyPragmas(ctx, db, role); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func sqliteDSN(path string) string {
+	return path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(wal)&_pragma=synchronous(normal)"
+}
+
+func applyPragmas(ctx context.Context, db *sql.DB, role string) error {
+	for _, stmt := range []string{
+		`pragma journal_mode = wal`,
+		`pragma busy_timeout = 5000`,
+		`pragma foreign_keys = on`,
+		`pragma synchronous = normal`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("apply sqlite %s %s: %w", role, stmt, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) readDB() *sql.DB {
+	if s.reader != nil {
+		return s.reader
+	}
+	return s.db
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, sqlschema.Schema); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `
+	for _, stmt := range []string{
+		`alter table sources add column sync_status text not null default 'active'`,
+		`alter table sources add column sync_status_reason text not null default ''`,
+		`alter table sources add column sync_paused_at text not null default ''`,
+		`alter table jobs add column source_id text not null default ''`,
+		`alter table jobs add column target_kind text not null default ''`,
+		`alter table jobs add column target_id text not null default ''`,
+		`alter table jobs add column progress_json text not null default '{}'`,
+		`alter table jobs add column result_json text not null default '{}'`,
+		`alter table jobs add column worker_id text not null default ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `
+update jobs
+set source_id = json_extract(payload_json, '$.source_id')
+where source_id = ''
+  and json_valid(payload_json)
+  and json_extract(payload_json, '$.source_id') is not null
+`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+create index if not exists idx_jobs_kind_status_run_after
+  on jobs(kind, status, run_after);
+create index if not exists idx_jobs_source_kind_status
+  on jobs(source_id, kind, status, updated_at);
+create index if not exists idx_jobs_target
+  on jobs(target_kind, target_id, kind, status);
+create index if not exists idx_feedback_target
+  on feedback_events(target_kind, target_id, feedback_kind);
+create table if not exists query_events (
+  id text primary key,
+  query_hash text not null,
+  normalized_query text not null default '',
+  query_text text not null default '',
+  source text not null default '',
+  result_count integer not null default 0,
+  latency_ms integer not null default 0,
+  cache_hit integer not null default 0,
+  created_at text not null default current_timestamp
+);
+create table if not exists search_result_events (
+  id text primary key,
+  query_event_id text not null references query_events(id) on delete cascade,
+  document_id text not null,
+  section_id text not null,
+  rank integer not null,
+  score real not null default 0,
+  clicked integer not null default 0,
+  used_in_context integer not null default 0,
+  created_at text not null default current_timestamp
+);
+create table if not exists search_index_meta (
+  key text primary key,
+  value text not null,
+  updated_at text not null default current_timestamp
+);
+create index if not exists idx_query_events_hash_created
+  on query_events(query_hash, created_at);
+create index if not exists idx_search_result_events_query
+  on search_result_events(query_event_id, rank);
+create virtual table if not exists fts_nodes using fts5(
+  kind,
+  name,
+  canonical_name,
+  metadata_json,
+  node_id unindexed
+);
+create virtual table if not exists fts_section_tokens using fts5(
+  title_tokens,
+  section_heading_tokens,
+  symbol_tokens,
+  content_tokens,
+  section_id unindexed,
+  document_id unindexed
+);
+create virtual table if not exists fts_section_tokens_trigram using fts5(
+  title_tokens,
+  section_heading_tokens,
+  symbol_tokens,
+  content_tokens,
+  section_id unindexed,
+  document_id unindexed,
+  tokenize='trigram'
+);
+`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
 update jobs
 set status = 'failed',
     last_error = 'Previous run interrupted (process exited while job was running)',
+    worker_id = '',
+    locked_until = null,
     updated_at = current_timestamp
 where status = 'running'
-`)
+`); err != nil {
+		return err
+	}
+	if err := s.EnsureSearchIndexes(ctx); err != nil {
+		return err
+	}
+	return s.recordSchemaVersion(ctx)
+}
+
+func (s *Store) CheckSchema(ctx context.Context) error {
+	version, err := s.schemaVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if version < sqlschema.CurrentSchemaVersion {
+		return fmt.Errorf("database schema version %d is older than required version %d; run docgraph migrate", version, sqlschema.CurrentSchemaVersion)
+	}
+	if version > sqlschema.CurrentSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d; upgrade docgraph", version, sqlschema.CurrentSchemaVersion)
+	}
+	return nil
+}
+
+func (s *Store) recordSchemaVersion(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+insert into schema_migrations (version, applied_at)
+values (?, current_timestamp)
+on conflict(version) do nothing
+`, sqlschema.CurrentSchemaVersion)
 	return err
+}
+
+func (s *Store) schemaVersion(ctx context.Context) (int, error) {
+	var version int
+	err := s.db.QueryRowContext(ctx, `select coalesce(max(version), 0) from schema_migrations`).Scan(&version)
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table: schema_migrations") {
+			return 0, fmt.Errorf("database is not migrated; run docgraph migrate")
+		}
+		return 0, err
+	}
+	if version == 0 {
+		return 0, fmt.Errorf("database is not migrated; run docgraph migrate")
+	}
+	return version, nil
 }
 
 func (s *Store) Status(ctx context.Context) (sqlschema.Status, error) {
 	count := func(table string) (int64, error) {
 		var n int64
-		err := s.db.QueryRowContext(ctx, "select count(*) from "+table).Scan(&n)
+		err := s.readDB().QueryRowContext(ctx, "select count(*) from "+table).Scan(&n)
 		return n, err
 	}
 
@@ -96,13 +307,213 @@ func (s *Store) Status(ctx context.Context) (sqlschema.Status, error) {
 	return status, nil
 }
 
+func (s *Store) EnsureSearchIndexes(ctx context.Context) error {
+	if err := s.ensureLegacyNodeIndex(ctx); err != nil {
+		return err
+	}
+	needsTokenBackfill, err := s.ensureSectionTokenIndexVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if !needsTokenBackfill {
+		return nil
+	}
+	if err := s.backfillSectionTokenIndexes(ctx); err != nil {
+		return err
+	}
+	if err := s.setSearchIndexVersion(ctx, "section_tokens", sectionTokenIndexVersion); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureLegacyNodeIndex(ctx context.Context) error {
+	if version, err := s.searchIndexVersion(ctx, "nodes"); err != nil {
+		return err
+	} else if version == legacyNodeIndexVersion {
+		return nil
+	}
+	nodeCount, err := s.countRows(ctx, "nodes")
+	if err != nil {
+		return err
+	}
+	ftsCount, err := s.countRows(ctx, "fts_nodes")
+	if err != nil {
+		return err
+	}
+	if ftsCount >= nodeCount {
+		return s.setSearchIndexVersion(ctx, "nodes", legacyNodeIndexVersion)
+	}
+	if ftsCount == 0 {
+		return s.backfillNodeIndexFromOffset(ctx, 0)
+	}
+	return s.backfillNodeIndexFromOffset(ctx, ftsCount)
+}
+
+func (s *Store) ensureSectionTokenIndexVersion(ctx context.Context) (bool, error) {
+	var version string
+	err := s.db.QueryRowContext(ctx, `select value from search_index_meta where key = 'section_tokens'`).Scan(&version)
+	if err == nil && version == sectionTokenIndexVersion {
+		return false, nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return false, err
+	}
+	sectionCount, err := s.countRows(ctx, "sections")
+	if err != nil {
+		return false, err
+	}
+	tokenCount, err := s.countRows(ctx, "fts_section_tokens")
+	if err != nil {
+		return false, err
+	}
+	trigramCount, err := s.countRows(ctx, "fts_section_tokens_trigram")
+	if err != nil {
+		return false, err
+	}
+	if tokenCount >= sectionCount && trigramCount >= sectionCount {
+		return false, s.setSearchIndexVersion(ctx, "section_tokens", sectionTokenIndexVersion)
+	}
+	if version == sectionTokenIndexRebuilding {
+		return true, nil
+	}
+	if _, err := s.db.ExecContext(ctx, `delete from fts_section_tokens`); err != nil {
+		return false, err
+	}
+	if _, err := s.db.ExecContext(ctx, `delete from fts_section_tokens_trigram`); err != nil {
+		return false, err
+	}
+	if err := s.setSearchIndexVersion(ctx, "section_tokens", sectionTokenIndexRebuilding); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) searchIndexVersion(ctx context.Context, key string) (string, error) {
+	var version string
+	err := s.db.QueryRowContext(ctx, `select value from search_index_meta where key = ?`, key).Scan(&version)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+func (s *Store) countRows(ctx context.Context, table string) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, "select count(*) from "+table).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) setSearchIndexVersion(ctx context.Context, key string, version string) error {
+	_, err := s.db.ExecContext(ctx, `
+insert into search_index_meta (key, value, updated_at)
+values (?, ?, current_timestamp)
+on conflict(key) do update set
+  value = excluded.value,
+  updated_at = current_timestamp
+`, key, version)
+	return err
+}
+
+func (s *Store) backfillNodeIndexFromOffset(ctx context.Context, offset int64) error {
+	if _, err := s.db.ExecContext(ctx, `
+insert into fts_nodes (kind, name, canonical_name, metadata_json, node_id)
+select nodes.kind, nodes.name, nodes.canonical_name, nodes.metadata_json, nodes.id
+from nodes
+order by nodes.rowid
+limit -1 offset ?
+`, offset); err != nil {
+		return err
+	}
+	return s.setSearchIndexVersion(ctx, "nodes", legacyNodeIndexVersion)
+}
+
+func (s *Store) backfillSectionTokenIndexes(ctx context.Context) error {
+	sectionCount, err := s.countRows(ctx, "sections")
+	if err != nil {
+		return err
+	}
+	tokenCount, err := s.countRows(ctx, "fts_section_tokens")
+	if err != nil {
+		return err
+	}
+	trigramCount, err := s.countRows(ctx, "fts_section_tokens_trigram")
+	if err != nil {
+		return err
+	}
+	offset := minInt64(tokenCount, trigramCount)
+	if offset >= sectionCount {
+		return nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+select s.id, s.document_id, d.title, s.heading_path, s.title, s.content
+from sections s
+join documents d on d.id = s.document_id
+order by s.rowid
+limit -1 offset ?
+`, offset)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type rowData struct {
+		sectionID     string
+		documentID    string
+		documentTitle string
+		headingPath   string
+		sectionTitle  string
+		content       string
+	}
+	pending := make([]rowData, 0)
+	for rows.Next() {
+		var row rowData
+		if err := rows.Scan(&row.sectionID, &row.documentID, &row.documentTitle, &row.headingPath, &row.sectionTitle, &row.content); err != nil {
+			return err
+		}
+		pending = append(pending, row)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, row := range pending {
+		titleTokens, headingTokens, symbolTokens, contentTokens := buildSectionIndexTexts(row.documentTitle, row.sectionTitle, row.headingPath, row.content)
+		if _, err := s.db.ExecContext(ctx, `
+insert into fts_section_tokens (title_tokens, section_heading_tokens, symbol_tokens, content_tokens, section_id, document_id)
+values (?, ?, ?, ?, ?, ?)
+`, titleTokens, headingTokens, symbolTokens, contentTokens, row.sectionID, row.documentID); err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `
+insert into fts_section_tokens_trigram (title_tokens, section_heading_tokens, symbol_tokens, content_tokens, section_id, document_id)
+values (?, ?, ?, ?, ?, ?)
+`, titleTokens, headingTokens, symbolTokens, contentTokens, row.sectionID, row.documentID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (s *Store) CreateSource(ctx context.Context, source domain.Source) (domain.Source, error) {
 	if source.ConfigJSON == "" {
 		source.ConfigJSON = "{}"
 	}
+	source.SyncStatus, source.SyncStatusReason, source.SyncPausedAt = normalizeSourceSyncState(source.SyncStatus, source.SyncStatusReason, source.SyncPausedAt)
 	_, err := s.db.ExecContext(ctx, `
-insert into sources (id, kind, name, dsn, config_json, product_hint, module_hint, sync_schedule)
-values (?, ?, ?, ?, ?, ?, ?, ?)
+insert into sources (id, kind, name, dsn, config_json, product_hint, module_hint, sync_schedule, sync_status, sync_status_reason, sync_paused_at)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 on conflict(id) do update set
   kind = excluded.kind,
   name = excluded.name,
@@ -112,7 +523,7 @@ on conflict(id) do update set
   module_hint = excluded.module_hint,
   sync_schedule = excluded.sync_schedule,
   updated_at = current_timestamp
-`, source.ID, source.Kind, source.Name, source.DSN, source.ConfigJSON, source.ProductHint, source.ModuleHint, source.SyncSchedule)
+`, source.ID, source.Kind, source.Name, source.DSN, source.ConfigJSON, source.ProductHint, source.ModuleHint, source.SyncSchedule, source.SyncStatus, source.SyncStatusReason, source.SyncPausedAt)
 	if err != nil {
 		return domain.Source{}, err
 	}
@@ -166,7 +577,13 @@ func (s *Store) DeleteSource(ctx context.Context, id string) error {
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `
-delete from fts_sections
+delete from fts_section_tokens
+where document_id in (select id from documents where source_id = ?)
+`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+delete from fts_section_tokens_trigram
 where document_id in (select id from documents where source_id = ?)
 `, id); err != nil {
 		return err
@@ -185,8 +602,8 @@ where document_id in (select id from documents where source_id = ?)
 }
 
 func (s *Store) ListSources(ctx context.Context) ([]domain.Source, error) {
-	rows, err := s.db.QueryContext(ctx, `
-select id, kind, name, dsn, config_json, product_hint, module_hint, sync_schedule, created_at, updated_at
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, kind, name, dsn, config_json, product_hint, module_hint, sync_schedule, sync_status, sync_status_reason, sync_paused_at, created_at, updated_at
 from sources
 order by created_at desc, id desc
 `)
@@ -198,7 +615,7 @@ order by created_at desc, id desc
 	var sources []domain.Source
 	for rows.Next() {
 		var source domain.Source
-		if err := rows.Scan(&source.ID, &source.Kind, &source.Name, &source.DSN, &source.ConfigJSON, &source.ProductHint, &source.ModuleHint, &source.SyncSchedule, &source.CreatedAt, &source.UpdatedAt); err != nil {
+		if err := rows.Scan(&source.ID, &source.Kind, &source.Name, &source.DSN, &source.ConfigJSON, &source.ProductHint, &source.ModuleHint, &source.SyncSchedule, &source.SyncStatus, &source.SyncStatusReason, &source.SyncPausedAt, &source.CreatedAt, &source.UpdatedAt); err != nil {
 			return nil, err
 		}
 		sources = append(sources, source)
@@ -208,68 +625,249 @@ order by created_at desc, id desc
 
 func (s *Store) GetSource(ctx context.Context, id string) (domain.Source, error) {
 	var source domain.Source
-	err := s.db.QueryRowContext(ctx, `
-select id, kind, name, dsn, config_json, product_hint, module_hint, sync_schedule, created_at, updated_at
+	err := s.readDB().QueryRowContext(ctx, `
+select id, kind, name, dsn, config_json, product_hint, module_hint, sync_schedule, sync_status, sync_status_reason, sync_paused_at, created_at, updated_at
 from sources
 where id = ?
-`, id).Scan(&source.ID, &source.Kind, &source.Name, &source.DSN, &source.ConfigJSON, &source.ProductHint, &source.ModuleHint, &source.SyncSchedule, &source.CreatedAt, &source.UpdatedAt)
+`, id).Scan(&source.ID, &source.Kind, &source.Name, &source.DSN, &source.ConfigJSON, &source.ProductHint, &source.ModuleHint, &source.SyncSchedule, &source.SyncStatus, &source.SyncStatusReason, &source.SyncPausedAt, &source.CreatedAt, &source.UpdatedAt)
 	if err != nil {
 		return domain.Source{}, err
 	}
 	return source, nil
 }
 
-func (s *Store) ListSourceArtifacts(ctx context.Context, sourceID string, limit, offset int) (domain.SourceArtifacts, error) {
-	sourceID = strings.TrimSpace(sourceID)
-	if sourceID == "" {
-		return domain.SourceArtifacts{}, fmt.Errorf("source id is required")
+func (s *Store) CreateConfluenceCookieCredential(ctx context.Context, credential domain.ConfluenceCookieCredential) (domain.ConfluenceCookieCredential, error) {
+	credential.ID = strings.TrimSpace(credential.ID)
+	credential.Name = strings.TrimSpace(credential.Name)
+	credential.BaseURL = strings.TrimSpace(credential.BaseURL)
+	credential.Cookie = strings.TrimSpace(credential.Cookie)
+	credential.Notes = strings.TrimSpace(credential.Notes)
+	credential.Status = normalizeCredentialStatus(credential.Status)
+	if credential.ID == "" {
+		return domain.ConfluenceCookieCredential{}, fmt.Errorf("credential id is required")
 	}
-	if limit <= 0 || limit > 200 {
-		limit = 50
+	if credential.Name == "" {
+		return domain.ConfluenceCookieCredential{}, fmt.Errorf("credential name is required")
 	}
-	if offset < 0 {
-		offset = 0
+	if credential.BaseURL == "" {
+		return domain.ConfluenceCookieCredential{}, fmt.Errorf("credential base_url is required")
 	}
-	if _, err := s.GetSource(ctx, sourceID); err != nil {
-		return domain.SourceArtifacts{}, err
+	if credential.Cookie == "" {
+		return domain.ConfluenceCookieCredential{}, fmt.Errorf("credential cookie is required")
 	}
+	_, err := s.db.ExecContext(ctx, `
+insert into confluence_cookie_credentials (id, name, base_url, cookie, notes, status, last_error)
+values (?, ?, ?, ?, ?, ?, ?)
+`, credential.ID, credential.Name, credential.BaseURL, credential.Cookie, credential.Notes, credential.Status, strings.TrimSpace(credential.LastError))
+	if err != nil {
+		return domain.ConfluenceCookieCredential{}, err
+	}
+	return s.GetConfluenceCookieCredential(ctx, credential.ID)
+}
 
-	counts, err := s.sourceArtifactCounts(ctx, sourceID)
+func (s *Store) UpdateConfluenceCookieCredential(ctx context.Context, credential domain.ConfluenceCookieCredential) (domain.ConfluenceCookieCredential, error) {
+	credential.ID = strings.TrimSpace(credential.ID)
+	credential.Name = strings.TrimSpace(credential.Name)
+	credential.BaseURL = strings.TrimSpace(credential.BaseURL)
+	credential.Cookie = strings.TrimSpace(credential.Cookie)
+	credential.Notes = strings.TrimSpace(credential.Notes)
+	credential.Status = normalizeCredentialStatus(credential.Status)
+	if credential.ID == "" {
+		return domain.ConfluenceCookieCredential{}, fmt.Errorf("credential id is required")
+	}
+	if credential.Name == "" {
+		return domain.ConfluenceCookieCredential{}, fmt.Errorf("credential name is required")
+	}
+	if credential.BaseURL == "" {
+		return domain.ConfluenceCookieCredential{}, fmt.Errorf("credential base_url is required")
+	}
+	if credential.Cookie == "" {
+		return domain.ConfluenceCookieCredential{}, fmt.Errorf("credential cookie is required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+update confluence_cookie_credentials
+set name = ?, base_url = ?, cookie = ?, notes = ?, status = ?, last_error = ?, updated_at = current_timestamp
+where id = ?
+`, credential.Name, credential.BaseURL, credential.Cookie, credential.Notes, credential.Status, strings.TrimSpace(credential.LastError), credential.ID)
+	if err != nil {
+		return domain.ConfluenceCookieCredential{}, err
+	}
+	if n, err := result.RowsAffected(); err == nil && n == 0 {
+		return domain.ConfluenceCookieCredential{}, sql.ErrNoRows
+	}
+	return s.GetConfluenceCookieCredential(ctx, credential.ID)
+}
+
+func (s *Store) UpdateConfluenceCookieCredentialValidation(ctx context.Context, id string, status string, errText string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("credential id is required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+update confluence_cookie_credentials
+set status = ?, last_validated_at = current_timestamp, last_error = ?, updated_at = current_timestamp
+where id = ?
+`, normalizeCredentialStatus(status), strings.TrimSpace(errText), id)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err == nil && n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) DeleteConfluenceCookieCredential(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("credential id is required")
+	}
+	result, err := s.db.ExecContext(ctx, `delete from confluence_cookie_credentials where id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err == nil && n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) ListConfluenceCookieCredentials(ctx context.Context) ([]domain.ConfluenceCookieCredential, error) {
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, name, base_url, cookie, notes, status, last_validated_at, last_error, created_at, updated_at
+from confluence_cookie_credentials
+order by updated_at desc, created_at desc, id desc
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var credentials []domain.ConfluenceCookieCredential
+	for rows.Next() {
+		var credential domain.ConfluenceCookieCredential
+		if err := rows.Scan(&credential.ID, &credential.Name, &credential.BaseURL, &credential.Cookie, &credential.Notes, &credential.Status, &credential.LastValidatedAt, &credential.LastError, &credential.CreatedAt, &credential.UpdatedAt); err != nil {
+			return nil, err
+		}
+		credentials = append(credentials, credential)
+	}
+	return credentials, rows.Err()
+}
+
+func (s *Store) GetConfluenceCookieCredential(ctx context.Context, id string) (domain.ConfluenceCookieCredential, error) {
+	var credential domain.ConfluenceCookieCredential
+	err := s.readDB().QueryRowContext(ctx, `
+select id, name, base_url, cookie, notes, status, last_validated_at, last_error, created_at, updated_at
+from confluence_cookie_credentials
+where id = ?
+`, strings.TrimSpace(id)).Scan(&credential.ID, &credential.Name, &credential.BaseURL, &credential.Cookie, &credential.Notes, &credential.Status, &credential.LastValidatedAt, &credential.LastError, &credential.CreatedAt, &credential.UpdatedAt)
+	if err != nil {
+		return domain.ConfluenceCookieCredential{}, err
+	}
+	return credential, nil
+}
+
+func normalizeCredentialStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "valid", "invalid":
+		return strings.TrimSpace(status)
+	default:
+		return "unknown"
+	}
+}
+
+func (s *Store) UpdateSourceSyncState(ctx context.Context, id string, status string, reason string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("source id is required")
+	}
+	status, reason, pausedAt := normalizeSourceSyncState(status, reason, "")
+	if status == "paused" && pausedAt == "" {
+		result, err := s.db.ExecContext(ctx, `
+update sources
+set sync_status = ?, sync_status_reason = ?, sync_paused_at = current_timestamp, updated_at = current_timestamp
+where id = ?
+`, status, reason, id)
+		if err != nil {
+			return err
+		}
+		if n, err := result.RowsAffected(); err == nil && n == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+update sources
+set sync_status = ?, sync_status_reason = ?, sync_paused_at = ?, updated_at = current_timestamp
+where id = ?
+`, status, reason, pausedAt, id)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err == nil && n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) ListSourceArtifacts(ctx context.Context, sourceID string, limit, offset int) (domain.SourceArtifacts, error) {
+	sourceID, limit, offset, err := normalizeSourceArtifactPage(sourceID, limit, offset)
 	if err != nil {
 		return domain.SourceArtifacts{}, err
 	}
-	docs, err := s.listSourceDocuments(ctx, sourceID, limit, offset)
+	counts, err := s.GetSourceArtifactCounts(ctx, sourceID)
 	if err != nil {
 		return domain.SourceArtifacts{}, err
 	}
-	sections, err := s.listSourceSections(ctx, sourceID, limit, offset)
+	docs, err := s.ListSourceDocuments(ctx, sourceID, limit, offset)
 	if err != nil {
 		return domain.SourceArtifacts{}, err
 	}
-	nodes, err := s.listSourceNodes(ctx, sourceID, limit, offset)
+	sections, err := s.ListSourceSections(ctx, sourceID, limit, offset)
 	if err != nil {
 		return domain.SourceArtifacts{}, err
 	}
-	edges, err := s.listSourceEdges(ctx, sourceID, limit, offset)
+	sectionEntities, err := s.ListSourceSectionEntities(ctx, sourceID, limit, offset)
+	if err != nil {
+		return domain.SourceArtifacts{}, err
+	}
+	nodes, err := s.ListSourceNodes(ctx, sourceID, limit, offset)
+	if err != nil {
+		return domain.SourceArtifacts{}, err
+	}
+	edges, err := s.ListSourceEdges(ctx, sourceID, limit, offset)
+	if err != nil {
+		return domain.SourceArtifacts{}, err
+	}
+	entityDiagnostics, err := s.sourceEntityDiagnostics(ctx, sourceID, 20)
 	if err != nil {
 		return domain.SourceArtifacts{}, err
 	}
 	return domain.SourceArtifacts{
-		SourceID:  sourceID,
-		Counts:    counts,
-		Documents: docs,
-		Sections:  sections,
-		Nodes:     nodes,
-		Edges:     edges,
+		SourceID:          sourceID,
+		Counts:            counts,
+		EntityDiagnostics: entityDiagnostics,
+		Documents:         docs,
+		Sections:          sections,
+		SectionEntities:   sectionEntities,
+		Nodes:             nodes,
+		Edges:             edges,
 	}, nil
 }
 
-func (s *Store) sourceArtifactCounts(ctx context.Context, sourceID string) (domain.SourceArtifactCounts, error) {
+func (s *Store) GetSourceArtifactCounts(ctx context.Context, sourceID string) (domain.SourceArtifactCounts, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return domain.SourceArtifactCounts{}, fmt.Errorf("source id is required")
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return domain.SourceArtifactCounts{}, err
+	}
 	var counts domain.SourceArtifactCounts
-	if err := s.db.QueryRowContext(ctx, `select count(*) from documents where source_id = ?`, sourceID).Scan(&counts.Documents); err != nil {
+	if err := s.readDB().QueryRowContext(ctx, `select count(*) from documents where source_id = ?`, sourceID).Scan(&counts.Documents); err != nil {
 		return counts, err
 	}
-	if err := s.db.QueryRowContext(ctx, `
+	if err := s.readDB().QueryRowContext(ctx, `
 select count(*)
 from sections
 join documents on documents.id = sections.document_id
@@ -277,10 +875,10 @@ where documents.source_id = ?
 `, sourceID).Scan(&counts.Sections); err != nil {
 		return counts, err
 	}
-	if err := s.db.QueryRowContext(ctx, `select count(*) from nodes where metadata_json like ?`, sourceIDLike(sourceID)).Scan(&counts.Nodes); err != nil {
+	if err := s.readDB().QueryRowContext(ctx, `select count(*) from nodes where metadata_json like ?`, sourceIDLike(sourceID)).Scan(&counts.Nodes); err != nil {
 		return counts, err
 	}
-	if err := s.db.QueryRowContext(ctx, `
+	if err := s.readDB().QueryRowContext(ctx, `
 select count(distinct e.id)
 from edges e
 join nodes src on src.id = e.src_id
@@ -293,11 +891,287 @@ where src.metadata_json like ?
 `, sourceIDLike(sourceID), sourceIDLike(sourceID), sourceID).Scan(&counts.Edges); err != nil {
 		return counts, err
 	}
+	if err := s.readDB().QueryRowContext(ctx, `
+select count(*)
+from section_entities se
+join documents d on d.id = se.document_id
+where d.source_id = ?
+`, sourceID).Scan(&counts.SectionEntities); err != nil {
+		return counts, err
+	}
 	return counts, nil
 }
 
-func (s *Store) listSourceDocuments(ctx context.Context, sourceID string, limit, offset int) ([]domain.DocumentSummary, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *Store) GetSourceHealth(ctx context.Context, sourceID string) (domain.SourceHealth, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return domain.SourceHealth{}, fmt.Errorf("source id is required")
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return domain.SourceHealth{}, err
+	}
+	counts, err := s.GetSourceArtifactCounts(ctx, sourceID)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	entityDiagnostics, err := s.sourceEntityDiagnostics(ctx, sourceID, 20)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	zeroDocs, err := s.listZeroSectionDocuments(ctx, sourceID, 50)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	lowSections, err := s.listLowContentSections(ctx, sourceID, 50)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	staleFeedback, err := s.listSourceDocumentFeedback(ctx, sourceID, "document_stale", 100)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	jobs, err := s.ListJobs(ctx, domain.JobListOptions{SourceID: sourceID, Kind: "sync_source", Limit: 1})
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	var latestJob domain.Job
+	var brokenLinks []domain.BrokenLink
+	if len(jobs) > 0 {
+		latestJob = jobs[0]
+		brokenLinks = brokenLinksFromJob(latestJob)
+	}
+	warnings := sourceHealthWarnings(counts, entityDiagnostics, latestJob, brokenLinks, zeroDocs, lowSections, staleFeedback)
+	return domain.SourceHealth{
+		SourceID:             sourceID,
+		Counts:               counts,
+		EntityDiagnostics:    entityDiagnostics,
+		LatestJob:            latestJob,
+		BrokenLinks:          brokenLinks,
+		ZeroSectionDocuments: zeroDocs,
+		LowContentSections:   lowSections,
+		StaleFeedback:        staleFeedback,
+		Warnings:             warnings,
+	}, nil
+}
+
+func (s *Store) listZeroSectionDocuments(ctx context.Context, sourceID string, limit int) ([]domain.DocumentSummary, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select documents.id, documents.source_id, documents.external_id, documents.title, documents.url,
+       documents.content_hash, documents.indexed_at, count(sections.id)
+from documents
+left join sections on sections.document_id = documents.id
+where documents.source_id = ?
+group by documents.id
+having count(sections.id) = 0
+order by documents.indexed_at desc, documents.title asc
+limit ?
+`, sourceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var docs []domain.DocumentSummary
+	for rows.Next() {
+		var doc domain.DocumentSummary
+		if err := rows.Scan(&doc.ID, &doc.SourceID, &doc.ExternalID, &doc.Title, &doc.URL, &doc.ContentHash, &doc.IndexedAt, &doc.SectionCount); err != nil {
+			return nil, err
+		}
+		doc.NodeID = stableDocumentNodeID(doc.ID)
+		docs = append(docs, doc)
+	}
+	return docs, rows.Err()
+}
+
+func (s *Store) listLowContentSections(ctx context.Context, sourceID string, limit int) ([]domain.SectionSummary, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
+       substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 220),
+       sections.ordinal
+from sections
+join documents on documents.id = sections.document_id
+where documents.source_id = ?
+  and length(trim(sections.content)) < 80
+order by length(trim(sections.content)) asc, documents.title asc, sections.ordinal asc
+limit ?
+`, sourceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sections []domain.SectionSummary
+	for rows.Next() {
+		var section domain.SectionSummary
+		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.Ordinal); err != nil {
+			return nil, err
+		}
+		section.NodeID = stableSectionNodeID(section.ID)
+		sections = append(sections, section)
+	}
+	return sections, rows.Err()
+}
+
+func (s *Store) listSourceDocumentFeedback(ctx context.Context, sourceID string, feedbackKind string, limit int) ([]domain.FeedbackEvent, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select fe.id, fe.target_kind, fe.target_id, fe.feedback_kind, fe.payload_json, fe.actor, fe.created_at
+from feedback_events fe
+join documents d on d.id = fe.target_id
+where fe.target_kind = 'document'
+  and d.source_id = ?
+  and (? = '' or fe.feedback_kind = ?)
+order by fe.rowid desc
+limit ?
+`, sourceID, feedbackKind, feedbackKind, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := make([]domain.FeedbackEvent, 0)
+	for rows.Next() {
+		var event domain.FeedbackEvent
+		if err := rows.Scan(&event.ID, &event.TargetKind, &event.TargetID, &event.FeedbackKind, &event.PayloadJSON, &event.Actor, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func brokenLinksFromJob(job domain.Job) []domain.BrokenLink {
+	raw := strings.TrimSpace(job.ResultJSON)
+	if raw == "" || raw == "{}" {
+		raw = strings.TrimSpace(job.PayloadJSON)
+	}
+	var payload domain.ResultPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil
+	}
+	return payload.BrokenLinks
+}
+
+func sourceHealthWarnings(counts domain.SourceArtifactCounts, entityDiagnostics domain.EntityDiagnostics, latestJob domain.Job, brokenLinks []domain.BrokenLink, zeroDocs []domain.DocumentSummary, lowSections []domain.SectionSummary, staleFeedback []domain.FeedbackEvent) []domain.SourceHealthWarning {
+	warnings := make([]domain.SourceHealthWarning, 0)
+	if latestJob.ID == "" {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "no_sync_job", Severity: "warn", Message: "Source has no sync job history."})
+	} else if latestJob.Status == "failed" {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "latest_sync_failed", Severity: "error", Message: latestJob.LastError, Count: 1})
+	}
+	if counts.Documents == 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "no_documents", Severity: "error", Message: "No documents are indexed for this source."})
+	}
+	if counts.Sections > 0 && counts.SectionEntities == 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "no_section_entities", Severity: "info", Message: "No technical entities have been extracted for this source.", Count: int(counts.Sections)})
+	}
+	if len(brokenLinks) > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "broken_links", Severity: "warn", Message: "Latest sync reported broken links.", Count: len(brokenLinks)})
+	}
+	if len(zeroDocs) > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "zero_section_documents", Severity: "warn", Message: "Some documents have no parsed sections.", Count: len(zeroDocs)})
+	}
+	if len(lowSections) > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "low_content_sections", Severity: "warn", Message: "Some parsed sections contain very little text.", Count: len(lowSections)})
+	}
+	if len(staleFeedback) > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "stale_documents", Severity: "info", Message: "Some documents are manually marked stale.", Count: len(staleFeedback)})
+	}
+	if entityDiagnostics.DocumentsPathOnly > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "path_literals_without_api", Severity: "warn", Message: "Some documents contain path literals but no API endpoints.", Count: entityDiagnostics.DocumentsPathOnly})
+	}
+	return warnings
+}
+
+func (s *Store) sourceEntityDiagnostics(ctx context.Context, sourceID string, limit int) (domain.EntityDiagnostics, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	var diagnostics domain.EntityDiagnostics
+	err := s.readDB().QueryRowContext(ctx, `
+select
+  count(*),
+  coalesce(sum(case when kind = 'api_endpoint' then 1 else 0 end), 0),
+  coalesce(sum(case when kind = 'path_literal' then 1 else 0 end), 0),
+  coalesce(sum(case when kind = 'operation_candidate' then 1 else 0 end), 0),
+  count(distinct document_id),
+  count(distinct case when kind = 'api_endpoint' then document_id end),
+  count(distinct section_id)
+from section_entities
+where document_id in (select id from documents where source_id = ?)
+`, sourceID).Scan(&diagnostics.Total, &diagnostics.APIEndpoints, &diagnostics.PathLiterals, &diagnostics.Operations, &diagnostics.DocumentsWithAny, &diagnostics.DocumentsWithAPI, &diagnostics.SectionsWithAny)
+	if err != nil {
+		return domain.EntityDiagnostics{}, err
+	}
+	err = s.readDB().QueryRowContext(ctx, `
+select count(*)
+from (
+  select document_id
+  from section_entities
+  where document_id in (select id from documents where source_id = ?)
+  group by document_id
+  having sum(case when kind = 'path_literal' then 1 else 0 end) > 0
+     and sum(case when kind = 'api_endpoint' then 1 else 0 end) = 0
+)
+`, sourceID).Scan(&diagnostics.DocumentsPathOnly)
+	if err != nil {
+		return domain.EntityDiagnostics{}, err
+	}
+	docs, err := s.listPathOnlyEntityDocuments(ctx, sourceID, limit)
+	if err != nil {
+		return domain.EntityDiagnostics{}, err
+	}
+	diagnostics.TopPathOnlyDocs = docs
+	return diagnostics, nil
+}
+
+func (s *Store) listPathOnlyEntityDocuments(ctx context.Context, sourceID string, limit int) ([]domain.DocumentSummary, error) {
+	rows, err := s.readDB().QueryContext(ctx, `
+select d.id, d.source_id, d.external_id, d.title, d.url,
+       d.content_hash, d.indexed_at, count(distinct sections.id) as section_count
+from documents d
+join section_entities se on se.document_id = d.id
+left join sections on sections.document_id = d.id
+where d.source_id = ?
+group by d.id
+having sum(case when se.kind = 'path_literal' then 1 else 0 end) > 0
+   and sum(case when se.kind = 'api_endpoint' then 1 else 0 end) = 0
+order by sum(case when se.kind = 'path_literal' then 1 else 0 end) desc, d.indexed_at desc, d.title asc
+limit ?
+`, sourceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	docs := make([]domain.DocumentSummary, 0)
+	for rows.Next() {
+		var doc domain.DocumentSummary
+		if err := rows.Scan(&doc.ID, &doc.SourceID, &doc.ExternalID, &doc.Title, &doc.URL, &doc.ContentHash, &doc.IndexedAt, &doc.SectionCount); err != nil {
+			return nil, err
+		}
+		doc.NodeID = stableDocumentNodeID(doc.ID)
+		docs = append(docs, doc)
+	}
+	return docs, rows.Err()
+}
+
+func (s *Store) ListSourceDocuments(ctx context.Context, sourceID string, limit, offset int) ([]domain.DocumentSummary, error) {
+	sourceID, limit, offset, err := normalizeSourceArtifactPage(sourceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
 select documents.id, documents.source_id, documents.external_id, documents.title, documents.url,
        documents.content_hash, documents.indexed_at, count(sections.id)
 from documents
@@ -324,8 +1198,103 @@ limit ? offset ?
 	return docs, rows.Err()
 }
 
-func (s *Store) listSourceSections(ctx context.Context, sourceID string, limit, offset int) ([]domain.SectionSummary, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *Store) GetDocument(ctx context.Context, id string) (domain.DocumentSummary, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return domain.DocumentSummary{}, fmt.Errorf("document id is required")
+	}
+	var doc domain.DocumentSummary
+	err := s.readDB().QueryRowContext(ctx, `
+select documents.id, documents.source_id, documents.external_id, documents.title, documents.url,
+       documents.content_hash, documents.indexed_at, count(sections.id)
+from documents
+left join sections on sections.document_id = documents.id
+where documents.id = ?
+group by documents.id
+`, id).Scan(&doc.ID, &doc.SourceID, &doc.ExternalID, &doc.Title, &doc.URL, &doc.ContentHash, &doc.IndexedAt, &doc.SectionCount)
+	if err != nil {
+		return domain.DocumentSummary{}, err
+	}
+	doc.NodeID = stableDocumentNodeID(doc.ID)
+	return doc, nil
+}
+
+func (s *Store) GetDocumentBySourceExternalID(ctx context.Context, sourceID string, externalID string) (domain.DocumentSummary, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	externalID = strings.TrimSpace(externalID)
+	if sourceID == "" {
+		return domain.DocumentSummary{}, fmt.Errorf("source id is required")
+	}
+	if externalID == "" {
+		return domain.DocumentSummary{}, fmt.Errorf("external id is required")
+	}
+
+	var doc domain.DocumentSummary
+	err := s.readDB().QueryRowContext(ctx, `
+select documents.id, documents.source_id, documents.external_id, documents.title, documents.url,
+       documents.content_hash, documents.indexed_at, count(sections.id)
+from documents
+left join sections on sections.document_id = documents.id
+where documents.source_id = ? and documents.external_id = ?
+group by documents.id
+`, sourceID, externalID).Scan(&doc.ID, &doc.SourceID, &doc.ExternalID, &doc.Title, &doc.URL, &doc.ContentHash, &doc.IndexedAt, &doc.SectionCount)
+	if err != nil {
+		return domain.DocumentSummary{}, err
+	}
+	doc.NodeID = stableDocumentNodeID(doc.ID)
+	return doc, nil
+}
+
+func (s *Store) ListDocumentSections(ctx context.Context, documentID string, limit, offset int) ([]domain.SectionSummary, error) {
+	documentID = strings.TrimSpace(documentID)
+	if documentID == "" {
+		return nil, fmt.Errorf("document id is required")
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		return nil, fmt.Errorf("offset must be non-negative")
+	}
+	if _, err := s.GetDocument(ctx, documentID); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
+       substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 800),
+       sections.ordinal
+from sections
+join documents on documents.id = sections.document_id
+where sections.document_id = ?
+order by sections.ordinal asc
+limit ? offset ?
+`, documentID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sections []domain.SectionSummary
+	for rows.Next() {
+		var section domain.SectionSummary
+		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.Ordinal); err != nil {
+			return nil, err
+		}
+		section.NodeID = stableSectionNodeID(section.ID)
+		sections = append(sections, section)
+	}
+	return sections, rows.Err()
+}
+
+func (s *Store) ListSourceSections(ctx context.Context, sourceID string, limit, offset int) ([]domain.SectionSummary, error) {
+	sourceID, limit, offset, err := normalizeSourceArtifactPage(sourceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
 select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
        substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 220),
        sections.ordinal
@@ -352,8 +1321,15 @@ limit ? offset ?
 	return sections, rows.Err()
 }
 
-func (s *Store) listSourceNodes(ctx context.Context, sourceID string, limit, offset int) ([]domain.Node, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *Store) ListSourceNodes(ctx context.Context, sourceID string, limit, offset int) ([]domain.Node, error) {
+	sourceID, limit, offset, err := normalizeSourceArtifactPage(sourceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
 select id, kind, name, canonical_name, metadata_json, confidence, created_at, updated_at
 from nodes
 where metadata_json like ?
@@ -376,8 +1352,15 @@ limit ? offset ?
 	return nodes, rows.Err()
 }
 
-func (s *Store) listSourceEdges(ctx context.Context, sourceID string, limit, offset int) ([]domain.EdgeSummary, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *Store) ListSourceEdges(ctx context.Context, sourceID string, limit, offset int) ([]domain.EdgeSummary, error) {
+	sourceID, limit, offset, err := normalizeSourceArtifactPage(sourceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
 select distinct e.id, e.src_id, src.name, src.kind, e.dst_id, dst.name, dst.kind,
        e.kind, e.confidence, e.provenance, coalesce(e.evidence_section_id, '')
 from edges e
@@ -407,6 +1390,20 @@ limit ? offset ?
 	return edges, rows.Err()
 }
 
+func normalizeSourceArtifactPage(sourceID string, limit, offset int) (string, int, int, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return "", 0, 0, fmt.Errorf("source id is required")
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return sourceID, limit, offset, nil
+}
+
 func (s *Store) ReplaceDocument(ctx context.Context, doc domain.DocumentInput, sections []domain.SectionInput) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -428,14 +1425,17 @@ on conflict(id) do update set
   indexed_at = current_timestamp
 `, doc.ID, doc.SourceID, doc.ExternalID, doc.Title, doc.URL, doc.Version, doc.ContentHash)
 	if err != nil {
-		return err
+		return fmt.Errorf("upsert document %s: %w", doc.ID, err)
 	}
 
-	if _, err := tx.ExecContext(ctx, `delete from fts_sections where document_id = ?`, doc.ID); err != nil {
-		return err
+	if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens where document_id = ?`, doc.ID); err != nil {
+		return fmt.Errorf("delete fts_section_tokens for document %s: %w", doc.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens_trigram where document_id = ?`, doc.ID); err != nil {
+		return fmt.Errorf("delete fts_section_tokens_trigram for document %s: %w", doc.ID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `delete from sections where document_id = ?`, doc.ID); err != nil {
-		return err
+		return fmt.Errorf("delete sections for document %s: %w", doc.ID, err)
 	}
 
 	for _, section := range sections {
@@ -444,18 +1444,29 @@ insert into sections (id, document_id, heading_path, title, content, content_has
 values (?, ?, ?, ?, ?, ?, ?)
 `, section.ID, doc.ID, section.HeadingPath, section.Title, section.Content, section.ContentHash, section.Ordinal)
 		if err != nil {
-			return err
+			return fmt.Errorf("insert section %s for document %s: %w", section.ID, doc.ID, err)
+		}
+		titleTokens, headingTokens, symbolTokens, contentTokens := buildSectionIndexTexts(doc.Title, section.Title, section.HeadingPath, section.Content)
+		_, err = tx.ExecContext(ctx, `
+insert into fts_section_tokens (title_tokens, section_heading_tokens, symbol_tokens, content_tokens, section_id, document_id)
+values (?, ?, ?, ?, ?, ?)
+`, titleTokens, headingTokens, symbolTokens, contentTokens, section.ID, doc.ID)
+		if err != nil {
+			return fmt.Errorf("insert fts_section_tokens for section %s: %w", section.ID, err)
 		}
 		_, err = tx.ExecContext(ctx, `
-insert into fts_sections (title, heading_path, content, section_id, document_id)
-values (?, ?, ?, ?, ?)
-`, section.Title, section.HeadingPath, section.Content, section.ID, doc.ID)
+insert into fts_section_tokens_trigram (title_tokens, section_heading_tokens, symbol_tokens, content_tokens, section_id, document_id)
+values (?, ?, ?, ?, ?, ?)
+`, titleTokens, headingTokens, symbolTokens, contentTokens, section.ID, doc.ID)
 		if err != nil {
-			return err
+			return fmt.Errorf("insert fts_section_tokens_trigram for section %s: %w", section.ID, err)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit replace document %s: %w", doc.ID, err)
+	}
+	return nil
 }
 
 func (s *Store) DeleteDocumentsNotInSource(ctx context.Context, sourceID string, keepDocumentIDs []string) error {
@@ -479,17 +1490,26 @@ func (s *Store) DeleteDocumentsNotInSource(ctx context.Context, sourceID string,
 	defer tx.Rollback()
 
 	for _, docID := range staleIDs {
-		if _, err := tx.ExecContext(ctx, `delete from fts_sections where document_id = ?`, docID); err != nil {
-			return err
+		if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens where document_id = ?`, docID); err != nil {
+			return fmt.Errorf("delete stale fts_section_tokens for document %s: %w", docID, err)
+		}
+		if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens_trigram where document_id = ?`, docID); err != nil {
+			return fmt.Errorf("delete stale fts_section_tokens_trigram for document %s: %w", docID, err)
+		}
+		if _, err := tx.ExecContext(ctx, `delete from fts_nodes where node_id in (select id from nodes where metadata_json like ?)`, documentIDLike(docID)); err != nil {
+			return fmt.Errorf("delete stale fts_nodes for document %s: %w", docID, err)
 		}
 		if _, err := tx.ExecContext(ctx, `delete from nodes where metadata_json like ?`, documentIDLike(docID)); err != nil {
-			return err
+			return fmt.Errorf("delete stale nodes for document %s: %w", docID, err)
 		}
 		if _, err := tx.ExecContext(ctx, `delete from documents where id = ?`, docID); err != nil {
-			return err
+			return fmt.Errorf("delete stale document %s: %w", docID, err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete stale documents for source %s: %w", sourceID, err)
+	}
+	return nil
 }
 
 func (s *Store) staleDocumentIDs(ctx context.Context, sourceID string, keepDocumentIDs []string) ([]string, error) {
@@ -525,10 +1545,20 @@ func (s *Store) GetDocumentProfile(ctx context.Context, documentID string) (doma
 	if documentID == "" {
 		return domain.DocumentProfile{}, fmt.Errorf("document id is required")
 	}
-	if err := s.ensureDocumentProfile(ctx, documentID); err != nil {
+	if err := s.ensureDocumentExists(ctx, documentID); err != nil {
 		return domain.DocumentProfile{}, err
 	}
-	return s.getDocumentProfile(ctx, documentID)
+	profile, err := s.getDocumentProfile(ctx, documentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.DocumentProfile{
+			DocumentID:           documentID,
+			RetrievalProfileJSON: "{}",
+		}, nil
+	}
+	if err != nil {
+		return domain.DocumentProfile{}, err
+	}
+	return profile, nil
 }
 
 func (s *Store) UpdateDocumentProfileDesc(ctx context.Context, input domain.DocumentProfileInput) (domain.DocumentProfile, error) {
@@ -601,7 +1631,7 @@ func (s *Store) ensureDocumentExists(ctx context.Context, documentID string) err
 
 func (s *Store) getDocumentProfile(ctx context.Context, documentID string) (domain.DocumentProfile, error) {
 	var profile domain.DocumentProfile
-	err := s.db.QueryRowContext(ctx, `
+	err := s.readDB().QueryRowContext(ctx, `
 select document_id, "desc", retrieval_profile_json, generated_from_hash, generated_at, created_at, updated_at
 from document_profiles
 where document_id = ?
@@ -612,6 +1642,1108 @@ where document_id = ?
 	return profile, nil
 }
 
+type sectionEntityEvidence struct {
+	Occurrences []sectionEntityOccurrence `json:"occurrences,omitempty"`
+	Notes       []string                  `json:"notes,omitempty"`
+}
+
+type sectionEntityOccurrence struct {
+	Raw       string `json:"raw,omitempty"`
+	Source    string `json:"source,omitempty"`
+	SpanStart int    `json:"span_start,omitempty"`
+	SpanEnd   int    `json:"span_end,omitempty"`
+	Evidence  string `json:"evidence,omitempty"`
+}
+
+func (s *Store) ReplaceSectionEntities(ctx context.Context, documentID string, entities []domain.SectionEntityInput) error {
+	documentID = strings.TrimSpace(documentID)
+	if documentID == "" {
+		return fmt.Errorf("document id is required")
+	}
+	if err := s.ensureDocumentExists(ctx, documentID); err != nil {
+		return err
+	}
+	sectionIDs, err := s.documentSectionIDSet(ctx, documentID)
+	if err != nil {
+		return err
+	}
+	aggregated, err := aggregateSectionEntityInputs(documentID, sectionIDs, entities)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `delete from section_entities where document_id = ?`, documentID); err != nil {
+		return fmt.Errorf("delete section entities for document %s: %w", documentID, err)
+	}
+	for _, entity := range aggregated {
+		_, err := tx.ExecContext(ctx, `
+insert into section_entities (
+  id, section_id, document_id, kind, raw_text, canonical_text,
+  method, path, operation, source, confidence, evidence_json
+) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, entity.ID, entity.SectionID, entity.DocumentID, entity.Kind, entity.RawText, entity.CanonicalText, entity.Method, entity.Path, entity.Operation, entity.Source, entity.Confidence, entity.EvidenceJSON)
+		if err != nil {
+			return fmt.Errorf("insert section entity %s: %w", entity.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit replace section entities for document %s: %w", documentID, err)
+	}
+	return nil
+}
+
+func (s *Store) ListDocumentEntities(ctx context.Context, documentID string) ([]domain.SectionEntity, error) {
+	documentID = strings.TrimSpace(documentID)
+	if documentID == "" {
+		return nil, fmt.Errorf("document id is required")
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, section_id, document_id, kind, raw_text, canonical_text,
+       method, path, operation, source, confidence, evidence_json, created_at
+from section_entities
+where document_id = ?
+order by (
+  select sections.ordinal from sections where sections.id = section_entities.section_id
+) asc, kind asc, method asc, canonical_text asc, id asc
+`, documentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSectionEntities(rows)
+}
+
+func (s *Store) ListSourceSectionEntities(ctx context.Context, sourceID string, limit, offset int) ([]domain.SectionEntity, error) {
+	sourceID, limit, offset, err := normalizeSourceArtifactPage(sourceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select se.id, se.section_id, se.document_id, se.kind, se.raw_text, se.canonical_text,
+       se.method, se.path, se.operation, se.source, se.confidence, se.evidence_json, se.created_at
+from section_entities se
+join documents d on d.id = se.document_id
+left join sections s on s.id = se.section_id
+where d.source_id = ?
+order by d.indexed_at desc, d.title asc, coalesce(s.ordinal, 0) asc, se.kind asc, se.method asc, se.canonical_text asc, se.id asc
+limit ? offset ?
+`, sourceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSectionEntities(rows)
+}
+
+func (s *Store) SearchEntities(ctx context.Context, query string, limit int) ([]domain.SectionEntity, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	seen := map[string]bool{}
+	results := make([]domain.SectionEntity, 0, limit)
+	add := func(entities []domain.SectionEntity) {
+		for _, entity := range entities {
+			if len(results) >= limit {
+				return
+			}
+			if seen[entity.ID] {
+				continue
+			}
+			seen[entity.ID] = true
+			results = append(results, entity)
+		}
+	}
+
+	for _, term := range entitySearchTerms(extract.ExtractSection(extract.SectionInput{Content: query})) {
+		entities, err := s.searchEntitiesExact(ctx, term, limit-len(results))
+		if err != nil {
+			return nil, err
+		}
+		add(entities)
+		if len(results) >= limit {
+			return results, nil
+		}
+	}
+
+	entities, err := s.searchEntitiesLike(ctx, query, limit-len(results))
+	if err != nil {
+		return nil, err
+	}
+	add(entities)
+	return results, nil
+}
+
+func (s *Store) searchEntitiesExact(ctx context.Context, term string, limit int) ([]domain.SectionEntity, error) {
+	term = strings.ToLower(strings.TrimSpace(term))
+	if term == "" || limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, section_id, document_id, kind, raw_text, canonical_text,
+       method, path, operation, source, confidence, evidence_json, created_at
+from section_entities
+where lower(canonical_text) = ?
+   or lower(path) = ?
+   or lower(method || ' ' || path) = ?
+   or lower(operation) = ?
+order by confidence desc, kind asc, canonical_text asc, id asc
+limit ?
+`, term, term, term, term, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSectionEntities(rows)
+}
+
+func (s *Store) searchEntitiesLike(ctx context.Context, query string, limit int) ([]domain.SectionEntity, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	pattern := "%" + escapeLike(strings.ToLower(query)) + "%"
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, section_id, document_id, kind, raw_text, canonical_text,
+       method, path, operation, source, confidence, evidence_json, created_at
+from section_entities
+where lower(canonical_text) like ? escape '\'
+   or lower(raw_text) like ? escape '\'
+   or lower(path) like ? escape '\'
+   or lower(operation) like ? escape '\'
+order by confidence desc, kind asc, canonical_text asc, id asc
+limit ?
+`, pattern, pattern, pattern, pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSectionEntities(rows)
+}
+
+func scanSectionEntities(rows *sql.Rows) ([]domain.SectionEntity, error) {
+	entities := make([]domain.SectionEntity, 0)
+	for rows.Next() {
+		var entity domain.SectionEntity
+		if err := rows.Scan(
+			&entity.ID,
+			&entity.SectionID,
+			&entity.DocumentID,
+			&entity.Kind,
+			&entity.RawText,
+			&entity.CanonicalText,
+			&entity.Method,
+			&entity.Path,
+			&entity.Operation,
+			&entity.Source,
+			&entity.Confidence,
+			&entity.EvidenceJSON,
+			&entity.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		entities = append(entities, entity)
+	}
+	return entities, rows.Err()
+}
+
+func (s *Store) documentSectionIDSet(ctx context.Context, documentID string) (map[string]bool, error) {
+	rows, err := s.readDB().QueryContext(ctx, `select id from sections where document_id = ?`, documentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sectionIDs := map[string]bool{}
+	for rows.Next() {
+		var sectionID string
+		if err := rows.Scan(&sectionID); err != nil {
+			return nil, err
+		}
+		sectionIDs[sectionID] = true
+	}
+	return sectionIDs, rows.Err()
+}
+
+func aggregateSectionEntityInputs(documentID string, sectionIDs map[string]bool, inputs []domain.SectionEntityInput) ([]domain.SectionEntity, error) {
+	type aggregate struct {
+		entity    domain.SectionEntity
+		evidence  sectionEntityEvidence
+		notesSeen map[string]bool
+	}
+	byID := map[string]*aggregate{}
+	for _, input := range inputs {
+		normalized, err := normalizeSectionEntityInput(documentID, sectionIDs, input)
+		if err != nil {
+			return nil, err
+		}
+		if normalized.Kind == "" {
+			continue
+		}
+		id := ids.Stable("entity", normalized.SectionID, normalized.Kind, normalized.Method, normalized.CanonicalText)
+		item := byID[id]
+		if item == nil {
+			normalized.ID = id
+			normalized.EvidenceJSON = "{}"
+			item = &aggregate{
+				entity:    normalized,
+				notesSeen: map[string]bool{},
+			}
+			byID[id] = item
+		}
+		if normalized.Confidence > item.entity.Confidence {
+			item.entity.Confidence = normalized.Confidence
+			if normalized.RawText != "" {
+				item.entity.RawText = normalized.RawText
+			}
+			if normalized.Source != "" {
+				item.entity.Source = normalized.Source
+			}
+		}
+		if item.entity.RawText == "" && normalized.RawText != "" {
+			item.entity.RawText = normalized.RawText
+		}
+		if item.entity.Source == "" && normalized.Source != "" {
+			item.entity.Source = normalized.Source
+		}
+		if item.entity.Operation == "" && normalized.Operation != "" {
+			item.entity.Operation = normalized.Operation
+		}
+		item.evidence.Occurrences = append(item.evidence.Occurrences, sectionEntityOccurrence{
+			Raw:       normalized.RawText,
+			Source:    normalized.Source,
+			SpanStart: input.SpanStart,
+			SpanEnd:   input.SpanEnd,
+			Evidence:  strings.TrimSpace(input.Evidence),
+		})
+		for _, note := range input.Notes {
+			note = strings.TrimSpace(note)
+			if note == "" || item.notesSeen[note] {
+				continue
+			}
+			item.notesSeen[note] = true
+			item.evidence.Notes = append(item.evidence.Notes, note)
+		}
+	}
+
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	result := make([]domain.SectionEntity, 0, len(ids))
+	for _, id := range ids {
+		item := byID[id]
+		data, err := json.Marshal(item.evidence)
+		if err != nil {
+			return nil, err
+		}
+		item.entity.EvidenceJSON = string(data)
+		result = append(result, item.entity)
+	}
+	return result, nil
+}
+
+func normalizeSectionEntityInput(documentID string, sectionIDs map[string]bool, input domain.SectionEntityInput) (domain.SectionEntity, error) {
+	sectionID := strings.TrimSpace(input.SectionID)
+	if sectionID == "" {
+		return domain.SectionEntity{}, fmt.Errorf("section id is required")
+	}
+	if !sectionIDs[sectionID] {
+		return domain.SectionEntity{}, fmt.Errorf("section %s does not belong to document %s", sectionID, documentID)
+	}
+	kind := strings.TrimSpace(input.Kind)
+	canonical := strings.TrimSpace(input.CanonicalText)
+	method := strings.ToUpper(strings.TrimSpace(input.Method))
+	path := strings.TrimSpace(input.Path)
+	operation := strings.TrimSpace(input.Operation)
+	if canonical == "" {
+		switch {
+		case method != "" && path != "":
+			canonical = method + " " + path
+		case path != "":
+			canonical = path
+		default:
+			canonical = operation
+		}
+	}
+	if kind == "" || canonical == "" {
+		return domain.SectionEntity{}, nil
+	}
+	return domain.SectionEntity{
+		SectionID:     sectionID,
+		DocumentID:    documentID,
+		Kind:          kind,
+		RawText:       strings.TrimSpace(input.RawText),
+		CanonicalText: canonical,
+		Method:        method,
+		Path:          path,
+		Operation:     operation,
+		Source:        strings.TrimSpace(input.Source),
+		Confidence:    input.Confidence,
+	}, nil
+}
+
+func (s *Store) CreateKnowledgeRelationProposal(ctx context.Context, input domain.KnowledgeRelationProposalInput) (domain.KnowledgeRelationProposal, error) {
+	input = normalizeKnowledgeRelationProposalInput(input)
+	if input.ID == "" {
+		input.ID = ids.Random("krp", 12)
+	}
+	if err := validateKnowledgeRelationProposalInput(ctx, s, input); err != nil {
+		return domain.KnowledgeRelationProposal{}, err
+	}
+	_, err := s.db.ExecContext(ctx, `
+insert into knowledge_relation_proposals (
+  id, relation_type, from_document_id, from_anchor, to_document_id, to_anchor,
+  direction, reason, evidence_json, proposed_effect, confidence, created_by_type, created_by_ref
+) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, input.ID, input.RelationType, input.FromDocumentID, input.FromAnchor, input.ToDocumentID, input.ToAnchor,
+		input.Direction, input.Reason, input.EvidenceJSON, input.ProposedEffect, input.Confidence, input.CreatedByType, input.CreatedByRef)
+	if err != nil {
+		return domain.KnowledgeRelationProposal{}, err
+	}
+	return s.GetKnowledgeRelationProposal(ctx, input.ID)
+}
+
+func (s *Store) ListKnowledgeRelationProposals(ctx context.Context, opts domain.KnowledgeRelationProposalListOptions) ([]domain.KnowledgeRelationProposal, error) {
+	opts.Status = strings.TrimSpace(opts.Status)
+	opts.DocumentID = strings.TrimSpace(opts.DocumentID)
+	if opts.Limit <= 0 || opts.Limit > 200 {
+		opts.Limit = 50
+	}
+	if opts.Offset < 0 {
+		opts.Offset = 0
+	}
+	where := []string{"1 = 1"}
+	args := make([]any, 0, 4)
+	if opts.Status != "" && opts.Status != "all" {
+		where = append(where, "status = ?")
+		args = append(args, opts.Status)
+	}
+	if opts.DocumentID != "" {
+		where = append(where, "(from_document_id = ? or to_document_id = ?)")
+		args = append(args, opts.DocumentID, opts.DocumentID)
+	}
+	args = append(args, opts.Limit, opts.Offset)
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, relation_type, from_document_id, from_anchor, to_document_id, to_anchor,
+       direction, reason, evidence_json, proposed_effect, confidence, created_by_type, created_by_ref,
+       status, reviewed_by, review_note, reviewed_at, created_at, updated_at
+from knowledge_relation_proposals
+where `+strings.Join(where, " and ")+`
+order by created_at desc, id desc
+limit ? offset ?
+`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanKnowledgeRelationProposals(rows)
+}
+
+func (s *Store) GetKnowledgeRelationProposal(ctx context.Context, id string) (domain.KnowledgeRelationProposal, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return domain.KnowledgeRelationProposal{}, fmt.Errorf("proposal id is required")
+	}
+	row := s.readDB().QueryRowContext(ctx, `
+select id, relation_type, from_document_id, from_anchor, to_document_id, to_anchor,
+       direction, reason, evidence_json, proposed_effect, confidence, created_by_type, created_by_ref,
+       status, reviewed_by, review_note, reviewed_at, created_at, updated_at
+from knowledge_relation_proposals
+where id = ?
+`, id)
+	return scanKnowledgeRelationProposal(row)
+}
+
+func (s *Store) ApproveKnowledgeRelationProposal(ctx context.Context, id string, reviewedBy string, reviewNote string) (domain.KnowledgeRelation, error) {
+	id = strings.TrimSpace(id)
+	reviewedBy = strings.TrimSpace(reviewedBy)
+	reviewNote = strings.TrimSpace(reviewNote)
+	if id == "" {
+		return domain.KnowledgeRelation{}, fmt.Errorf("proposal id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	defer tx.Rollback()
+
+	proposal, err := getKnowledgeRelationProposalTx(ctx, tx, id)
+	if err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	if proposal.Status != "pending" {
+		return domain.KnowledgeRelation{}, fmt.Errorf("proposal %q is %s", id, proposal.Status)
+	}
+	relationID := ids.Random("kr", 12)
+	_, err = tx.ExecContext(ctx, `
+update knowledge_relation_proposals
+set status = 'approved',
+    reviewed_by = ?,
+    review_note = ?,
+    reviewed_at = current_timestamp,
+    updated_at = current_timestamp
+where id = ? and status = 'pending'
+`, reviewedBy, reviewNote, id)
+	if err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	_, err = tx.ExecContext(ctx, `
+insert into knowledge_relations (
+  id, relation_type, from_document_id, from_anchor, to_document_id, to_anchor,
+  direction, effect, weight, reason, evidence_json, approved_from_proposal_id, created_by
+) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, relationID, proposal.RelationType, proposal.FromDocumentID, proposal.FromAnchor, proposal.ToDocumentID, proposal.ToAnchor,
+		proposal.Direction, proposal.ProposedEffect, relationWeightForEffect(proposal.ProposedEffect), proposal.Reason, proposal.EvidenceJSON, proposal.ID, reviewedBy)
+	if err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	return s.getKnowledgeRelation(ctx, relationID)
+}
+
+func (s *Store) RejectKnowledgeRelationProposal(ctx context.Context, id string, reviewedBy string, reviewNote string) (domain.KnowledgeRelationProposal, error) {
+	return s.updateKnowledgeRelationProposalStatus(ctx, id, "rejected", reviewedBy, reviewNote)
+}
+
+func (s *Store) CancelKnowledgeRelationProposal(ctx context.Context, id string, reviewedBy string, reviewNote string) (domain.KnowledgeRelationProposal, error) {
+	return s.updateKnowledgeRelationProposalStatus(ctx, id, "cancelled", reviewedBy, reviewNote)
+}
+
+func (s *Store) updateKnowledgeRelationProposalStatus(ctx context.Context, id string, status string, reviewedBy string, reviewNote string) (domain.KnowledgeRelationProposal, error) {
+	id = strings.TrimSpace(id)
+	reviewedBy = strings.TrimSpace(reviewedBy)
+	reviewNote = strings.TrimSpace(reviewNote)
+	if id == "" {
+		return domain.KnowledgeRelationProposal{}, fmt.Errorf("proposal id is required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+update knowledge_relation_proposals
+set status = ?,
+    reviewed_by = ?,
+    review_note = ?,
+    reviewed_at = current_timestamp,
+    updated_at = current_timestamp
+where id = ? and status = 'pending'
+`, status, reviewedBy, reviewNote, id)
+	if err != nil {
+		return domain.KnowledgeRelationProposal{}, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return domain.KnowledgeRelationProposal{}, err
+	}
+	if changed == 0 {
+		proposal, getErr := s.GetKnowledgeRelationProposal(ctx, id)
+		if getErr != nil {
+			return domain.KnowledgeRelationProposal{}, getErr
+		}
+		return domain.KnowledgeRelationProposal{}, fmt.Errorf("proposal %q is %s", id, proposal.Status)
+	}
+	return s.GetKnowledgeRelationProposal(ctx, id)
+}
+
+func (s *Store) ListKnowledgeRelations(ctx context.Context, opts domain.KnowledgeRelationListOptions) ([]domain.KnowledgeRelation, error) {
+	opts.DocumentID = strings.TrimSpace(opts.DocumentID)
+	if opts.Limit <= 0 || opts.Limit > 200 {
+		opts.Limit = 50
+	}
+	where := []string{"1 = 1"}
+	args := make([]any, 0, 6)
+	if opts.DocumentID != "" {
+		where = append(where, "(from_document_id = ? or to_document_id = ?)")
+		args = append(args, opts.DocumentID, opts.DocumentID)
+	}
+	if len(opts.RelationTypes) > 0 {
+		placeholders := make([]string, 0, len(opts.RelationTypes))
+		for _, relationType := range opts.RelationTypes {
+			relationType = strings.TrimSpace(relationType)
+			if relationType == "" {
+				continue
+			}
+			placeholders = append(placeholders, "?")
+			args = append(args, relationType)
+		}
+		if len(placeholders) > 0 {
+			where = append(where, "relation_type in ("+strings.Join(placeholders, ",")+")")
+		}
+	}
+	if !opts.IncludeDisabled {
+		where = append(where, "disabled_at = ''")
+	}
+	args = append(args, opts.Limit)
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, relation_type, from_document_id, from_anchor, to_document_id, to_anchor,
+       direction, effect, weight, reason, evidence_json, coalesce(approved_from_proposal_id, ''),
+       created_by, disabled_at, created_at, updated_at
+from knowledge_relations
+where `+strings.Join(where, " and ")+`
+order by created_at desc, id desc
+limit ?
+`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanKnowledgeRelations(rows)
+}
+
+func (s *Store) DisableKnowledgeRelation(ctx context.Context, id string, reviewedBy string, note string) (domain.KnowledgeRelation, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return domain.KnowledgeRelation{}, fmt.Errorf("relation id is required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+update knowledge_relations
+set disabled_at = current_timestamp,
+    updated_at = current_timestamp
+where id = ? and disabled_at = ''
+`, id)
+	if err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	if changed == 0 {
+		if _, err := s.getKnowledgeRelation(ctx, id); err != nil {
+			return domain.KnowledgeRelation{}, err
+		}
+	}
+	return s.getKnowledgeRelation(ctx, id)
+}
+
+func (s *Store) ReenableKnowledgeRelation(ctx context.Context, id string, reviewedBy string, note string) (domain.KnowledgeRelation, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return domain.KnowledgeRelation{}, fmt.Errorf("relation id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+update knowledge_relations
+set disabled_at = '',
+    updated_at = current_timestamp
+where id = ?
+`, id)
+	if err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	return s.getKnowledgeRelation(ctx, id)
+}
+
+func (s *Store) getKnowledgeRelation(ctx context.Context, id string) (domain.KnowledgeRelation, error) {
+	row := s.readDB().QueryRowContext(ctx, `
+select id, relation_type, from_document_id, from_anchor, to_document_id, to_anchor,
+       direction, effect, weight, reason, evidence_json, coalesce(approved_from_proposal_id, ''),
+       created_by, disabled_at, created_at, updated_at
+from knowledge_relations
+where id = ?
+`, id)
+	return scanKnowledgeRelation(row)
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func normalizeKnowledgeRelationProposalInput(input domain.KnowledgeRelationProposalInput) domain.KnowledgeRelationProposalInput {
+	input.ID = strings.TrimSpace(input.ID)
+	input.RelationType = strings.TrimSpace(input.RelationType)
+	input.FromDocumentID = strings.TrimSpace(input.FromDocumentID)
+	input.FromAnchor = strings.TrimSpace(input.FromAnchor)
+	input.ToDocumentID = strings.TrimSpace(input.ToDocumentID)
+	input.ToAnchor = strings.TrimSpace(input.ToAnchor)
+	input.Direction = strings.TrimSpace(input.Direction)
+	input.Reason = strings.TrimSpace(input.Reason)
+	input.EvidenceJSON = defaultJSONObject(input.EvidenceJSON)
+	input.ProposedEffect = strings.TrimSpace(input.ProposedEffect)
+	input.CreatedByType = strings.TrimSpace(input.CreatedByType)
+	input.CreatedByRef = strings.TrimSpace(input.CreatedByRef)
+	if input.Direction == "" {
+		input.Direction = "directed"
+	}
+	if input.ProposedEffect == "" {
+		input.ProposedEffect = effectForRelationType(input.RelationType)
+	}
+	if input.Confidence < 0 {
+		input.Confidence = 0
+	}
+	if input.Confidence > 1 {
+		input.Confidence = 1
+	}
+	return input
+}
+
+func validateKnowledgeRelationProposalInput(ctx context.Context, s *Store, input domain.KnowledgeRelationProposalInput) error {
+	if input.RelationType == "" {
+		return fmt.Errorf("relation_type is required")
+	}
+	if !allowedKnowledgeRelationType(input.RelationType) {
+		return fmt.Errorf("unsupported relation_type %q", input.RelationType)
+	}
+	if input.FromDocumentID == "" {
+		return fmt.Errorf("from_document_id is required")
+	}
+	if input.ToDocumentID == "" {
+		return fmt.Errorf("to_document_id is required")
+	}
+	if input.FromDocumentID == input.ToDocumentID {
+		return fmt.Errorf("from_document_id and to_document_id must differ")
+	}
+	if input.Direction != "directed" && input.Direction != "undirected" {
+		return fmt.Errorf("direction must be directed or undirected")
+	}
+	if input.Reason == "" {
+		return fmt.Errorf("reason is required")
+	}
+	if !allowedKnowledgeRelationEffect(input.ProposedEffect) {
+		return fmt.Errorf("unsupported proposed_effect %q", input.ProposedEffect)
+	}
+	if !json.Valid([]byte(input.EvidenceJSON)) {
+		return fmt.Errorf("evidence_json must be valid JSON")
+	}
+	if err := s.ensureDocumentExists(ctx, input.FromDocumentID); err != nil {
+		return fmt.Errorf("from_document_id %q not found: %w", input.FromDocumentID, err)
+	}
+	if err := s.ensureDocumentExists(ctx, input.ToDocumentID); err != nil {
+		return fmt.Errorf("to_document_id %q not found: %w", input.ToDocumentID, err)
+	}
+	return nil
+}
+
+func allowedKnowledgeRelationType(value string) bool {
+	switch value {
+	case "related_to", "schema_reference", "deprecated_by", "should_ignore":
+		return true
+	default:
+		return false
+	}
+}
+
+func allowedKnowledgeRelationEffect(value string) bool {
+	switch value {
+	case "context_link", "boost", "demote", "ignore":
+		return true
+	default:
+		return false
+	}
+}
+
+func effectForRelationType(relationType string) string {
+	switch relationType {
+	case "deprecated_by":
+		return "demote"
+	case "should_ignore":
+		return "ignore"
+	case "related_to":
+		return "boost"
+	default:
+		return "context_link"
+	}
+}
+
+func relationWeightForEffect(effect string) float64 {
+	switch effect {
+	case "boost":
+		return 0.5
+	case "demote":
+		return -0.8
+	case "ignore":
+		return -1
+	default:
+		return 1
+	}
+}
+
+func scanKnowledgeRelationProposal(row rowScanner) (domain.KnowledgeRelationProposal, error) {
+	var proposal domain.KnowledgeRelationProposal
+	err := row.Scan(&proposal.ID, &proposal.RelationType, &proposal.FromDocumentID, &proposal.FromAnchor, &proposal.ToDocumentID, &proposal.ToAnchor,
+		&proposal.Direction, &proposal.Reason, &proposal.EvidenceJSON, &proposal.ProposedEffect, &proposal.Confidence, &proposal.CreatedByType, &proposal.CreatedByRef,
+		&proposal.Status, &proposal.ReviewedBy, &proposal.ReviewNote, &proposal.ReviewedAt, &proposal.CreatedAt, &proposal.UpdatedAt)
+	if err != nil {
+		return domain.KnowledgeRelationProposal{}, err
+	}
+	return proposal, nil
+}
+
+func scanKnowledgeRelationProposals(rows *sql.Rows) ([]domain.KnowledgeRelationProposal, error) {
+	proposals := make([]domain.KnowledgeRelationProposal, 0)
+	for rows.Next() {
+		proposal, err := scanKnowledgeRelationProposal(rows)
+		if err != nil {
+			return nil, err
+		}
+		proposals = append(proposals, proposal)
+	}
+	return proposals, rows.Err()
+}
+
+func getKnowledgeRelationProposalTx(ctx context.Context, tx *sql.Tx, id string) (domain.KnowledgeRelationProposal, error) {
+	row := tx.QueryRowContext(ctx, `
+select id, relation_type, from_document_id, from_anchor, to_document_id, to_anchor,
+       direction, reason, evidence_json, proposed_effect, confidence, created_by_type, created_by_ref,
+       status, reviewed_by, review_note, reviewed_at, created_at, updated_at
+from knowledge_relation_proposals
+where id = ?
+`, id)
+	return scanKnowledgeRelationProposal(row)
+}
+
+func scanKnowledgeRelation(row rowScanner) (domain.KnowledgeRelation, error) {
+	var relation domain.KnowledgeRelation
+	err := row.Scan(&relation.ID, &relation.RelationType, &relation.FromDocumentID, &relation.FromAnchor, &relation.ToDocumentID, &relation.ToAnchor,
+		&relation.Direction, &relation.Effect, &relation.Weight, &relation.Reason, &relation.EvidenceJSON, &relation.ApprovedFromProposalID,
+		&relation.CreatedBy, &relation.DisabledAt, &relation.CreatedAt, &relation.UpdatedAt)
+	if err != nil {
+		return domain.KnowledgeRelation{}, err
+	}
+	return relation, nil
+}
+
+func scanKnowledgeRelations(rows *sql.Rows) ([]domain.KnowledgeRelation, error) {
+	relations := make([]domain.KnowledgeRelation, 0)
+	for rows.Next() {
+		relation, err := scanKnowledgeRelation(rows)
+		if err != nil {
+			return nil, err
+		}
+		relations = append(relations, relation)
+	}
+	return relations, rows.Err()
+}
+
+func (s *Store) CreateJob(ctx context.Context, input domain.JobInput) (domain.Job, error) {
+	input.Kind = strings.TrimSpace(input.Kind)
+	input.SourceID = strings.TrimSpace(input.SourceID)
+	input.TargetKind = strings.TrimSpace(input.TargetKind)
+	input.TargetID = strings.TrimSpace(input.TargetID)
+	input.PayloadJSON = defaultJSONObject(input.PayloadJSON)
+	input.ProgressJSON = defaultJSONObject(input.ProgressJSON)
+	input.ResultJSON = defaultJSONObject(input.ResultJSON)
+	input.RunAfter = strings.TrimSpace(input.RunAfter)
+	if input.Kind == "" {
+		return domain.Job{}, fmt.Errorf("job kind is required")
+	}
+	jobID := ids.Random("job", 12)
+	if input.RunAfter == "" {
+		_, err := s.db.ExecContext(ctx, `
+insert into jobs (id, kind, status, source_id, target_kind, target_id, payload_json, progress_json, result_json)
+values (?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+`, jobID, input.Kind, input.SourceID, input.TargetKind, input.TargetID, input.PayloadJSON, input.ProgressJSON, input.ResultJSON)
+		if err != nil {
+			return domain.Job{}, err
+		}
+	} else {
+		_, err := s.db.ExecContext(ctx, `
+insert into jobs (id, kind, status, source_id, target_kind, target_id, payload_json, progress_json, result_json, run_after)
+values (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+`, jobID, input.Kind, input.SourceID, input.TargetKind, input.TargetID, input.PayloadJSON, input.ProgressJSON, input.ResultJSON, input.RunAfter)
+		if err != nil {
+			return domain.Job{}, err
+		}
+	}
+	return s.GetJob(ctx, jobID)
+}
+
+func (s *Store) ClaimDueJob(ctx context.Context, workerID string, kinds []string, lease time.Duration) (domain.Job, error) {
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		return domain.Job{}, fmt.Errorf("worker id is required")
+	}
+	kinds = normalizeKinds(kinds)
+	if len(kinds) == 0 {
+		return domain.Job{}, fmt.Errorf("at least one job kind is required")
+	}
+	if lease <= 0 {
+		lease = time.Minute
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Job{}, err
+	}
+	defer tx.Rollback()
+
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(kinds)), ",")
+	args := make([]any, 0, len(kinds))
+	for _, kind := range kinds {
+		args = append(args, kind)
+	}
+	var id string
+	query := fmt.Sprintf(`
+select id
+from jobs
+where kind in (%s)
+  and (
+    (status = 'queued' and run_after <= current_timestamp)
+    or (status = 'running' and locked_until is not null and locked_until <= current_timestamp)
+  )
+order by run_after asc, rowid asc
+limit 1
+`, placeholders)
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&id); err != nil {
+		return domain.Job{}, err
+	}
+	leaseUntil := time.Now().UTC().Add(lease).Format("2006-01-02 15:04:05")
+	result, err := tx.ExecContext(ctx, `
+update jobs
+set status = 'running',
+    attempts = attempts + 1,
+    worker_id = ?,
+    locked_until = ?,
+    last_error = '',
+    updated_at = current_timestamp
+where id = ?
+  and (
+    status = 'queued'
+    or (status = 'running' and locked_until is not null and locked_until <= current_timestamp)
+  )
+`, workerID, leaseUntil, id)
+	if err != nil {
+		return domain.Job{}, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return domain.Job{}, err
+	}
+	if updated == 0 {
+		return domain.Job{}, sql.ErrNoRows
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Job{}, err
+	}
+	return s.GetJob(ctx, id)
+}
+
+func (s *Store) UpdateJobProgress(ctx context.Context, id string, progressJSON string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("job id is required")
+	}
+	progressJSON = defaultJSONObject(progressJSON)
+	result, err := s.db.ExecContext(ctx, `
+update jobs
+set progress_json = ?,
+    updated_at = current_timestamp
+where id = ?
+`, progressJSON, id)
+	if err != nil {
+		return err
+	}
+	return requireRowsAffected(result)
+}
+
+func (s *Store) CompleteJob(ctx context.Context, id string, resultJSON string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("job id is required")
+	}
+	resultJSON = defaultJSONObject(resultJSON)
+	result, err := s.db.ExecContext(ctx, `
+update jobs
+set status = 'completed',
+    result_json = ?,
+    worker_id = '',
+    locked_until = null,
+    last_error = '',
+    updated_at = current_timestamp
+where id = ?
+  and status not in ('canceled', 'canceling')
+`, resultJSON, id)
+	if err != nil {
+		return err
+	}
+	return requireRowsAffected(result)
+}
+
+func (s *Store) FailJob(ctx context.Context, id string, errText string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("job id is required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+update jobs
+set status = 'failed',
+    worker_id = '',
+    locked_until = null,
+    last_error = ?,
+    updated_at = current_timestamp
+where id = ?
+  and status not in ('canceled', 'canceling')
+`, strings.TrimSpace(errText), id)
+	if err != nil {
+		return err
+	}
+	return requireRowsAffected(result)
+}
+
+func (s *Store) CancelJob(ctx context.Context, id string, reason string) (domain.Job, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return domain.Job{}, fmt.Errorf("job id is required")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "canceled by user"
+	}
+	job, err := s.GetJob(ctx, id)
+	if err != nil {
+		return domain.Job{}, err
+	}
+	switch job.Status {
+	case "queued":
+		result, err := s.db.ExecContext(ctx, `
+update jobs
+set status = 'canceled',
+    worker_id = '',
+    locked_until = null,
+    last_error = ?,
+    updated_at = current_timestamp
+where id = ?
+  and status = 'queued'
+`, reason, id)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		if err := requireRowsAffected(result); err != nil {
+			return domain.Job{}, err
+		}
+		return s.GetJob(ctx, id)
+	case "running":
+		result, err := s.db.ExecContext(ctx, `
+update jobs
+set status = 'canceling',
+    last_error = ?,
+    updated_at = current_timestamp
+where id = ?
+  and status = 'running'
+`, reason, id)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		if err := requireRowsAffected(result); err != nil {
+			return domain.Job{}, err
+		}
+		return s.GetJob(ctx, id)
+	case "canceling", "canceled":
+		return job, nil
+	default:
+		return job, domain.ErrJobNotCancelable
+	}
+}
+
+func (s *Store) MarkJobCanceled(ctx context.Context, id string, reason string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("job id is required")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "canceled"
+	}
+	result, err := s.db.ExecContext(ctx, `
+update jobs
+set status = 'canceled',
+    worker_id = '',
+    locked_until = null,
+    last_error = ?,
+    updated_at = current_timestamp
+where id = ?
+  and status in ('running', 'canceling')
+`, reason, id)
+	if err != nil {
+		return err
+	}
+	return requireRowsAffected(result)
+}
+
+func (s *Store) ListJobs(ctx context.Context, opts domain.JobListOptions) ([]domain.Job, error) {
+	if opts.Limit <= 0 || opts.Limit > 100 {
+		opts.Limit = 20
+	}
+	if opts.Offset < 0 {
+		opts.Offset = 0
+	}
+	where, args := jobWhere(opts)
+	args = append(args, opts.Limit, opts.Offset)
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, kind, status, source_id, target_kind, target_id, payload_json, progress_json, result_json, worker_id, attempts, run_after, coalesce(locked_until, ''), last_error, created_at, updated_at
+from jobs
+where `+where+`
+order by rowid desc
+limit ? offset ?
+`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanJobs(rows)
+}
+
+func (s *Store) CountJobs(ctx context.Context, opts domain.JobListOptions) (int, error) {
+	where, args := jobWhere(opts)
+	var count int
+	if err := s.readDB().QueryRowContext(ctx, `select count(*) from jobs where `+where, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) GetJob(ctx context.Context, id string) (domain.Job, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return domain.Job{}, fmt.Errorf("job id is required")
+	}
+	var job domain.Job
+	err := s.readDB().QueryRowContext(ctx, `
+select id, kind, status, source_id, target_kind, target_id, payload_json, progress_json, result_json, worker_id, attempts, run_after, coalesce(locked_until, ''), last_error, created_at, updated_at
+from jobs
+where id = ?
+`, id).Scan(&job.ID, &job.Kind, &job.Status, &job.SourceID, &job.TargetKind, &job.TargetID, &job.PayloadJSON, &job.ProgressJSON, &job.ResultJSON, &job.WorkerID, &job.Attempts, &job.RunAfter, &job.LockedUntil, &job.LastError, &job.CreatedAt, &job.UpdatedAt)
+	if err != nil {
+		return domain.Job{}, err
+	}
+	return job, nil
+}
+
+func jobWhere(opts domain.JobListOptions) (string, []any) {
+	clauses := []string{"1 = 1"}
+	args := []any{}
+	if value := strings.TrimSpace(opts.SourceID); value != "" {
+		clauses = append(clauses, "source_id = ?")
+		args = append(args, value)
+	}
+	if value := strings.TrimSpace(opts.Kind); value != "" {
+		clauses = append(clauses, "kind = ?")
+		args = append(args, value)
+	}
+	if value := strings.TrimSpace(opts.Status); value != "" {
+		clauses = append(clauses, "status = ?")
+		args = append(args, value)
+	}
+	if value := strings.TrimSpace(opts.TargetKind); value != "" {
+		clauses = append(clauses, "target_kind = ?")
+		args = append(args, value)
+	}
+	if value := strings.TrimSpace(opts.TargetID); value != "" {
+		clauses = append(clauses, "target_id = ?")
+		args = append(args, value)
+	}
+	return strings.Join(clauses, " and "), args
+}
+
 func (s *Store) CreateSyncJob(ctx context.Context, sourceID string) (domain.SyncJob, error) {
 	sourceID = strings.TrimSpace(sourceID)
 	if sourceID == "" {
@@ -620,9 +2752,9 @@ func (s *Store) CreateSyncJob(ctx context.Context, sourceID string) (domain.Sync
 	jobID := ids.Random("job", 12)
 	payload := syncJobPayload(sourceID, domain.ResultPayload{})
 	_, err := s.db.ExecContext(ctx, `
-insert into jobs (id, kind, status, payload_json, attempts)
-values (?, 'sync_source', 'running', ?, 1)
-`, jobID, payload)
+insert into jobs (id, kind, status, source_id, payload_json, progress_json, result_json, attempts)
+values (?, 'sync_source', 'running', ?, ?, '{}', '{}', 1)
+`, jobID, sourceID, payload)
 	if err != nil {
 		return domain.SyncJob{}, err
 	}
@@ -645,11 +2777,11 @@ func (s *Store) CreateSyncJobIfIdle(ctx context.Context, sourceID string) (domai
 select id
 from jobs
 where kind = 'sync_source'
-  and status = 'running'
-  and payload_json like ?
+  and status in ('queued', 'running', 'canceling')
+  and (source_id = ? or payload_json like ?)
 order by rowid desc
 limit 1
-`, sourceIDLike(sourceID)).Scan(&running)
+`, sourceID, sourceIDLike(sourceID)).Scan(&running)
 	if err == nil {
 		return domain.SyncJob{}, domain.ErrSyncInProgress
 	}
@@ -660,9 +2792,9 @@ limit 1
 	jobID := ids.Random("job", 12)
 	payload := syncJobPayload(sourceID, domain.ResultPayload{})
 	if _, err := tx.ExecContext(ctx, `
-insert into jobs (id, kind, status, payload_json, attempts)
-values (?, 'sync_source', 'running', ?, 1)
-`, jobID, payload); err != nil {
+insert into jobs (id, kind, status, source_id, payload_json, progress_json, result_json)
+values (?, 'sync_source', 'queued', ?, ?, '{}', '{}')
+`, jobID, sourceID, payload); err != nil {
 		return domain.SyncJob{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -680,32 +2812,32 @@ func (s *Store) CompleteSyncJob(ctx context.Context, id string, resultPayload do
 	if err != nil {
 		return err
 	}
-	sourceID := sourceIDFromPayload(job.PayloadJSON)
+	sourceID := job.SourceID
+	if sourceID == "" {
+		sourceID = sourceIDFromPayload(job.PayloadJSON)
+	}
 	payload := syncJobPayload(sourceID, resultPayload)
-	_, err = s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 update jobs
 set status = 'completed',
+    source_id = ?,
     payload_json = ?,
+    result_json = ?,
+    worker_id = '',
+    locked_until = null,
     last_error = '',
     updated_at = current_timestamp
 where id = ?
-`, payload, id)
-	return err
+  and status not in ('canceled', 'canceling')
+`, sourceID, payload, payload, id)
+	if err != nil {
+		return fmt.Errorf("complete sync job %s: %w", id, err)
+	}
+	return requireRowsAffected(result)
 }
 
 func (s *Store) FailSyncJob(ctx context.Context, id string, errText string) error {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return fmt.Errorf("job id is required")
-	}
-	_, err := s.db.ExecContext(ctx, `
-update jobs
-set status = 'failed',
-    last_error = ?,
-    updated_at = current_timestamp
-where id = ?
-`, strings.TrimSpace(errText), id)
-	return err
+	return s.FailJob(ctx, id, errText)
 }
 
 func (s *Store) ListSyncJobs(ctx context.Context, sourceID string, limit int) ([]domain.SyncJob, error) {
@@ -716,27 +2848,19 @@ func (s *Store) ListSyncJobs(ctx context.Context, sourceID string, limit int) ([
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	rows, err := s.db.QueryContext(ctx, `
-select id, kind, status, payload_json, attempts, run_after, coalesce(locked_until, ''), last_error, created_at, updated_at
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, kind, status, source_id, target_kind, target_id, payload_json, progress_json, result_json, worker_id, attempts, run_after, coalesce(locked_until, ''), last_error, created_at, updated_at
 from jobs
-where kind = 'sync_source' and payload_json like ?
+where kind = 'sync_source'
+  and (source_id = ? or payload_json like ?)
 order by rowid desc
 limit ?
-`, sourceIDLike(sourceID), limit)
+`, sourceID, sourceIDLike(sourceID), limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var jobs []domain.SyncJob
-	for rows.Next() {
-		var job domain.SyncJob
-		if err := rows.Scan(&job.ID, &job.Kind, &job.Status, &job.PayloadJSON, &job.Attempts, &job.RunAfter, &job.LockedUntil, &job.LastError, &job.CreatedAt, &job.UpdatedAt); err != nil {
-			return nil, err
-		}
-		jobs = append(jobs, job)
-	}
-	return jobs, rows.Err()
+	return scanJobs(rows)
 }
 
 func (s *Store) DeleteSyncJob(ctx context.Context, sourceID string, jobID string) error {
@@ -748,12 +2872,19 @@ func (s *Store) DeleteSyncJob(ctx context.Context, sourceID string, jobID string
 	if jobID == "" {
 		return fmt.Errorf("job id is required")
 	}
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if job.Status == "queued" || job.Status == "running" || job.Status == "canceling" {
+		return domain.ErrJobNotCancelable
+	}
 	result, err := s.db.ExecContext(ctx, `
 delete from jobs
 where id = ?
   and kind = 'sync_source'
-  and payload_json like ?
-`, jobID, sourceIDLike(sourceID))
+  and (source_id = ? or payload_json like ?)
+`, jobID, sourceID, sourceIDLike(sourceID))
 	if err != nil {
 		return err
 	}
@@ -768,27 +2899,68 @@ where id = ?
 }
 
 func (s *Store) getSyncJob(ctx context.Context, id string) (domain.SyncJob, error) {
-	var job domain.SyncJob
-	err := s.db.QueryRowContext(ctx, `
-select id, kind, status, payload_json, attempts, run_after, coalesce(locked_until, ''), last_error, created_at, updated_at
-from jobs
-where id = ?
-`, id).Scan(&job.ID, &job.Kind, &job.Status, &job.PayloadJSON, &job.Attempts, &job.RunAfter, &job.LockedUntil, &job.LastError, &job.CreatedAt, &job.UpdatedAt)
-	if err != nil {
-		return domain.SyncJob{}, err
+	return s.GetJob(ctx, id)
+}
+
+func defaultJSONObject(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "{}"
 	}
-	return job, nil
+	if !json.Valid([]byte(value)) {
+		return "{}"
+	}
+	return value
+}
+
+func normalizeKinds(kinds []string) []string {
+	seen := map[string]bool{}
+	var normalized []string
+	for _, kind := range kinds {
+		kind = strings.TrimSpace(kind)
+		if kind == "" || seen[kind] {
+			continue
+		}
+		seen[kind] = true
+		normalized = append(normalized, kind)
+	}
+	return normalized
+}
+
+func requireRowsAffected(result sql.Result) error {
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func scanJobs(rows *sql.Rows) ([]domain.Job, error) {
+	var jobs []domain.Job
+	for rows.Next() {
+		var job domain.Job
+		if err := rows.Scan(&job.ID, &job.Kind, &job.Status, &job.SourceID, &job.TargetKind, &job.TargetID, &job.PayloadJSON, &job.ProgressJSON, &job.ResultJSON, &job.WorkerID, &job.Attempts, &job.RunAfter, &job.LockedUntil, &job.LastError, &job.CreatedAt, &job.UpdatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
 }
 
 func syncJobPayload(sourceID string, result domain.ResultPayload) string {
 	data, err := json.Marshal(struct {
-		SourceID    string              `json:"source_id"`
-		Documents   int                 `json:"documents"`
-		BrokenLinks []domain.BrokenLink `json:"broken_links,omitempty"`
+		SourceID          string                   `json:"source_id"`
+		Documents         int                      `json:"documents"`
+		EntityDiagnostics domain.EntityDiagnostics `json:"entity_diagnostics,omitempty"`
+		BrokenLinks       []domain.BrokenLink      `json:"broken_links,omitempty"`
 	}{
-		SourceID:    sourceID,
-		Documents:   result.Documents,
-		BrokenLinks: result.BrokenLinks,
+		SourceID:          sourceID,
+		Documents:         result.Documents,
+		EntityDiagnostics: result.EntityDiagnostics,
+		BrokenLinks:       result.BrokenLinks,
 	})
 	if err != nil {
 		return "{}"
@@ -808,6 +2980,28 @@ func sourceIDFromPayload(payload string) string {
 
 func sourceIDLike(sourceID string) string {
 	return `%` + jsonField("source_id", sourceID) + `%`
+}
+
+func normalizeSourceSyncState(status string, reason string, pausedAt string) (string, string, string) {
+	status = strings.TrimSpace(status)
+	reason = strings.TrimSpace(reason)
+	pausedAt = strings.TrimSpace(pausedAt)
+	if status == "" {
+		status = "active"
+	}
+	if status != "active" && status != "paused" {
+		status = "active"
+		reason = ""
+		pausedAt = ""
+	}
+	if status == "active" {
+		reason = ""
+		pausedAt = ""
+	}
+	if status == "paused" && reason == "" {
+		reason = "credential_required"
+	}
+	return status, reason, pausedAt
 }
 
 func documentIDLike(documentID string) string {
@@ -859,7 +3053,13 @@ func (s *Store) UpsertNode(ctx context.Context, node domain.NodeInput) error {
 		node.Confidence = 1
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
 insert into nodes (id, kind, name, canonical_name, metadata_json, confidence)
 values (?, ?, ?, ?, ?, ?)
 on conflict(id) do update set
@@ -869,8 +3069,22 @@ on conflict(id) do update set
   metadata_json = excluded.metadata_json,
   confidence = excluded.confidence,
   updated_at = current_timestamp
-`, node.ID, node.Kind, node.Name, node.CanonicalName, node.MetadataJSON, node.Confidence)
-	return err
+`, node.ID, node.Kind, node.Name, node.CanonicalName, node.MetadataJSON, node.Confidence); err != nil {
+		return fmt.Errorf("upsert node %s: %w", node.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `delete from fts_nodes where node_id = ?`, node.ID); err != nil {
+		return fmt.Errorf("delete fts node %s: %w", node.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+insert into fts_nodes (kind, name, canonical_name, metadata_json, node_id)
+values (?, ?, ?, ?, ?)
+`, node.Kind, node.Name, node.CanonicalName, node.MetadataJSON, node.ID); err != nil {
+		return fmt.Errorf("insert fts node %s: %w", node.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit upsert node %s: %w", node.ID, err)
+	}
+	return nil
 }
 
 func (s *Store) UpsertEdge(ctx context.Context, edge domain.EdgeInput) error {
@@ -914,7 +3128,10 @@ on conflict(id) do update set
   metadata_json = excluded.metadata_json,
   updated_at = current_timestamp
 `, edge.ID, edge.SrcID, edge.DstID, edge.Kind, edge.Confidence, edge.Provenance, edge.EvidenceSectionID, edge.SourceRevision, edge.MetadataJSON)
-	return err
+	if err != nil {
+		return fmt.Errorf("upsert edge %s src=%s dst=%s evidence_section=%s: %w", edge.ID, edge.SrcID, edge.DstID, edge.EvidenceSectionID, err)
+	}
+	return nil
 }
 
 func (s *Store) SearchNodes(ctx context.Context, query string, limit int) ([]domain.Node, error) {
@@ -926,20 +3143,46 @@ func (s *Store) SearchNodes(ctx context.Context, query string, limit int) ([]dom
 		limit = 20
 	}
 	like := "%" + strings.ToLower(query) + "%"
-	rows, err := s.db.QueryContext(ctx, `
-select id, kind, name, canonical_name, metadata_json, confidence, created_at, updated_at
-from nodes
-where lower(id) like ?
-   or lower(kind) like ?
-   or lower(name) like ?
-   or lower(canonical_name) like ?
-   or lower(metadata_json) like ?
-order by
-  case when id = ? then 0 when lower(name) = lower(?) then 1 else 2 end,
-  kind asc,
-  name asc
+	ftsQuery := nodeFTSQuery(query)
+	args := []any{query, query, query}
+	ftsCandidate := ""
+	if ftsQuery != "" {
+		ftsCandidate = `
+  union all
+  select n.id, 2
+  from fts_nodes f
+  join nodes n on n.id = f.node_id
+  where fts_nodes match ?
+`
+		args = append(args, ftsQuery)
+	}
+	args = append(args, like, like, like, like, like, limit)
+	rows, err := s.readDB().QueryContext(ctx, `
+with candidates as (
+  select id, 0 as source_rank from nodes where id = ?
+  union all
+  select id, 1 from nodes where lower(name) = lower(?) or lower(canonical_name) = lower(?)
+`+ftsCandidate+`
+  union all
+  select id, 3
+  from nodes
+  where lower(id) like ?
+     or lower(kind) like ?
+     or lower(name) like ?
+     or lower(canonical_name) like ?
+     or lower(metadata_json) like ?
+),
+ranked as (
+  select id, min(source_rank) as source_rank
+  from candidates
+  group by id
+)
+select n.id, n.kind, n.name, n.canonical_name, n.metadata_json, n.confidence, n.created_at, n.updated_at
+from ranked r
+join nodes n on n.id = r.id
+order by r.source_rank, n.kind asc, n.name asc
 limit ?
-`, like, like, like, like, like, query, query, limit)
+`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -956,9 +3199,26 @@ limit ?
 	return nodes, rows.Err()
 }
 
+func nodeFTSQuery(query string) string {
+	terms := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+		return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '/' || r == '-' || r == '.')
+	})
+	seen := map[string]bool{}
+	cleaned := make([]string, 0, len(terms))
+	for _, term := range terms {
+		term = strings.Trim(term, `"'`)
+		if term == "" || seen[term] {
+			continue
+		}
+		seen[term] = true
+		cleaned = append(cleaned, `"`+strings.ReplaceAll(term, `"`, `""`)+`"`)
+	}
+	return strings.Join(cleaned, " OR ")
+}
+
 func (s *Store) GetNode(ctx context.Context, id string) (domain.Node, error) {
 	var node domain.Node
-	err := s.db.QueryRowContext(ctx, `
+	err := s.readDB().QueryRowContext(ctx, `
 select id, kind, name, canonical_name, metadata_json, confidence, created_at, updated_at
 from nodes
 where id = ?
@@ -971,13 +3231,16 @@ where id = ?
 
 func (s *Store) GetSection(ctx context.Context, id string) (domain.SectionContent, error) {
 	var sc domain.SectionContent
-	err := s.db.QueryRowContext(ctx, `
+	err := s.readDB().QueryRowContext(ctx, `
 select s.id, s.document_id, d.title, d.url, s.title, s.heading_path, s.content
 from sections s
 join documents d on s.document_id = d.id
 where s.id = ?
 `, id).Scan(&sc.SectionID, &sc.DocumentID, &sc.DocumentTitle, &sc.DocumentURL, &sc.Title, &sc.HeadingPath, &sc.Content)
 	if err != nil {
+		return domain.SectionContent{}, err
+	}
+	if err := s.attachExplicitReferences(ctx, &sc); err != nil {
 		return domain.SectionContent{}, err
 	}
 	return sc, nil
@@ -1140,7 +3403,7 @@ limit ?
 
 func (s *Store) relatedRows(ctx context.Context, query string, id string, kind string, limit int) ([]domain.RelatedNode, error) {
 	kind = strings.TrimSpace(kind)
-	rows, err := s.db.QueryContext(ctx, query, id, kind, kind, limit)
+	rows, err := s.readDB().QueryContext(ctx, query, id, kind, kind, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1336,7 +3599,7 @@ on conflict(id) do update set
 
 func (s *Store) getFeedbackEvent(ctx context.Context, id string) (domain.FeedbackEvent, error) {
 	var event domain.FeedbackEvent
-	err := s.db.QueryRowContext(ctx, `
+	err := s.readDB().QueryRowContext(ctx, `
 select id, target_kind, target_id, feedback_kind, payload_json, actor, created_at
 from feedback_events
 where id = ?
@@ -1372,7 +3635,7 @@ func (s *Store) ListFeedbackEvents(ctx context.Context, opts domain.FeedbackList
 		limit = 20
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.readDB().QueryContext(ctx, `
 select id, target_kind, target_id, feedback_kind, payload_json, actor, created_at
 from feedback_events
 where (? = '' or target_kind = ?)
@@ -1395,6 +3658,62 @@ limit ?
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+func (s *Store) RecordQueryObservation(ctx context.Context, input domain.QueryObservationInput) error {
+	input.QueryText = strings.TrimSpace(input.QueryText)
+	input.NormalizedQuery = strings.TrimSpace(input.NormalizedQuery)
+	if input.NormalizedQuery == "" {
+		input.NormalizedQuery = strings.ToLower(input.QueryText)
+	}
+	if input.Source == "" {
+		input.Source = "api"
+	}
+	if input.ID == "" {
+		input.ID = ids.Random("qry", 12)
+	}
+	queryHash := queryHash(input.NormalizedQuery)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+insert into query_events (id, query_hash, normalized_query, query_text, source, result_count, latency_ms, cache_hit)
+values (?, ?, ?, ?, ?, ?, ?, ?)
+`, input.ID, queryHash, input.NormalizedQuery, input.QueryText, input.Source, input.ResultCount, input.LatencyMS, boolInt(input.CacheHit)); err != nil {
+		return err
+	}
+	for i, result := range input.Results {
+		if strings.TrimSpace(result.DocumentID) == "" || strings.TrimSpace(result.SectionID) == "" {
+			continue
+		}
+		rank := result.Rank
+		if rank <= 0 {
+			rank = i + 1
+		}
+		if _, err := tx.ExecContext(ctx, `
+insert into search_result_events (id, query_event_id, document_id, section_id, rank, score)
+values (?, ?, ?, ?, ?, ?)
+`, ids.Random("qres", 12), input.ID, result.DocumentID, result.SectionID, rank, result.Score); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func queryHash(query string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(query))))
+	return hex.EncodeToString(sum[:])
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Store) SearchSections(ctx context.Context, query string, limit int) ([]domain.SearchHit, error) {
@@ -1420,7 +3739,7 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 		opts.Limit = 20
 	}
 	if opts.MaxSearches <= 0 {
-		opts.MaxSearches = 3
+		opts.MaxSearches = 5
 	}
 	if opts.MaxSearches > 5 {
 		opts.MaxSearches = 5
@@ -1443,12 +3762,15 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 	if opts.MaxCharsPerResult > 4000 {
 		opts.MaxCharsPerResult = 4000
 	}
+	if opts.RelationDepth <= 0 || opts.RelationDepth > 1 {
+		opts.RelationDepth = 1
+	}
 
 	collector := newSearchCollector(opts)
 	attempts := make([]domain.SearchAttempt, 0, opts.MaxSearches)
 
-	runAttempt := func(kind string, query string, terms []string, fn func() ([]domain.SearchHit, error)) error {
-		if len(attempts) >= opts.MaxSearches {
+	runAttempt := func(kind string, query string, terms []string, required bool, fn func() ([]domain.SearchHit, error)) error {
+		if !required && len(attempts) >= opts.MaxSearches {
 			return nil
 		}
 		hits, err := fn()
@@ -1460,26 +3782,51 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 		return nil
 	}
 
-	phraseQuery := quoteMatchQuery(opts.Query)
-	if err := runAttempt("phrase", phraseQuery, nil, func() ([]domain.SearchHit, error) {
-		return s.searchSectionsMatch(ctx, phraseQuery, opts.Limit*2, opts)
-	}); err != nil {
-		return domain.SearchResult{}, err
-	}
-
-	tokenQuery := fallbackMatchQuery(opts.Query)
-	if tokenQuery != "" && tokenQuery != phraseQuery {
-		if err := runAttempt("token", tokenQuery, nil, func() ([]domain.SearchHit, error) {
-			return s.searchSectionsMatch(ctx, tokenQuery, opts.Limit*2, opts)
+	queryTerms := classifyQueryTerms(opts.Query)
+	queryEntities := extractQueryEntities(opts.Query)
+	entityExactTerms := entitySearchTerms(queryEntities)
+	if len(entityExactTerms) > 0 {
+		entityQuery := matchQueryFromTerms(entityExactTerms, 16)
+		if err := runAttempt("entity_exact", entityQuery, entityExactTerms, false, func() ([]domain.SearchHit, error) {
+			return s.searchSectionsEntity(ctx, entityQuery, opts.Limit*3, opts, entityMatchExact)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+		if err := runAttempt("entity_normalized", entityQuery, entityExactTerms, false, func() ([]domain.SearchHit, error) {
+			return s.searchSectionsEntity(ctx, entityQuery, opts.Limit*3, opts, entityMatchNormalized)
 		}); err != nil {
 			return domain.SearchResult{}, err
 		}
 	}
+	unicodeTerms := strongQueryTermTexts(queryTerms)
+	tokenQuery := matchQueryFromTerms(unicodeTerms, 16)
+	if err := runAttempt("unicode61", tokenQuery, unicodeTerms, false, func() ([]domain.SearchHit, error) {
+		return s.searchSectionsTokenFTS(ctx, tokenQuery, opts.Limit*3, opts)
+	}); err != nil {
+		return domain.SearchResult{}, err
+	}
 
-	if hasHan(opts.Query) {
+	trigramQuery := trigramFTSQuery(opts.Query)
+	if err := runAttempt("trigram", trigramQuery, nil, false, func() ([]domain.SearchHit, error) {
+		return s.searchSectionsTokenTrigram(ctx, opts.Query, opts.Limit*3, opts)
+	}); err != nil {
+		return domain.SearchResult{}, err
+	}
+
+	if len(collector.hits) == 0 {
+		profileTerms := profileSearchTerms(opts.Query)
+		if len(profileTerms) > 0 {
+			if err := runAttempt("profile_fallback", "", profileTerms, false, func() ([]domain.SearchHit, error) {
+				return s.searchSectionsProfile(ctx, profileTerms, opts.Limit*2, opts)
+			}); err != nil {
+				return domain.SearchResult{}, err
+			}
+		}
+	}
+	if len(collector.hits) == 0 {
 		terms := substringSearchTerms(opts.Query)
 		if len(terms) > 0 {
-			if err := runAttempt("ngram", "", terms, func() ([]domain.SearchHit, error) {
+			if err := runAttempt("like_fallback", "", terms, true, func() ([]domain.SearchHit, error) {
 				return s.searchSectionsLike(ctx, terms, opts.Limit*2, opts)
 			}); err != nil {
 				return domain.SearchResult{}, err
@@ -1487,27 +3834,355 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 		}
 	}
 
-	profileTerms := profileSearchTerms(opts.Query)
-	if len(profileTerms) > 0 {
-		if err := runAttempt("profile", "", profileTerms, func() ([]domain.SearchHit, error) {
-			return s.searchSectionsProfile(ctx, profileTerms, opts.Limit*2, opts)
-		}); err != nil {
+	hits := collector.results()
+	if opts.UseRelationExpansion && len(hits) > 0 {
+		var err error
+		hits, err = s.expandSearchHitsWithRelations(ctx, hits, opts)
+		if err != nil {
 			return domain.SearchResult{}, err
 		}
 	}
-
-	hits := collector.results()
-	return domain.SearchResult{
+	result := domain.SearchResult{
 		Query:        opts.Query,
 		SearchesUsed: len(attempts),
 		Attempts:     attempts,
 		Hits:         hits,
-	}, nil
+		SuggestedReads: domain.SuggestedReads{
+			ExplicitReferences:  []domain.ExplicitReference{},
+			ImplicitSymbolLinks: []domain.SuggestedRead{},
+			CuratedRelations:    []domain.SuggestedRead{},
+			StructuralNeighbors: []domain.SuggestedRead{},
+		},
+	}
+	if err := s.enrichSearchResultExplicitReferences(ctx, &result); err != nil {
+		return domain.SearchResult{}, err
+	}
+	return result, nil
 }
 
-func (s *Store) searchSectionsMatch(ctx context.Context, matchQuery string, limit int, opts domain.SearchOptions) ([]domain.SearchHit, error) {
-	rows, err := s.db.QueryContext(ctx, `
-select fts_sections.section_id, fts_sections.document_id, documents.title, documents.url,
+type entityMatchMode string
+
+const (
+	entityMatchExact      entityMatchMode = "entity_exact"
+	entityMatchNormalized entityMatchMode = "entity_normalized"
+)
+
+func (s *Store) searchSectionsEntity(ctx context.Context, matchQuery string, limit int, opts domain.SearchOptions, mode entityMatchMode) ([]domain.SearchHit, error) {
+	hits, err := s.searchSectionsStoredEntities(ctx, opts, mode, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) > 0 {
+		return hits, nil
+	}
+	return s.searchSectionsEntityFTS(ctx, matchQuery, limit, opts, mode)
+}
+
+func (s *Store) searchSectionsStoredEntities(ctx context.Context, opts domain.SearchOptions, mode entityMatchMode, limit int) ([]domain.SearchHit, error) {
+	queryEntities := extractQueryEntities(opts.Query)
+	if len(queryEntities) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	terms := entitySearchTerms(queryEntities)
+	seen := map[string]bool{}
+	hits := make([]domain.SearchHit, 0)
+	for _, term := range terms {
+		entities, err := s.searchEntitiesExact(ctx, term, limit)
+		if err != nil {
+			return nil, err
+		}
+		for _, entity := range entities {
+			if len(hits) >= limit {
+				return hits, nil
+			}
+			if seen[entity.SectionID] {
+				continue
+			}
+			match := storedEntityMatchForQuery(entity, queryEntities)
+			if mode == entityMatchExact && !match.Exact {
+				continue
+			}
+			if mode == entityMatchNormalized && !match.Normalized {
+				continue
+			}
+			hit, err := s.sectionHitForStoredEntity(ctx, entity, opts, mode, match)
+			if err != nil {
+				return nil, err
+			}
+			seen[entity.SectionID] = true
+			hits = append(hits, hit)
+		}
+	}
+	sortSearchHits(hits)
+	return hits, nil
+}
+
+func (s *Store) sectionHitForStoredEntity(ctx context.Context, entity domain.SectionEntity, opts domain.SearchOptions, mode entityMatchMode, match entityMatchResult) (domain.SearchHit, error) {
+	var hit domain.SearchHit
+	var profileJSON string
+	err := s.readDB().QueryRowContext(ctx, `
+select sections.id, sections.document_id, documents.title, documents.url,
+       coalesce(document_profiles."desc", ''),
+       coalesce(document_profiles.retrieval_profile_json, '{}'),
+       exists (
+         select 1 from feedback_events fe
+         where fe.target_kind = 'document'
+           and fe.target_id = documents.id
+           and fe.feedback_kind = 'document_canonical'
+       ) as canonical,
+       sections.title, sections.heading_path, sections.content
+from sections
+join documents on documents.id = sections.document_id
+left join document_profiles on document_profiles.document_id = documents.id
+where sections.id = ?
+  and not exists (
+    select 1 from feedback_events fe
+    where fe.target_kind = 'document'
+      and fe.target_id = documents.id
+      and fe.feedback_kind = 'document_stale'
+  )
+`, entity.SectionID).Scan(&hit.SectionID, &hit.DocumentID, &hit.DocumentTitle, &hit.DocumentURL, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content)
+	if err != nil {
+		return domain.SearchHit{}, err
+	}
+	terms := match.Terms
+	if len(terms) == 0 {
+		terms = []string{sectionEntityDisplayTerm(entity)}
+	}
+	hit.Snippet = bestSnippet(hit.Content, terms)
+	enrichSearchHit(&hit, opts, profileJSON, terms, string(mode))
+	breakdown := domain.ScoreBreakdown{
+		MatchedFields: []string{string(mode)},
+		MatchedTerms:  uniqueStrings(terms),
+	}
+	if mode == entityMatchExact {
+		breakdown.ExactMatchBoost = 260
+	} else {
+		breakdown.ExactMatchBoost = 180
+	}
+	if hit.Canonical {
+		breakdown.CanonicalBoost = 30
+	}
+	hit.MatchedEntities = []domain.MatchedEntity{matchedEntityFromStored(entity, string(mode))}
+	breakdown.Total = breakdown.ExactMatchBoost + breakdown.CanonicalBoost
+	hit.Rank = breakdown.Total
+	hit.ScoreBreakdown = &breakdown
+	if hit.QueryMatch != nil {
+		applyScoreBreakdownToQueryMatch(hit.QueryMatch, breakdown)
+	}
+	return hit, nil
+}
+
+func (s *Store) searchSectionsEntityFTS(ctx context.Context, matchQuery string, limit int, opts domain.SearchOptions, mode entityMatchMode) ([]domain.SearchHit, error) {
+	hits, err := s.searchSectionsTokenFTS(ctx, matchQuery, limit, opts)
+	if err != nil {
+		return nil, err
+	}
+	filtered := hits[:0]
+	for _, hit := range hits {
+		match := entityMatchForHit(hit, opts.Query)
+		matched := mode == entityMatchExact && match.Exact
+		matched = matched || mode == entityMatchNormalized && match.Normalized
+		if !matched {
+			continue
+		}
+		hasStoredEntities, err := s.sectionHasStoredEntities(ctx, hit.SectionID)
+		if err != nil {
+			return nil, err
+		}
+		if hasStoredEntities {
+			continue
+		}
+		hit.MatchedEntities = matchedEntitiesWithMode(match.Entities, string(mode))
+		filtered = append(filtered, hit)
+	}
+	return filtered, nil
+}
+
+func (s *Store) sectionHasStoredEntities(ctx context.Context, sectionID string) (bool, error) {
+	var exists bool
+	err := s.readDB().QueryRowContext(ctx, `
+select exists (
+  select 1 from section_entities
+  where section_id = ?
+)
+`, sectionID).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func (s *Store) expandSearchHitsWithRelations(ctx context.Context, hits []domain.SearchHit, opts domain.SearchOptions) ([]domain.SearchHit, error) {
+	if len(hits) == 0 {
+		return hits, nil
+	}
+	byDocument := map[string]int{}
+	for i, hit := range hits {
+		if hit.DocumentID != "" {
+			byDocument[hit.DocumentID] = i
+		}
+	}
+	documents := make([]string, 0, len(byDocument))
+	for documentID := range byDocument {
+		documents = append(documents, documentID)
+	}
+	sort.Strings(documents)
+
+	relationsByDocument, err := s.knowledgeRelationsForDocuments(ctx, documents, opts.RelationTypes)
+	if err != nil {
+		return nil, err
+	}
+	for _, documentID := range documents {
+		sourceIdx := byDocument[documentID]
+		for _, relation := range relationsByDocument[documentID] {
+			targetDocumentID, direction, ok := relationTargetForDocument(relation, documentID)
+			if !ok {
+				continue
+			}
+			match := domain.RelationMatch{
+				RelationID:       relation.ID,
+				RelationType:     relation.RelationType,
+				SourceDocumentID: documentID,
+				TargetDocumentID: targetDocumentID,
+				Direction:        direction,
+				Effect:           relation.Effect,
+				Weight:           relation.Weight,
+				Reason:           relation.Reason,
+			}
+			hits[sourceIdx].RelationMatches = append(hits[sourceIdx].RelationMatches, match)
+			if relation.Effect == "ignore" || relation.RelationType == "should_ignore" {
+				continue
+			}
+			if _, exists := byDocument[targetDocumentID]; exists {
+				continue
+			}
+			if len(hits) >= opts.Limit {
+				continue
+			}
+			relatedHit, err := s.firstSectionHitForDocument(ctx, targetDocumentID, opts)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				return nil, err
+			}
+			relatedHit.RelationMatches = []domain.RelationMatch{match}
+			relatedHit.Rank = hits[sourceIdx].Rank + relation.Weight
+			if relatedHit.Snippet == "" {
+				relatedHit.Snippet = bestSnippet(relatedHit.Content, searchTerms(opts.Query))
+			}
+			applySearchDetailOptions(&relatedHit, opts)
+			byDocument[targetDocumentID] = len(hits)
+			hits = append(hits, relatedHit)
+		}
+	}
+	sortSearchHits(hits)
+	if len(hits) > opts.Limit {
+		hits = hits[:opts.Limit]
+	}
+	return hits, nil
+}
+
+func (s *Store) knowledgeRelationsForDocuments(ctx context.Context, documentIDs []string, relationTypes []string) (map[string][]domain.KnowledgeRelation, error) {
+	result := make(map[string][]domain.KnowledgeRelation, len(documentIDs))
+	if len(documentIDs) == 0 {
+		return result, nil
+	}
+	allowedTypes := map[string]bool{}
+	for _, relationType := range relationTypes {
+		relationType = strings.TrimSpace(relationType)
+		if relationType != "" {
+			allowedTypes[relationType] = true
+		}
+	}
+	for _, documentID := range documentIDs {
+		relations, err := s.ListKnowledgeRelations(ctx, domain.KnowledgeRelationListOptions{
+			DocumentID:    documentID,
+			RelationTypes: relationTypes,
+			Limit:         50,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(allowedTypes) > 0 {
+			filtered := relations[:0]
+			for _, relation := range relations {
+				if allowedTypes[relation.RelationType] {
+					filtered = append(filtered, relation)
+				}
+			}
+			relations = filtered
+		}
+		result[documentID] = relations
+	}
+	return result, nil
+}
+
+func relationTargetForDocument(relation domain.KnowledgeRelation, documentID string) (string, string, bool) {
+	if relation.FromDocumentID == documentID {
+		return relation.ToDocumentID, "out", true
+	}
+	if relation.ToDocumentID == documentID && relation.Direction == "undirected" {
+		return relation.FromDocumentID, "in", true
+	}
+	return "", "", false
+}
+
+func (s *Store) firstSectionHitForDocument(ctx context.Context, documentID string, opts domain.SearchOptions) (domain.SearchHit, error) {
+	var hit domain.SearchHit
+	var profileJSON string
+	err := s.readDB().QueryRowContext(ctx, `
+select sections.id, sections.document_id, documents.title, documents.url,
+       coalesce(document_profiles."desc", ''),
+       coalesce(document_profiles.retrieval_profile_json, '{}'),
+       exists (
+         select 1 from feedback_events fe
+         where fe.target_kind = 'document'
+           and fe.target_id = documents.id
+           and fe.feedback_kind = 'document_canonical'
+       ) as canonical,
+       sections.title, sections.heading_path, sections.content
+from sections
+join documents on documents.id = sections.document_id
+left join document_profiles on document_profiles.document_id = documents.id
+where sections.document_id = ?
+order by sections.ordinal asc, sections.id asc
+limit 1
+`, documentID).Scan(&hit.SectionID, &hit.DocumentID, &hit.DocumentTitle, &hit.DocumentURL, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content)
+	if err != nil {
+		return domain.SearchHit{}, err
+	}
+	enrichSearchHit(&hit, opts, profileJSON, searchTerms(opts.Query), "relation")
+	return hit, nil
+}
+
+func applySearchDetailOptions(hit *domain.SearchHit, opts domain.SearchOptions) {
+	if opts.Detail == "summary" {
+		hit.Content = fmt.Sprintf("[content omitted; use doc_get_section(\"%s\") to read full section]", hit.SectionID)
+		hit.Desc = ""
+		hit.Profile = nil
+		hit.RetrievalProfile = nil
+		hit.QueryMatch = nil
+		return
+	}
+	if opts.MaxCharsPerResult > 0 {
+		before := len(hit.Content)
+		hit.Content = truncateBytes(hit.Content, opts.MaxCharsPerResult)
+		if len(hit.Content) < before {
+			hit.Content += fmt.Sprintf("\n[truncated at %d bytes; use doc_get_section(\"%s\") for full content]", opts.MaxCharsPerResult, hit.SectionID)
+		}
+	}
+	if opts.ProfileDetail == "none" {
+		hit.Desc = ""
+		hit.Profile = nil
+		hit.RetrievalProfile = nil
+	}
+}
+
+func (s *Store) searchSectionsTokenFTS(ctx context.Context, matchQuery string, limit int, opts domain.SearchOptions) ([]domain.SearchHit, error) {
+	rows, err := s.readDB().QueryContext(ctx, `
+select fts_section_tokens.section_id, fts_section_tokens.document_id, documents.title, documents.url,
        coalesce(document_profiles."desc", ''),
        coalesce(document_profiles.retrieval_profile_json, '{}'),
        exists (
@@ -1517,19 +4192,19 @@ select fts_sections.section_id, fts_sections.document_id, documents.title, docum
            and fe.feedback_kind = 'document_canonical'
        ) as canonical,
        sections.title, sections.heading_path, sections.content,
-       snippet(fts_sections, 2, '<mark>', '</mark>', '...', 16), rank
-from fts_sections
-join sections on sections.id = fts_sections.section_id
-join documents on documents.id = fts_sections.document_id
+       -bm25(fts_section_tokens, 8.0, 6.0, 7.0, 1.0) as score
+from fts_section_tokens
+join sections on sections.id = fts_section_tokens.section_id
+join documents on documents.id = fts_section_tokens.document_id
 left join document_profiles on document_profiles.document_id = documents.id
-where fts_sections match ?
+where fts_section_tokens match ?
   and not exists (
     select 1 from feedback_events fe
     where fe.target_kind = 'document'
       and fe.target_id = documents.id
       and fe.feedback_kind = 'document_stale'
   )
-order by canonical desc, rank
+order by canonical desc, score desc
 limit ?
 `, matchQuery, limit)
 	if err != nil {
@@ -1537,17 +4212,104 @@ limit ?
 	}
 	defer rows.Close()
 
-	var hits []domain.SearchHit
+	return scanWeightedSearchHits(rows, opts, "fts_unicode")
+}
+
+func (s *Store) searchSectionsTokenTrigram(ctx context.Context, query string, limit int, opts domain.SearchOptions) ([]domain.SearchHit, error) {
+	trigramQuery := trigramFTSQuery(query)
+
+	rows, err := s.readDB().QueryContext(ctx, `
+select fts_section_tokens_trigram.section_id, fts_section_tokens_trigram.document_id, documents.title, documents.url,
+       coalesce(document_profiles."desc", ''),
+       coalesce(document_profiles.retrieval_profile_json, '{}'),
+       exists (
+         select 1 from feedback_events fe
+         where fe.target_kind = 'document'
+           and fe.target_id = documents.id
+           and fe.feedback_kind = 'document_canonical'
+       ) as canonical,
+       sections.title, sections.heading_path, sections.content,
+       -bm25(fts_section_tokens_trigram, 8.0, 6.0, 7.0, 1.0) as score
+from fts_section_tokens_trigram
+join sections on sections.id = fts_section_tokens_trigram.section_id
+join documents on documents.id = fts_section_tokens_trigram.document_id
+left join document_profiles on document_profiles.document_id = documents.id
+where fts_section_tokens_trigram match ?
+  and not exists (
+    select 1 from feedback_events fe
+    where fe.target_kind = 'document'
+      and fe.target_id = documents.id
+      and fe.feedback_kind = 'document_stale'
+  )
+order by canonical desc, score desc
+limit ?
+`, trigramQuery, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanWeightedSearchHits(rows, opts, "fts_trigram")
+}
+
+func scanWeightedSearchHits(rows *sql.Rows, opts domain.SearchOptions, field string) ([]domain.SearchHit, error) {
+	type pendingHit struct {
+		hit         domain.SearchHit
+		profileJSON string
+		rawScore    float64
+	}
+	pending := make([]pendingHit, 0)
+	maxRawScore := 0.0
 	for rows.Next() {
 		var hit domain.SearchHit
 		var profileJSON string
-		if err := rows.Scan(&hit.SectionID, &hit.DocumentID, &hit.DocumentTitle, &hit.DocumentURL, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content, &hit.Snippet, &hit.Rank); err != nil {
+		var rawScore float64
+		if err := rows.Scan(&hit.SectionID, &hit.DocumentID, &hit.DocumentTitle, &hit.DocumentURL, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content, &rawScore); err != nil {
 			return nil, err
 		}
-		enrichSearchHit(&hit, opts, profileJSON, searchTerms(opts.Query), "fts")
+		if rawScore > maxRawScore {
+			maxRawScore = rawScore
+		}
+		pending = append(pending, pendingHit{hit: hit, profileJSON: profileJSON, rawScore: rawScore})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	hits := make([]domain.SearchHit, 0, len(pending))
+	queryTerms := classifyQueryTerms(opts.Query)
+	terms := uniqueStrings(append(entitySearchTerms(extractQueryEntities(opts.Query)), strongQueryTermTexts(queryTerms)...))
+	if len(terms) == 0 {
+		terms = searchTerms(opts.Query)
+	}
+	for _, row := range pending {
+		hit := row.hit
+		baseScore := normalizedBM25Boost(row.rawScore, maxRawScore, field)
+		hit.Snippet = bestSnippet(hit.Content, terms)
+		enrichSearchHit(&hit, opts, row.profileJSON, terms, field)
+		breakdown := weightedScoreBreakdown(hit, opts.Query, terms, baseScore, field)
+		hit.Rank = breakdown.Total
+		hit.ScoreBreakdown = &breakdown
+		if hit.QueryMatch != nil {
+			applyScoreBreakdownToQueryMatch(hit.QueryMatch, breakdown)
+		}
 		hits = append(hits, hit)
 	}
-	return hits, rows.Err()
+	return hits, nil
+}
+
+func normalizedBM25Boost(rawScore float64, maxRawScore float64, field string) float64 {
+	if rawScore <= 0 || maxRawScore <= 0 {
+		return 0
+	}
+	switch field {
+	case "fts_unicode":
+		return rawScore / maxRawScore * 100
+	case "fts_trigram":
+		return rawScore / maxRawScore * 40
+	default:
+		return rawScore
+	}
 }
 
 func (s *Store) searchSectionsLike(ctx context.Context, terms []string, limit int, opts domain.SearchOptions) ([]domain.SearchHit, error) {
@@ -1600,9 +4362,9 @@ limit ?
 		var rows *sql.Rows
 		var err error
 		if profileOnly {
-			rows, err = s.db.QueryContext(ctx, query, pattern, pattern, limit)
+			rows, err = s.readDB().QueryContext(ctx, query, pattern, pattern, limit)
 		} else {
-			rows, err = s.db.QueryContext(ctx, query, pattern, pattern, pattern, pattern, limit)
+			rows, err = s.readDB().QueryContext(ctx, query, pattern, pattern, pattern, pattern, limit)
 		}
 		if err != nil {
 			return nil, err
@@ -1625,6 +4387,12 @@ limit ?
 				enrichSearchHit(&hit, opts, profileJSON, []string{term}, "profile")
 			} else {
 				enrichSearchHit(&hit, opts, profileJSON, []string{term}, "content")
+			}
+			breakdown := weightedScoreBreakdown(hit, opts.Query, []string{term}, 1, "fallback")
+			hit.Rank = breakdown.Total
+			hit.ScoreBreakdown = &breakdown
+			if hit.QueryMatch != nil {
+				applyScoreBreakdownToQueryMatch(hit.QueryMatch, breakdown)
 			}
 			hits = append(hits, hit)
 			if len(hits) >= limit {
@@ -1659,8 +4427,8 @@ func (c *searchCollector) add(attempt string, hits []domain.SearchHit) {
 	for _, hit := range hits {
 		if c.opts.Detail == "summary" {
 			// Summary mode: strip content and verbose metadata for lightweight scanning.
-			// LLM should use doc_get_section to retrieve full content of relevant sections.
-			hit.Content = ""
+			// Replace with a hint so LLMs know to use doc_get_section for full retrieval.
+			hit.Content = fmt.Sprintf("[content omitted; use doc_get_section(\"%s\") to read full section]", hit.SectionID)
 			hit.Desc = ""
 			hit.Profile = nil
 			hit.RetrievalProfile = nil
@@ -1668,7 +4436,11 @@ func (c *searchCollector) add(attempt string, hits []domain.SearchHit) {
 		} else {
 			// Content mode (default behavior): include full content with truncation.
 			if c.opts.MaxCharsPerResult > 0 {
+				before := len(hit.Content)
 				hit.Content = truncateBytes(hit.Content, c.opts.MaxCharsPerResult)
+				if len(hit.Content) < before {
+					hit.Content += fmt.Sprintf("\n[truncated at %d bytes; use doc_get_section(\"%s\") for full content]", c.opts.MaxCharsPerResult, hit.SectionID)
+				}
 			}
 			if c.opts.ProfileDetail == "none" {
 				hit.Desc = ""
@@ -1677,9 +4449,22 @@ func (c *searchCollector) add(attempt string, hits []domain.SearchHit) {
 			}
 		}
 		if idx, ok := c.seen[hit.SectionID]; ok {
+			oldRank := c.hits[idx].Rank
+			if c.hits[idx].ScoreBreakdown != nil && hit.ScoreBreakdown != nil {
+				merged := mergeScoreBreakdowns(*c.hits[idx].ScoreBreakdown, *hit.ScoreBreakdown)
+				c.hits[idx].ScoreBreakdown = &merged
+				c.hits[idx].Rank = merged.Total
+			} else if hit.Rank > c.hits[idx].Rank {
+				c.hits[idx].Rank = hit.Rank
+				c.hits[idx].ScoreBreakdown = hit.ScoreBreakdown
+			}
+			if hit.Rank > oldRank {
+				c.hits[idx].Snippet = hit.Snippet
+			}
 			if hit.QueryMatch != nil {
 				mergeQueryMatch(c.hits[idx].QueryMatch, hit.QueryMatch, attempt)
 			}
+			c.hits[idx].MatchedEntities = mergeMatchedEntities(c.hits[idx].MatchedEntities, hit.MatchedEntities)
 			continue
 		}
 		if hit.QueryMatch != nil {
@@ -1691,6 +4476,7 @@ func (c *searchCollector) add(attempt string, hits []domain.SearchHit) {
 }
 
 func (c *searchCollector) results() []domain.SearchHit {
+	sortSearchHits(c.hits)
 	result := make([]domain.SearchHit, 0, minInt(c.opts.Limit, len(c.hits)))
 	perDoc := map[string]int{}
 	for _, hit := range c.hits {
@@ -1704,6 +4490,55 @@ func (c *searchCollector) results() []domain.SearchHit {
 		result = append(result, hit)
 	}
 	return result
+}
+
+func sortSearchHits(hits []domain.SearchHit) {
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].Rank == hits[j].Rank {
+			if hits[i].Canonical != hits[j].Canonical {
+				return hits[i].Canonical
+			}
+			if hits[i].DocumentTitle == hits[j].DocumentTitle {
+				return hits[i].Title < hits[j].Title
+			}
+			return hits[i].DocumentTitle < hits[j].DocumentTitle
+		}
+		return hits[i].Rank > hits[j].Rank
+	})
+}
+
+func mergeScoreBreakdowns(left domain.ScoreBreakdown, right domain.ScoreBreakdown) domain.ScoreBreakdown {
+	merged := domain.ScoreBreakdown{
+		UnicodeBM25Boost: left.UnicodeBM25Boost + right.UnicodeBM25Boost,
+		TrigramBM25Boost: left.TrigramBM25Boost + right.TrigramBM25Boost,
+		TitleBoost:       maxFloat(left.TitleBoost, right.TitleBoost),
+		SectionBoost:     maxFloat(left.SectionBoost, right.SectionBoost),
+		SymbolBoost:      maxFloat(left.SymbolBoost, right.SymbolBoost),
+		ExactMatchBoost:  maxFloat(left.ExactMatchBoost, right.ExactMatchBoost),
+		CanonicalBoost:   maxFloat(left.CanonicalBoost, right.CanonicalBoost),
+		CoverageBoost:    maxFloat(left.CoverageBoost, right.CoverageBoost),
+		FallbackBoost:    maxFloat(left.FallbackBoost, right.FallbackBoost),
+		MatchedFields:    uniqueStrings(append(left.MatchedFields, right.MatchedFields...)),
+		MatchedTerms:     uniqueStrings(append(left.MatchedTerms, right.MatchedTerms...)),
+		MatchedSymbols:   uniqueStrings(append(left.MatchedSymbols, right.MatchedSymbols...)),
+	}
+	merged.Total = merged.UnicodeBM25Boost +
+		merged.TrigramBM25Boost +
+		merged.TitleBoost +
+		merged.SectionBoost +
+		merged.SymbolBoost +
+		merged.ExactMatchBoost +
+		merged.CanonicalBoost +
+		merged.CoverageBoost +
+		merged.FallbackBoost
+	return merged
+}
+
+func maxFloat(left float64, right float64) float64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func mergeQueryMatch(dst *domain.QueryMatch, src *domain.QueryMatch, attempt string) {
@@ -1940,6 +4775,61 @@ func quoteMatchQuery(query string) string {
 	return `"` + strings.ReplaceAll(strings.TrimSpace(query), `"`, `""`) + `"`
 }
 
+func matchQueryFromTerms(terms []string, limit int) string {
+	quoted := make([]string, 0, minInt(limit, len(terms)))
+	for _, term := range terms {
+		term = strings.TrimSpace(term)
+		if term == "" {
+			continue
+		}
+		quoted = append(quoted, `"`+strings.ReplaceAll(term, `"`, `""`)+`"`)
+		if len(quoted) >= limit {
+			break
+		}
+	}
+	if len(quoted) == 0 {
+		return `""`
+	}
+	return strings.Join(quoted, " OR ")
+}
+
+// trigramFTSQuery prepares a query for the trigram FTS5 index.
+// It splits the query at CJK/Latin script boundaries so each script
+// forms its own search term. This allows the trigram tokenizer to
+// match fragments within each script independently.
+// Example: "sampleapp平台默认配置schema" → `"sampleapp" OR "平台默认配置" OR "schema"`
+func trigramFTSQuery(query string) string {
+	var parts []string
+	var current strings.Builder
+	flush := func() {
+		s := strings.TrimSpace(current.String())
+		if s != "" {
+			parts = append(parts, `"`+strings.ReplaceAll(s, `"`, `""`)+`"`)
+		}
+		current.Reset()
+	}
+	for _, r := range query {
+		if current.Len() > 0 {
+			runes := []rune(current.String())
+			prevCJK := isCJK(runes[len(runes)-1])
+			curCJK := isCJK(r)
+			if prevCJK != curCJK {
+				flush()
+			}
+		}
+		current.WriteRune(r)
+	}
+	flush()
+	if len(parts) == 0 {
+		return `"` + strings.ReplaceAll(strings.TrimSpace(query), `"`, `""`) + `"`
+	}
+	return strings.Join(parts, " OR ")
+}
+
+func isCJK(r rune) bool {
+	return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r)
+}
+
 func fallbackMatchQuery(query string) string {
 	fields := strings.Fields(query)
 	if len(fields) <= 1 {
@@ -1970,6 +4860,101 @@ func searchTerms(query string) []string {
 	}
 	terms = append(terms, chineseNgrams(query, 2, 4)...)
 	return uniqueStrings(terms)
+}
+
+func expandedSearchTerms(query string) []string {
+	return queryTermTexts(classifyQueryTerms(query), true)
+}
+
+type queryTerm struct {
+	Text     string
+	Source   string
+	Strength string
+	Weight   float64
+}
+
+func classifyQueryTerms(query string) []queryTerm {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	seen := map[string]bool{}
+	terms := make([]queryTerm, 0)
+	add := func(text string, source string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		key := strings.ToLower(text)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		strength, weight := classifyTermStrength(text, source)
+		terms = append(terms, queryTerm{Text: text, Source: source, Strength: strength, Weight: weight})
+	}
+
+	for _, term := range searchtoken.Default().QueryTerms(query) {
+		add(term.Text, term.Source)
+	}
+	sort.SliceStable(terms, func(i, j int) bool {
+		if terms[i].Weight == terms[j].Weight {
+			if len([]rune(terms[i].Text)) == len([]rune(terms[j].Text)) {
+				return terms[i].Text < terms[j].Text
+			}
+			return len([]rune(terms[i].Text)) > len([]rune(terms[j].Text))
+		}
+		return terms[i].Weight > terms[j].Weight
+	})
+	return terms
+}
+
+func classifyTermStrength(term string, source string) (string, float64) {
+	runeLen := len([]rune(term))
+	if source == "symbol" {
+		return "strong", 3.0
+	}
+	if source == "raw" {
+		return "strong", 2.4
+	}
+	if source == "gse" && (hasASCII(term) || runeLen >= 2) {
+		return "strong", 2.0
+	}
+	if runeLen <= 1 {
+		return "weak", 0.4
+	}
+	return "neutral", 1.4
+}
+
+func queryTermTexts(terms []queryTerm, includeWeak bool) []string {
+	values := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if !includeWeak && term.Strength == "weak" {
+			continue
+		}
+		values = append(values, term.Text)
+	}
+	return uniqueStrings(nonEmptyStrings(values))
+}
+
+func strongQueryTermTexts(terms []queryTerm) []string {
+	values := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if term.Strength != "strong" {
+			continue
+		}
+		values = append(values, term.Text)
+	}
+	return uniqueStrings(nonEmptyStrings(values))
+}
+
+func hasASCII(value string) bool {
+	for _, r := range value {
+		if r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			return true
+		}
+	}
+	return false
 }
 
 func substringSearchTerms(query string) []string {
@@ -2068,6 +5053,498 @@ func snippetForTerm(content string, term string) string {
 		suffix = "..."
 	}
 	return prefix + content[start:idx] + "<mark>" + content[idx:idx+len(term)] + "</mark>" + content[idx+len(term):end] + suffix
+}
+
+func bestSnippet(content string, terms []string) string {
+	for _, term := range terms {
+		if strings.TrimSpace(term) != "" && strings.Contains(strings.ToLower(content), strings.ToLower(term)) {
+			return snippetForTerm(content, term)
+		}
+	}
+	return truncateBytes(strings.TrimSpace(content), 220)
+}
+
+func buildSectionIndexTexts(documentTitle string, sectionTitle string, headingPath string, content string) (string, string, string, string) {
+	titleText := tokenizedIndexText(documentTitle)
+	headingText := tokenizedIndexText(sectionTitle + "\n" + headingPath)
+	symbolText := strings.Join(searchtoken.Default().SymbolTerms(documentTitle+"\n"+sectionTitle+"\n"+headingPath+"\n"+content), " ")
+	contentText := tokenizedIndexText(content)
+	return titleText, headingText, symbolText, contentText
+}
+
+func tokenizedIndexText(text string) string {
+	return strings.Join(searchtoken.Default().IndexTerms(text), " ")
+}
+
+func weightedScoreBreakdown(hit domain.SearchHit, query string, terms []string, baseScore float64, source string) domain.ScoreBreakdown {
+	breakdown := domain.ScoreBreakdown{
+		MatchedTerms: uniqueStrings(nonEmptyStrings(terms)),
+	}
+	switch source {
+	case "fts_unicode":
+		breakdown.UnicodeBM25Boost = baseScore
+	case "fts_trigram":
+		breakdown.TrigramBM25Boost = baseScore
+	case "fallback", "content", "profile":
+		breakdown.FallbackBoost = baseScore
+	default:
+		breakdown.FallbackBoost = baseScore
+	}
+	if hit.Canonical {
+		breakdown.CanonicalBoost = 30
+	}
+	if containsFold(hit.DocumentTitle, query) || containsFold(hit.Title, query) || strongTermHit([]string{hit.DocumentTitle, hit.Title}, terms) {
+		breakdown.TitleBoost = 80
+	}
+	if containsFold(hit.HeadingPath, query) || containsFold(hit.Title, query) || strongTermHit([]string{hit.HeadingPath, hit.Title}, terms) {
+		breakdown.SectionBoost = 60
+	}
+	breakdown.MatchedSymbols = matchedSymbols(hit, terms)
+	if len(breakdown.MatchedSymbols) > 0 {
+		breakdown.SymbolBoost = 70
+	}
+	entityMatch := entityMatchForHit(hit, query)
+	if entityMatch.Exact {
+		breakdown.ExactMatchBoost = 260
+		breakdown.MatchedFields = append(breakdown.MatchedFields, string(entityMatchExact))
+		breakdown.MatchedTerms = append(breakdown.MatchedTerms, entityMatch.Terms...)
+	} else if entityMatch.Normalized {
+		breakdown.ExactMatchBoost = 160
+		breakdown.MatchedFields = append(breakdown.MatchedFields, string(entityMatchNormalized))
+		breakdown.MatchedTerms = append(breakdown.MatchedTerms, entityMatch.Terms...)
+	} else if exactPhraseHit(hit, query) {
+		breakdown.ExactMatchBoost = exactPhraseBoost(query)
+		breakdown.MatchedFields = append(breakdown.MatchedFields, "exact_phrase")
+	} else if exactHit(hit, query) {
+		breakdown.ExactMatchBoost = 100
+	}
+	breakdown.CoverageBoost = coverageBoost(hit, terms)
+	if hit.QueryMatch != nil {
+		breakdown.MatchedFields = uniqueStrings(append(hit.QueryMatch.MatchedFields, breakdown.MatchedFields...))
+	}
+	breakdown.MatchedTerms = uniqueStrings(breakdown.MatchedTerms)
+	breakdown.Total = breakdown.UnicodeBM25Boost +
+		breakdown.TrigramBM25Boost +
+		breakdown.TitleBoost +
+		breakdown.SectionBoost +
+		breakdown.SymbolBoost +
+		breakdown.ExactMatchBoost +
+		breakdown.CanonicalBoost +
+		breakdown.CoverageBoost +
+		breakdown.FallbackBoost
+	return breakdown
+}
+
+func coverageBoost(hit domain.SearchHit, terms []string) float64 {
+	coreTerms := make([]string, 0)
+	for _, term := range terms {
+		term = strings.TrimSpace(term)
+		if term == "" || len([]rune(term)) < 2 && !hasASCII(term) {
+			continue
+		}
+		coreTerms = append(coreTerms, term)
+	}
+	coreTerms = uniqueStrings(coreTerms)
+	if len(coreTerms) == 0 {
+		return 0
+	}
+	text := strings.ToLower(strings.Join([]string{hit.DocumentTitle, hit.Title, hit.HeadingPath, hit.Content}, "\n"))
+	matched := 0
+	for _, term := range coreTerms {
+		if strings.Contains(text, strings.ToLower(term)) {
+			matched++
+		}
+	}
+	return float64(matched) / float64(len(coreTerms)) * 80
+}
+
+func matchedSymbols(hit domain.SearchHit, terms []string) []string {
+	symbols := searchtoken.Default().SymbolTerms(strings.Join([]string{hit.DocumentTitle, hit.Title, hit.HeadingPath, hit.Content}, "\n"))
+	matched := make([]string, 0)
+	for _, symbol := range symbols {
+		for _, term := range terms {
+			if strings.EqualFold(symbol, term) {
+				matched = append(matched, symbol)
+				break
+			}
+		}
+	}
+	return uniqueStrings(matched)
+}
+
+type entityMatchResult struct {
+	Exact      bool
+	Normalized bool
+	Terms      []string
+	Entities   []domain.MatchedEntity
+}
+
+func extractQueryEntities(query string) []extract.EntityCandidate {
+	return extract.ExtractSection(extract.SectionInput{Content: query})
+}
+
+func extractHitEntities(hit domain.SearchHit) []extract.EntityCandidate {
+	return extract.ExtractSection(extract.SectionInput{
+		DocumentID:  hit.DocumentID,
+		SectionID:   hit.SectionID,
+		Title:       hit.DocumentTitle + "\n" + hit.Title,
+		HeadingPath: hit.HeadingPath,
+		Content:     hit.Content,
+	})
+}
+
+func entitySearchTerms(entities []extract.EntityCandidate) []string {
+	terms := make([]string, 0, len(entities)*2)
+	for _, entity := range entities {
+		switch entity.Kind {
+		case extract.EntityAPIEndpoint:
+			terms = append(terms, entity.Canonical, entity.Path)
+		case extract.EntityPathLiteral:
+			terms = append(terms, entity.Path)
+		case extract.EntityOperationCandidate:
+			terms = append(terms, entity.Operation)
+		}
+	}
+	return uniqueStrings(nonEmptyStrings(terms))
+}
+
+func entityMatchForHit(hit domain.SearchHit, query string) entityMatchResult {
+	queryEntities := extractQueryEntities(query)
+	if len(queryEntities) == 0 {
+		return entityMatchResult{}
+	}
+	queryHasPath := false
+	for _, queryEntity := range queryEntities {
+		if queryEntity.Path != "" {
+			queryHasPath = true
+			break
+		}
+	}
+	hitEntities := extractHitEntities(hit)
+	if len(hitEntities) == 0 {
+		return entityMatchResult{}
+	}
+	hitText := strings.Join([]string{hit.DocumentTitle, hit.Title, hit.HeadingPath, hit.Content}, "\n")
+	result := entityMatchResult{}
+	for _, queryEntity := range queryEntities {
+		for _, hitEntity := range hitEntities {
+			if queryHasPath && queryEntity.Path == "" {
+				continue
+			}
+			if queryEntity.Operation != "" && hitEntity.Operation != "" && strings.EqualFold(queryEntity.Operation, hitEntity.Operation) {
+				if queryEntity.Operation == hitEntity.Operation && strings.Contains(hitText, queryEntity.Operation) {
+					result.Exact = true
+				} else {
+					result.Normalized = true
+				}
+				result.Terms = append(result.Terms, queryEntity.Operation)
+				result.Entities = append(result.Entities, matchedEntityFromCandidate(hitEntity, ""))
+				continue
+			}
+			if queryEntity.Path == "" || hitEntity.Path == "" {
+				continue
+			}
+			methodCompatibleForExact := queryEntity.Method == "" || (hitEntity.Method != "" && queryEntity.Method == hitEntity.Method)
+			if queryEntity.Path == hitEntity.Path && methodCompatibleForExact && hitContainsEntityLiteral(hitText, queryEntity) {
+				result.Exact = true
+				result.Terms = append(result.Terms, entityDisplayTerm(queryEntity))
+				result.Entities = append(result.Entities, matchedEntityFromCandidate(hitEntity, ""))
+				continue
+			}
+			if strings.EqualFold(queryEntity.Path, hitEntity.Path) && methodsCompatibleForNormalized(queryEntity.Method, hitEntity.Method) {
+				result.Normalized = true
+				result.Terms = append(result.Terms, entityDisplayTerm(queryEntity))
+				result.Entities = append(result.Entities, matchedEntityFromCandidate(hitEntity, ""))
+			}
+		}
+	}
+	result.Terms = uniqueStrings(nonEmptyStrings(result.Terms))
+	result.Entities = uniqueMatchedEntities(result.Entities)
+	if result.Exact {
+		result.Normalized = false
+	}
+	return result
+}
+
+func storedEntityMatchForQuery(entity domain.SectionEntity, queryEntities []extract.EntityCandidate) entityMatchResult {
+	result := entityMatchResult{}
+	for _, queryEntity := range queryEntities {
+		if queryEntity.Operation != "" && entity.Operation != "" && strings.EqualFold(queryEntity.Operation, entity.Operation) {
+			if queryEntity.Operation == entity.Operation {
+				result.Exact = true
+			} else {
+				result.Normalized = true
+			}
+			result.Terms = append(result.Terms, queryEntity.Operation)
+			result.Entities = append(result.Entities, matchedEntityFromStored(entity, ""))
+			continue
+		}
+		if queryEntity.Path == "" || entity.Path == "" {
+			continue
+		}
+		if queryEntity.Path == entity.Path && methodsCompatibleForExact(queryEntity.Method, entity.Method) {
+			result.Exact = true
+			result.Terms = append(result.Terms, entityDisplayTerm(queryEntity))
+			result.Entities = append(result.Entities, matchedEntityFromStored(entity, ""))
+			continue
+		}
+		if strings.EqualFold(queryEntity.Path, entity.Path) && methodsCompatibleForNormalized(queryEntity.Method, entity.Method) {
+			result.Normalized = true
+			result.Terms = append(result.Terms, entityDisplayTerm(queryEntity))
+			result.Entities = append(result.Entities, matchedEntityFromStored(entity, ""))
+		}
+	}
+	result.Terms = uniqueStrings(nonEmptyStrings(result.Terms))
+	result.Entities = uniqueMatchedEntities(result.Entities)
+	if result.Exact {
+		result.Normalized = false
+	}
+	return result
+}
+
+func methodsCompatibleForNormalized(queryMethod string, hitMethod string) bool {
+	return queryMethod == "" || hitMethod == "" || queryMethod == hitMethod
+}
+
+func methodsCompatibleForExact(queryMethod string, hitMethod string) bool {
+	return queryMethod == "" || (hitMethod != "" && queryMethod == hitMethod)
+}
+
+func hitContainsEntityLiteral(hitText string, entity extract.EntityCandidate) bool {
+	if entity.Path != "" && strings.Contains(hitText, entity.Path) {
+		return true
+	}
+	if entity.Raw != "" && strings.Contains(hitText, entity.Raw) {
+		return true
+	}
+	return false
+}
+
+func entityDisplayTerm(entity extract.EntityCandidate) string {
+	if entity.Method != "" && entity.Path != "" {
+		return entity.Method + " " + entity.Path
+	}
+	if entity.Path != "" {
+		return entity.Path
+	}
+	return entity.Operation
+}
+
+func sectionEntityDisplayTerm(entity domain.SectionEntity) string {
+	if entity.Method != "" && entity.Path != "" {
+		return entity.Method + " " + entity.Path
+	}
+	if entity.Path != "" {
+		return entity.Path
+	}
+	if entity.Operation != "" {
+		return entity.Operation
+	}
+	return entity.CanonicalText
+}
+
+func matchedEntityFromStored(entity domain.SectionEntity, mode string) domain.MatchedEntity {
+	return domain.MatchedEntity{
+		ID:            entity.ID,
+		SectionID:     entity.SectionID,
+		DocumentID:    entity.DocumentID,
+		Kind:          entity.Kind,
+		CanonicalText: entity.CanonicalText,
+		Method:        entity.Method,
+		Path:          entity.Path,
+		Operation:     entity.Operation,
+		Source:        entity.Source,
+		Confidence:    entity.Confidence,
+		MatchMode:     mode,
+	}
+}
+
+func matchedEntityFromCandidate(candidate extract.EntityCandidate, mode string) domain.MatchedEntity {
+	return domain.MatchedEntity{
+		SectionID:     candidate.SectionID,
+		DocumentID:    candidate.DocumentID,
+		Kind:          string(candidate.Kind),
+		CanonicalText: candidate.Canonical,
+		Method:        candidate.Method,
+		Path:          candidate.Path,
+		Operation:     candidate.Operation,
+		Source:        string(candidate.Source),
+		Confidence:    candidate.Confidence,
+		MatchMode:     mode,
+	}
+}
+
+func matchedEntitiesWithMode(entities []domain.MatchedEntity, mode string) []domain.MatchedEntity {
+	out := make([]domain.MatchedEntity, 0, len(entities))
+	for _, entity := range entities {
+		entity.MatchMode = mode
+		out = append(out, entity)
+	}
+	return uniqueMatchedEntities(out)
+}
+
+func mergeMatchedEntities(existing []domain.MatchedEntity, incoming []domain.MatchedEntity) []domain.MatchedEntity {
+	merged := make([]domain.MatchedEntity, 0, len(existing)+len(incoming))
+	merged = append(merged, existing...)
+	merged = append(merged, incoming...)
+	return uniqueMatchedEntities(merged)
+}
+
+func uniqueMatchedEntities(entities []domain.MatchedEntity) []domain.MatchedEntity {
+	seen := map[string]bool{}
+	out := make([]domain.MatchedEntity, 0, len(entities))
+	for _, entity := range entities {
+		if entity.Kind == "" && entity.CanonicalText == "" && entity.Path == "" && entity.Operation == "" {
+			continue
+		}
+		key := strings.Join([]string{entity.ID, entity.SectionID, entity.Kind, entity.CanonicalText, entity.Method, entity.Path, entity.Operation, entity.MatchMode}, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, entity)
+	}
+	return out
+}
+
+func applyScoreBreakdownToQueryMatch(match *domain.QueryMatch, breakdown domain.ScoreBreakdown) {
+	match.MatchedFields = uniqueStrings(append(match.MatchedFields, breakdown.MatchedFields...))
+	match.MatchedTerms = uniqueStrings(append(match.MatchedTerms, breakdown.MatchedTerms...))
+	match.ScoreExplanation = weightedScoreExplanation(match.MatchedFields, breakdown)
+}
+
+func strongTermHit(fields []string, terms []string) bool {
+	for _, field := range fields {
+		for _, term := range terms {
+			term = strings.TrimSpace(term)
+			if term == "" {
+				continue
+			}
+			if !hasASCII(term) && len([]rune(term)) < 2 {
+				continue
+			}
+			if containsFold(field, term) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func exactHit(hit domain.SearchHit, query string) bool {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return false
+	}
+	return containsFold(hit.DocumentTitle, query) || containsFold(hit.Title, query) || containsFold(hit.HeadingPath, query) || containsFold(hit.Content, query)
+}
+
+func exactPhraseHit(hit domain.SearchHit, query string) bool {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return false
+	}
+	return containsExactPhraseFold(hit.DocumentTitle, query) || containsExactPhraseFold(hit.Title, query) || containsExactPhraseFold(hit.HeadingPath, query) || containsExactPhraseFold(hit.Content, query)
+}
+
+func exactPhraseBoost(query string) float64 {
+	switch classifyExactPhraseQuery(query) {
+	case phraseQueryLong:
+		return 260
+	case phraseQueryMedium:
+		return 160
+	default:
+		return 80
+	}
+}
+
+type phraseQueryClass int
+
+const (
+	phraseQueryShort phraseQueryClass = iota
+	phraseQueryMedium
+	phraseQueryLong
+)
+
+func classifyExactPhraseQuery(query string) phraseQueryClass {
+	runeLen := phraseQueryLength(query)
+	strongCount := 0
+	for _, term := range classifyQueryTerms(query) {
+		if term.Strength == "strong" {
+			strongCount++
+		}
+	}
+	switch {
+	case runeLen >= 18 || strongCount >= 5:
+		return phraseQueryLong
+	case runeLen >= 7 || strongCount >= 2:
+		return phraseQueryMedium
+	default:
+		return phraseQueryShort
+	}
+}
+
+func phraseQueryLength(query string) int {
+	count := 0
+	for _, r := range query {
+		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func containsExactPhraseFold(value string, query string) bool {
+	valueRunes := []rune(strings.ToLower(value))
+	queryRunes := []rune(strings.ToLower(strings.TrimSpace(query)))
+	if len(queryRunes) == 0 || len(queryRunes) > len(valueRunes) {
+		return false
+	}
+	for i := 0; i+len(queryRunes) <= len(valueRunes); i++ {
+		matched := true
+		for j, r := range queryRunes {
+			if valueRunes[i+j] != r {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		beforeOK := i == 0 || !isExactPhraseContinuation(valueRunes[i-1])
+		afterIdx := i + len(queryRunes)
+		afterOK := afterIdx == len(valueRunes) || !isExactPhraseContinuation(valueRunes[afterIdx])
+		if beforeOK && afterOK {
+			return true
+		}
+	}
+	return false
+}
+
+func isExactPhraseContinuation(r rune) bool {
+	if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		return true
+	}
+	return strings.ContainsRune("_./:{}-", r)
+}
+
+func weightedScoreExplanation(fields []string, breakdown domain.ScoreBreakdown) string {
+	base := scoreExplanation(fields)
+	if base == "" {
+		base = "matched indexed tokens"
+	}
+	return fmt.Sprintf("%s; weighted score %.2f from unicode %.2f, trigram %.2f, title %.0f, section %.0f, symbol %.0f, exact %.0f, coverage %.0f",
+		base,
+		breakdown.Total,
+		breakdown.UnicodeBM25Boost,
+		breakdown.TrigramBM25Boost,
+		breakdown.TitleBoost,
+		breakdown.SectionBoost,
+		breakdown.SymbolBoost,
+		breakdown.ExactMatchBoost,
+		breakdown.CoverageBoost,
+	)
 }
 
 func containsFold(value string, term string) bool {

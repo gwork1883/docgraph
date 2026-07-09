@@ -51,9 +51,30 @@ func BuildJSON(doc domain.DocumentInput, sections []domain.SectionInput) (string
 }
 
 func Build(doc domain.DocumentInput, sections []domain.SectionInput) RetrievalProfile {
+	return BuildWithAPIRefs(doc, sections, nil)
+}
+
+func BuildJSONWithAPIRefs(doc domain.DocumentInput, sections []domain.SectionInput, refs []string) (string, error) {
+	profile := BuildWithAPIRefs(doc, sections, refs)
+	data, err := json.Marshal(profile)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func BuildWithAPIRefs(doc domain.DocumentInput, sections []domain.SectionInput, refs []string) RetrievalProfile {
 	stats := map[string]*termStats{}
 	apiRefs := map[string]bool{}
 	tokenCount := 0
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		apiRefs[ref] = true
+	}
+	useProvidedAPIRefs := len(apiRefs) > 0
 
 	titleTerms := termSet(termsFromText(doc.Title, true))
 	for _, section := range sections {
@@ -73,12 +94,14 @@ func Build(doc domain.DocumentInput, sections []domain.SectionInput) RetrievalPr
 		for _, term := range termsFromText(section.Title+" "+section.HeadingPath, true) {
 			ensureTerm(stats, term).headingHits++
 		}
-		for _, ref := range apiRefsFromText(sectionText) {
-			apiRefs[ref] = true
-			stat := ensureTerm(stats, strings.ToLower(ref))
-			stat.tf++
-			stat.sections[section.ID] = true
-			sectionSeen[strings.ToLower(ref)] = true
+		if !useProvidedAPIRefs {
+			for _, ref := range apiRefsFromText(sectionText) {
+				apiRefs[ref] = true
+				stat := ensureTerm(stats, strings.ToLower(ref))
+				stat.tf++
+				stat.sections[section.ID] = true
+				sectionSeen[strings.ToLower(ref)] = true
+			}
 		}
 		_ = sectionSeen
 	}
@@ -351,7 +374,7 @@ func shouldSkipTerm(term string) bool {
 
 func looksImportant(term string) bool {
 	lower := strings.ToLower(term)
-	keywords := []string{"error", "错误", "响应", "权限", "auth", "token", "401", "403", "500", "api", "接口", "code"}
+	keywords := []string{"error", "错误", "响应", "配置", "auth", "token", "401", "403", "500", "api", "接口", "code"}
 	for _, keyword := range keywords {
 		if strings.Contains(lower, keyword) {
 			return true

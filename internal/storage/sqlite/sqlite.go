@@ -18,16 +18,20 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/docgraph/docgraph/internal/domain"
+	"github.com/docgraph/docgraph/internal/embeddingchunk"
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/searchtoken"
 	"github.com/docgraph/docgraph/internal/storage/sqlschema"
 	"github.com/docgraph/docgraph/internal/technical/extract"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 type Store struct {
-	db     *sql.DB
-	reader *sql.DB
-	dsn    string
+	db            *sql.DB
+	reader        *sql.DB
+	dsn           string
+	vectorBackend vectorstore.Store
+	vectorRuntime vectorstore.SearchRuntime
 }
 
 const (
@@ -72,6 +76,15 @@ func open(ctx context.Context, dsn string, create bool) (*Store, error) {
 }
 
 func (s *Store) Close() error {
+	if s.vectorBackend != nil {
+		if err := s.vectorBackend.Close(); err != nil {
+			if s.reader != nil {
+				_ = s.reader.Close()
+			}
+			_ = s.db.Close()
+			return err
+		}
+	}
 	if s.reader == nil {
 		return s.db.Close()
 	}
@@ -80,6 +93,14 @@ func (s *Store) Close() error {
 		return err
 	}
 	return s.db.Close()
+}
+
+func (s *Store) SetVectorBackend(backend vectorstore.Store) {
+	s.vectorBackend = backend
+}
+
+func (s *Store) SetVectorSearchRuntime(runtime vectorstore.SearchRuntime) {
+	s.vectorRuntime = runtime
 }
 
 func openSQLiteHandle(ctx context.Context, path string, maxOpenConns int, role string) (*sql.DB, error) {
@@ -993,7 +1014,7 @@ func (s *Store) listLowContentSections(ctx context.Context, sourceID string, lim
 	rows, err := s.readDB().QueryContext(ctx, `
 select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
        substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 220),
-       sections.ordinal
+       sections.content_hash, sections.ordinal
 from sections
 join documents on documents.id = sections.document_id
 where documents.source_id = ?
@@ -1009,7 +1030,7 @@ limit ?
 	var sections []domain.SectionSummary
 	for rows.Next() {
 		var section domain.SectionSummary
-		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.Ordinal); err != nil {
+		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.ContentHash, &section.Ordinal); err != nil {
 			return nil, err
 		}
 		section.NodeID = stableSectionNodeID(section.ID)
@@ -1262,7 +1283,7 @@ func (s *Store) ListDocumentSections(ctx context.Context, documentID string, lim
 	rows, err := s.readDB().QueryContext(ctx, `
 select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
        substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 800),
-       sections.ordinal
+       sections.content_hash, sections.ordinal
 from sections
 join documents on documents.id = sections.document_id
 where sections.document_id = ?
@@ -1277,7 +1298,7 @@ limit ? offset ?
 	var sections []domain.SectionSummary
 	for rows.Next() {
 		var section domain.SectionSummary
-		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.Ordinal); err != nil {
+		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.ContentHash, &section.Ordinal); err != nil {
 			return nil, err
 		}
 		section.NodeID = stableSectionNodeID(section.ID)
@@ -1297,7 +1318,7 @@ func (s *Store) ListSourceSections(ctx context.Context, sourceID string, limit, 
 	rows, err := s.readDB().QueryContext(ctx, `
 select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
        substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 220),
-       sections.ordinal
+       sections.content_hash, sections.ordinal
 from sections
 join documents on documents.id = sections.document_id
 where documents.source_id = ?
@@ -1312,7 +1333,7 @@ limit ? offset ?
 	var sections []domain.SectionSummary
 	for rows.Next() {
 		var section domain.SectionSummary
-		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.Ordinal); err != nil {
+		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.ContentHash, &section.Ordinal); err != nil {
 			return nil, err
 		}
 		section.NodeID = stableSectionNodeID(section.ID)
@@ -2744,6 +2765,57 @@ func jobWhere(opts domain.JobListOptions) (string, []any) {
 	return strings.Join(clauses, " and "), args
 }
 
+func (s *Store) CreateEmbeddingEnsureJobIfIdle(ctx context.Context, sourceID string) (domain.Job, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Job{}, err
+	}
+	defer tx.Rollback()
+
+	var running string
+	args := []any{}
+	scopeClause := "1 = 1"
+	if sourceID != "" {
+		scopeClause = "(source_id = '' or source_id = ?)"
+		args = append(args, sourceID)
+	}
+	query := `
+select id
+from jobs
+where kind = 'maintenance_embedding_ensure'
+  and status in ('queued', 'running', 'canceling')
+  and ` + scopeClause + `
+order by rowid desc
+limit 1
+`
+	err = tx.QueryRowContext(ctx, query, args...).Scan(&running)
+	if err == nil {
+		return domain.Job{}, domain.ErrSyncInProgress
+	}
+	if err != sql.ErrNoRows {
+		return domain.Job{}, err
+	}
+
+	jobID := ids.Random("job", 12)
+	targetKind := "embedding"
+	payload := `{"mode":"ensure"}`
+	if sourceID != "" {
+		targetKind = "source"
+		payload = fmt.Sprintf(`{"source_id":%q,"mode":"ensure"}`, sourceID)
+	}
+	if _, err := tx.ExecContext(ctx, `
+insert into jobs (id, kind, status, source_id, target_kind, target_id, payload_json, progress_json, result_json)
+values (?, 'maintenance_embedding_ensure', 'queued', ?, ?, ?, ?, '{}', '{}')
+`, jobID, sourceID, targetKind, sourceID, payload); err != nil {
+		return domain.Job{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Job{}, err
+	}
+	return s.GetJob(ctx, jobID)
+}
+
 func (s *Store) CreateSyncJob(ctx context.Context, sourceID string) (domain.SyncJob, error) {
 	sourceID = strings.TrimSpace(sourceID)
 	if sourceID == "" {
@@ -3246,6 +3318,217 @@ where s.id = ?
 	return sc, nil
 }
 
+func (s *Store) UpsertSectionEmbedding(ctx context.Context, input domain.SectionEmbeddingInput) error {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.UpsertSectionEmbedding(ctx, input)
+	}
+	return fmt.Errorf("vector search is disabled")
+}
+
+func (s *Store) GetSectionEmbedding(ctx context.Context, sectionID string, model string) (domain.VectorSearchHit, []float32, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.GetSectionEmbedding(ctx, sectionID, model)
+	}
+	return domain.VectorSearchHit{}, nil, sql.ErrNoRows
+}
+
+func (s *Store) DeleteSectionEmbeddings(ctx context.Context, sectionID string) error {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.DeleteSectionEmbeddings(ctx, sectionID)
+	}
+	return nil
+}
+
+func (s *Store) SearchSectionsByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]domain.VectorSearchHit, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.SearchSectionsByVector(ctx, embedding, model, limit, minSimilarity, plan)
+	}
+	return nil, nil
+}
+
+func (s *Store) ListSectionEmbeddingHashes(ctx context.Context, model string, limit, offset int) ([]domain.SectionEmbeddingHash, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.ListSectionEmbeddingHashes(ctx, model, limit, offset)
+	}
+	return nil, nil
+}
+
+func (s *Store) UpsertEmbeddingChunk(ctx context.Context, input domain.EmbeddingChunkInput) error {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.UpsertEmbeddingChunk(ctx, input)
+	}
+	return fmt.Errorf("vector search is disabled")
+}
+
+func (s *Store) GetEmbeddingChunk(ctx context.Context, chunkID string, model string) (domain.VectorSearchHit, []float32, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.GetEmbeddingChunk(ctx, chunkID, model)
+	}
+	return domain.VectorSearchHit{}, nil, sql.ErrNoRows
+}
+
+func (s *Store) DeleteEmbeddingChunksBySection(ctx context.Context, sectionID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) error {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.DeleteEmbeddingChunksBySection(ctx, sectionID, model, generatorVersion, tokenizer, chunkStrategy)
+	}
+	return nil
+}
+
+func (s *Store) SearchChunksByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]domain.VectorSearchHit, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.SearchChunksByVector(ctx, embedding, model, limit, minSimilarity, plan)
+	}
+	return nil, nil
+}
+
+func (s *Store) ListEmbeddingChunkHashes(ctx context.Context, model string, limit, offset int) ([]domain.EmbeddingChunkHash, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.ListEmbeddingChunkHashes(ctx, model, limit, offset)
+	}
+	return nil, nil
+}
+
+func (s *Store) GetSourceEmbeddingStatus(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string, chunkTargetTokens int) (domain.EmbeddingStatus, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	model = strings.TrimSpace(model)
+	generatorVersion = strings.TrimSpace(generatorVersion)
+	tokenizer = strings.TrimSpace(tokenizer)
+	chunkStrategy = strings.TrimSpace(chunkStrategy)
+	if sourceID == "" {
+		return domain.EmbeddingStatus{}, fmt.Errorf("source id is required")
+	}
+	status := domain.EmbeddingStatus{SourceID: sourceID, Model: model, GeneratorVersion: generatorVersion}
+	err := s.readDB().QueryRowContext(ctx, `
+select count(*)
+from sections
+join documents on documents.id = sections.document_id
+where documents.source_id = ?
+`, sourceID).Scan(&status.TotalSections)
+	if err != nil {
+		return domain.EmbeddingStatus{}, err
+	}
+	if model == "" || s.vectorBackend == nil {
+		status.Enabled = false
+		status.Status = "disabled"
+		if model == "" {
+			status.Reason = "embedding_not_configured"
+		} else {
+			status.Reason = "vector_db_not_configured"
+		}
+		status.PendingSections = status.TotalSections
+		return status, nil
+	}
+	status.Enabled = true
+	if tokenizer == "" {
+		tokenizer = "auto"
+	}
+	if chunkStrategy == "" {
+		chunkStrategy = "auto"
+	}
+	resolvedTokenizer := embeddingchunk.NewTextMeasurer(tokenizer, model).Name()
+	status.Tokenizer = resolvedTokenizer
+	status.ChunkStrategy = chunkStrategy
+
+	coverage, err := s.vectorBackend.GetEmbeddingCoverage(ctx, sourceID, model, generatorVersion, resolvedTokenizer, chunkStrategy)
+	if err != nil {
+		return domain.EmbeddingStatus{}, fmt.Errorf("query embedding coverage: %w", err)
+	}
+	status.EmbeddedSections = coverage.EmbeddedSections
+	status.EmbeddedChunks = coverage.EmbeddedChunks
+	status.TotalChunks = coverage.EmbeddedChunks // best known count; pending chunks unknown until they're built
+	status.PendingSections = status.TotalSections - status.EmbeddedSections
+	if status.PendingSections < 0 {
+		status.PendingSections = 0
+	}
+	if status.PendingSections > 0 {
+		status.Status = "indexing"
+	} else {
+		status.Status = "ready"
+	}
+	return status, nil
+}
+
+func (s *Store) GetSectionForEmbedding(ctx context.Context, sectionID string) (domain.EmbeddingSection, error) {
+	sectionID = strings.TrimSpace(sectionID)
+	if sectionID == "" {
+		return domain.EmbeddingSection{}, fmt.Errorf("section id is required")
+	}
+	var section domain.EmbeddingSection
+	err := s.readDB().QueryRowContext(ctx, `
+select sections.id, sections.document_id, documents.source_id, sources.name, sources.product_hint, sources.module_hint,
+       documents.title, sections.heading_path, sections.title, sections.content, sections.content_hash
+from sections
+join documents on documents.id = sections.document_id
+join sources on sources.id = documents.source_id
+where sections.id = ?
+`, sectionID).Scan(&section.SectionID, &section.DocumentID, &section.SourceID, &section.SourceName, &section.ProductHint, &section.ModuleHint, &section.DocumentTitle, &section.HeadingPath, &section.Title, &section.Content, &section.ContentHash)
+	if err != nil {
+		return domain.EmbeddingSection{}, err
+	}
+	return section, nil
+}
+
+func (s *Store) ListSectionsForEmbedding(ctx context.Context, sourceID string, limit, offset int) ([]domain.EmbeddingSection, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	where := ""
+	args := []any{}
+	if sourceID != "" {
+		where = "where sources.id = ?"
+		args = append(args, sourceID)
+	}
+	args = append(args, limit, offset)
+	rows, err := s.readDB().QueryContext(ctx, `
+select sections.id, sections.document_id, documents.source_id, sources.name, sources.product_hint, sources.module_hint,
+       documents.title, sections.heading_path, sections.title, sections.content, sections.content_hash
+from sections
+join documents on documents.id = sections.document_id
+join sources on sources.id = documents.source_id
+`+where+`
+order by documents.title asc, sections.ordinal asc, sections.id asc
+limit ? offset ?
+`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sections := make([]domain.EmbeddingSection, 0)
+	for rows.Next() {
+		var section domain.EmbeddingSection
+		if err := rows.Scan(&section.SectionID, &section.DocumentID, &section.SourceID, &section.SourceName, &section.ProductHint, &section.ModuleHint, &section.DocumentTitle, &section.HeadingPath, &section.Title, &section.Content, &section.ContentHash); err != nil {
+			return nil, err
+		}
+		sections = append(sections, section)
+	}
+	return sections, rows.Err()
+}
+
+func (s *Store) CountSectionsForEmbedding(ctx context.Context, sourceID string) (int, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	where := ""
+	args := []any{}
+	if sourceID != "" {
+		where = "where sources.id = ?"
+		args = append(args, sourceID)
+	}
+	var count int
+	err := s.readDB().QueryRowContext(ctx, `
+select count(*)
+from sections
+join documents on documents.id = sections.document_id
+join sources on sources.id = documents.source_id
+`+where, args...).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *Store) RelatedNodes(ctx context.Context, id string, opts domain.RelatedOptions) ([]domain.RelatedNode, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -3735,6 +4018,10 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 	if opts.Query == "" {
 		return domain.SearchResult{Query: opts.Query}, nil
 	}
+	opts.OriginalQuery = strings.TrimSpace(opts.OriginalQuery)
+	if opts.OriginalQuery == "" {
+		opts.OriginalQuery = opts.Query
+	}
 	if opts.Limit <= 0 || opts.Limit > 200 {
 		opts.Limit = 20
 	}
@@ -3766,6 +4053,14 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 		opts.RelationDepth = 1
 	}
 
+	// ===== Phase 1: Intent routing =====
+	weights := s.vectorRuntime.IntentRouteWeights
+	intent := RouteIntent(opts.OriginalQuery, opts.SemanticIntents, weights)
+	if !s.canUseVectorSearch() {
+		intent.WVector = 0
+	}
+
+	// ===== Phase 2: Text lane retrieval (existing cascade logic) =====
 	collector := newSearchCollector(opts)
 	attempts := make([]domain.SearchAttempt, 0, opts.MaxSearches)
 
@@ -3813,6 +4108,33 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 		return domain.SearchResult{}, err
 	}
 
+	if !strings.EqualFold(opts.OriginalQuery, opts.Query) {
+		originalTerms := strongQueryTermTexts(classifyQueryTerms(opts.OriginalQuery))
+		originalTokenQuery := matchQueryFromTerms(originalTerms, 16)
+		if err := runAttempt("original_unicode61", originalTokenQuery, originalTerms, true, func() ([]domain.SearchHit, error) {
+			originalOpts := opts
+			originalOpts.Query = opts.OriginalQuery
+			return s.searchSectionsTokenFTS(ctx, originalTokenQuery, opts.Limit*3, originalOpts)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+		if err := runAttempt("original_trigram", trigramFTSQuery(opts.OriginalQuery), nil, true, func() ([]domain.SearchHit, error) {
+			originalOpts := opts
+			originalOpts.Query = opts.OriginalQuery
+			return s.searchSectionsTokenTrigram(ctx, opts.OriginalQuery, opts.Limit*3, originalOpts)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+	}
+	exactTerms := uniqueStrings(nonEmptyStrings(opts.ExactTerms))
+	if len(exactTerms) > 0 {
+		if err := runAttempt("exact_terms", "", exactTerms, true, func() ([]domain.SearchHit, error) {
+			return s.searchSectionsLike(ctx, exactTerms, opts.Limit*3, opts)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+	}
+
 	if len(collector.hits) == 0 {
 		profileTerms := profileSearchTerms(opts.Query)
 		if len(profileTerms) > 0 {
@@ -3834,7 +4156,70 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 		}
 	}
 
-	hits := collector.results()
+	// ===== Phase 2b: Vector lane retrieval =====
+	var vectorHits []domain.SearchHit
+	var vectorAttempt domain.SearchAttempt
+	vectorCandidates := 0
+	if s.canUseVectorSearch() && intent.WVector > 0 {
+		vectorHits, vectorAttempt = s.searchSectionsVector(ctx, opts)
+		vectorCandidates = vectorAttempt.Hits
+		attempts = append(attempts, vectorAttempt)
+	}
+
+	// ===== Phase 3: Two-lane independent ranking =====
+	textResults := collector.results()
+	textRanked := assignRanks(textResults,
+		func(h domain.SearchHit) float64 {
+			if h.ScoreBreakdown != nil {
+				return h.ScoreBreakdown.Total
+			}
+			return h.Rank
+		},
+		func(h domain.SearchHit) []string {
+			if h.QueryMatch != nil {
+				return h.QueryMatch.SearchAttempts
+			}
+			return nil
+		})
+
+	vectorRanked := assignRanks(vectorHits,
+		func(h domain.SearchHit) float64 {
+			if h.ScoreBreakdown != nil {
+				return h.ScoreBreakdown.VectorBoost // raw similarity in RRF mode
+			}
+			return 0
+		},
+		func(_ domain.SearchHit) []string { return []string{"vector"} })
+
+	// ===== Phase 4: Weighted RRF fusion =====
+	rrfK := weights.RRFK
+	if rrfK <= 0 {
+		rrfK = 60
+	}
+	contribs := weightedRRFFusion(textRanked, vectorRanked, intent.WText, intent.WVector, rrfK)
+
+	// ===== Phase 5: Business multiplier calibration =====
+	// Build lookup maps for merging hits
+	textHitsBySection := map[string]*domain.SearchHit{}
+	for i := range textResults {
+		textHitsBySection[textResults[i].SectionID] = &textResults[i]
+	}
+	vectorHitsBySection := map[string]*domain.SearchHit{}
+	for i := range vectorHits {
+		vectorHitsBySection[vectorHits[i].SectionID] = &vectorHits[i]
+	}
+
+	// Set DocumentID on RRFContribution for per-doc cap enforcement
+	for sectionID, contrib := range contribs {
+		hit := mergeHitForSection(sectionID, textHitsBySection, vectorHitsBySection)
+		contrib.DocumentID = hit.DocumentID
+	}
+
+	applyMultiplierCalibration(contribs, textHitsBySection) // canonical/stale multiplier
+
+	// ===== Phase 6: Build final hits =====
+	hits := buildFinalHits(contribs, textHitsBySection, vectorHitsBySection, opts.Limit, opts.MaxSectionsPerDocument)
+
 	if opts.UseRelationExpansion && len(hits) > 0 {
 		var err error
 		hits, err = s.expandSearchHitsWithRelations(ctx, hits, opts)
@@ -3842,11 +4227,21 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 			return domain.SearchResult{}, err
 		}
 	}
+
 	result := domain.SearchResult{
 		Query:        opts.Query,
 		SearchesUsed: len(attempts),
 		Attempts:     attempts,
 		Hits:         hits,
+		HybridSearchMeta: &domain.HybridSearchMeta{
+			IntentRoute:         intent.Route,
+			WText:               intent.WText,
+			WVector:             intent.WVector,
+			RRFK:                rrfK,
+			TextCandidates:      len(textRanked),
+			VectorCandidates:    vectorCandidates,
+			VectorMinSimilarity: s.vectorRuntime.MinSimilarity,
+		},
 		SuggestedReads: domain.SuggestedReads{
 			ExplicitReferences:  []domain.ExplicitReference{},
 			ImplicitSymbolLinks: []domain.SuggestedRead{},
@@ -3876,6 +4271,153 @@ func (s *Store) searchSectionsEntity(ctx context.Context, matchQuery string, lim
 		return hits, nil
 	}
 	return s.searchSectionsEntityFTS(ctx, matchQuery, limit, opts, mode)
+}
+
+func (s *Store) canUseVectorSearch() bool {
+	return s.vectorRuntime.Embedder != nil && strings.TrimSpace(s.vectorRuntime.Embedder.Model()) != ""
+}
+
+func (s *Store) searchSectionsVector(ctx context.Context, opts domain.SearchOptions) ([]domain.SearchHit, domain.SearchAttempt) {
+	attempt := domain.SearchAttempt{Kind: "vector", Query: vectorQueryLabel(opts)}
+	weight := s.vectorRuntime.SearchWeight
+	if weight <= 0 {
+		weight = 0.4
+	}
+	if weight > 1 {
+		weight = 1
+	}
+	limit := s.vectorRuntime.VectorCandidates
+	if limit <= 0 {
+		limit = opts.Limit * 3
+	}
+	if limit <= 0 {
+		limit = 60
+	}
+	text := strings.Join(nonEmptyStrings(append([]string{opts.Query}, opts.SemanticIntents...)), "\n")
+	if strings.TrimSpace(text) == "" {
+		return nil, attempt
+	}
+	vectors, err := s.vectorRuntime.Embedder.Embed(ctx, []string{text})
+	if err != nil {
+		attempt.Error = "embedding_failed: " + truncateForSearchAttempt(err.Error(), 160)
+		return nil, attempt
+	}
+	if len(vectors) == 0 || len(vectors[0]) == 0 {
+		attempt.Error = "embedding_empty"
+		return nil, attempt
+	}
+	model := s.vectorRuntime.Embedder.Model()
+	vectorHits, err := s.SearchChunksByVector(ctx, vectors[0], model, limit, s.vectorRuntime.MinSimilarity, vectorstore.EmbeddingPlanFilter{
+		GeneratorVersion: strings.TrimSpace(s.vectorRuntime.GeneratorVersion),
+		Tokenizer:        embeddingchunk.NewTextMeasurer(s.vectorRuntime.Tokenizer, model).Name(),
+		ChunkStrategy:    strings.TrimSpace(s.vectorRuntime.ChunkStrategy),
+	})
+	if err != nil {
+		attempt.Error = "vector_search_failed: " + truncateForSearchAttempt(err.Error(), 160)
+		return nil, attempt
+	}
+	hits := make([]domain.SearchHit, 0, len(vectorHits))
+	seenSections := map[string]bool{}
+	for _, vectorHit := range vectorHits {
+		if seenSections[vectorHit.SectionID] {
+			continue
+		}
+		hit, ok, err := s.hydrateAndValidateVectorHit(ctx, vectorHit, opts, weight)
+		if err != nil {
+			attempt.Error = "vector_hydrate_failed: " + truncateForSearchAttempt(err.Error(), 160)
+			return hits, attempt
+		}
+		if !ok {
+			continue
+		}
+		seenSections[vectorHit.SectionID] = true
+		hits = append(hits, hit)
+	}
+	sortSearchHits(hits)
+	attempt.Hits = len(hits)
+	return hits, attempt
+}
+
+func (s *Store) hydrateAndValidateVectorHit(ctx context.Context, vectorHit domain.VectorSearchHit, opts domain.SearchOptions, weight float64) (domain.SearchHit, bool, error) {
+	var hit domain.SearchHit
+	var profileJSON string
+	err := s.readDB().QueryRowContext(ctx, `
+select sections.id, sections.document_id, documents.source_id, documents.title, documents.url,
+       sections.content_hash,
+       coalesce(document_profiles."desc", ''),
+       coalesce(document_profiles.retrieval_profile_json, '{}'),
+       exists (
+         select 1 from feedback_events fe
+         where fe.target_kind = 'document'
+           and fe.target_id = documents.id
+           and fe.feedback_kind = 'document_canonical'
+       ) as canonical,
+       sections.title, sections.heading_path, sections.content
+from sections
+join documents on documents.id = sections.document_id
+join sources on sources.id = documents.source_id
+left join document_profiles on document_profiles.document_id = documents.id
+where sections.id = ?
+  and documents.id = ?
+  and sources.id = ?
+  and not exists (
+    select 1 from feedback_events fe
+    where fe.target_kind = 'document'
+      and fe.target_id = documents.id
+      and fe.feedback_kind = 'document_stale'
+  )
+`, vectorHit.SectionID, vectorHit.DocumentID, vectorHit.SourceID).Scan(&hit.SectionID, &hit.DocumentID, &hit.SourceID, &hit.DocumentTitle, &hit.DocumentURL, &hit.ContentHash, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.SearchHit{}, false, nil
+	}
+	if err != nil {
+		return domain.SearchHit{}, false, err
+	}
+	contentHash := vectorHit.SectionContentHash
+	if contentHash == "" {
+		contentHash = vectorHit.ContentHash
+	}
+	if contentHash != hit.ContentHash {
+		return domain.SearchHit{}, false, nil
+	}
+	terms := searchTerms(opts.OriginalQuery)
+	if len(terms) == 0 {
+		terms = searchTerms(opts.Query)
+	}
+	if strings.TrimSpace(vectorHit.ChunkText) != "" {
+		hit.Snippet = bestSnippet(vectorHit.ChunkText, terms)
+	} else {
+		hit.Snippet = bestSnippet(hit.Content, terms)
+	}
+	enrichSearchHit(&hit, opts, profileJSON, terms, "vector")
+	breakdown := weightedScoreBreakdown(hit, opts.OriginalQuery, terms, 0, "vector")
+	breakdown.VectorBoost = vectorHit.Similarity // RRF mode: store raw similarity for transparency
+	breakdown.MatchedFields = uniqueStrings(append(breakdown.MatchedFields, "vector"))
+	breakdown.StaleEmbeddingPenalty = 0
+	breakdown.Total = scoreBreakdownTotal(breakdown)
+	hit.Rank = breakdown.Total
+	hit.ScoreBreakdown = &breakdown
+	hit.Trace = &domain.SearchHitTrace{
+		SourceID:             vectorHit.SourceID,
+		DocumentID:           vectorHit.DocumentID,
+		SectionID:            vectorHit.SectionID,
+		ChunkID:              vectorHit.ChunkID,
+		ChunkOrdinal:         vectorHit.ChunkOrdinal,
+		ContentHash:          contentHash,
+		EmbeddingModel:       vectorHit.Model,
+		EmbeddingTextHash:    vectorHit.EmbeddingTextHash,
+		ChunkTextHash:        vectorHit.ChunkTextHash,
+		EmbeddingGeneratedAt: vectorHit.GeneratedAt,
+		GeneratorVersion:     vectorHit.GeneratorVersion,
+		Tokenizer:            vectorHit.Tokenizer,
+		ChunkStrategy:        vectorHit.ChunkStrategy,
+		VectorTraceValid:     true,
+	}
+	hit.EvidenceLevel = evidenceLevelForBreakdown(breakdown)
+	if hit.QueryMatch != nil {
+		applyScoreBreakdownToQueryMatch(hit.QueryMatch, breakdown)
+	}
+	return hit, true, nil
 }
 
 func (s *Store) searchSectionsStoredEntities(ctx context.Context, opts domain.SearchOptions, mode entityMatchMode, limit int) ([]domain.SearchHit, error) {
@@ -4465,6 +5007,12 @@ func (c *searchCollector) add(attempt string, hits []domain.SearchHit) {
 				mergeQueryMatch(c.hits[idx].QueryMatch, hit.QueryMatch, attempt)
 			}
 			c.hits[idx].MatchedEntities = mergeMatchedEntities(c.hits[idx].MatchedEntities, hit.MatchedEntities)
+			if c.hits[idx].Trace == nil && hit.Trace != nil {
+				c.hits[idx].Trace = hit.Trace
+			}
+			if hit.EvidenceLevel != "" && (c.hits[idx].EvidenceLevel == "" || c.hits[idx].EvidenceLevel == "weak_vector_only") {
+				c.hits[idx].EvidenceLevel = hit.EvidenceLevel
+			}
 			continue
 		}
 		if hit.QueryMatch != nil {
@@ -4485,6 +5033,9 @@ func (c *searchCollector) results() []domain.SearchHit {
 		}
 		if perDoc[hit.DocumentID] >= c.opts.MaxSectionsPerDocument {
 			continue
+		}
+		if hit.EvidenceLevel == "" && hit.ScoreBreakdown != nil {
+			hit.EvidenceLevel = evidenceLevelForBreakdown(*hit.ScoreBreakdown)
 		}
 		perDoc[hit.DocumentID]++
 		result = append(result, hit)
@@ -4509,28 +5060,26 @@ func sortSearchHits(hits []domain.SearchHit) {
 
 func mergeScoreBreakdowns(left domain.ScoreBreakdown, right domain.ScoreBreakdown) domain.ScoreBreakdown {
 	merged := domain.ScoreBreakdown{
-		UnicodeBM25Boost: left.UnicodeBM25Boost + right.UnicodeBM25Boost,
-		TrigramBM25Boost: left.TrigramBM25Boost + right.TrigramBM25Boost,
-		TitleBoost:       maxFloat(left.TitleBoost, right.TitleBoost),
-		SectionBoost:     maxFloat(left.SectionBoost, right.SectionBoost),
-		SymbolBoost:      maxFloat(left.SymbolBoost, right.SymbolBoost),
-		ExactMatchBoost:  maxFloat(left.ExactMatchBoost, right.ExactMatchBoost),
-		CanonicalBoost:   maxFloat(left.CanonicalBoost, right.CanonicalBoost),
-		CoverageBoost:    maxFloat(left.CoverageBoost, right.CoverageBoost),
-		FallbackBoost:    maxFloat(left.FallbackBoost, right.FallbackBoost),
-		MatchedFields:    uniqueStrings(append(left.MatchedFields, right.MatchedFields...)),
-		MatchedTerms:     uniqueStrings(append(left.MatchedTerms, right.MatchedTerms...)),
-		MatchedSymbols:   uniqueStrings(append(left.MatchedSymbols, right.MatchedSymbols...)),
+		UnicodeBM25Boost:      left.UnicodeBM25Boost + right.UnicodeBM25Boost,
+		TrigramBM25Boost:      left.TrigramBM25Boost + right.TrigramBM25Boost,
+		TitleBoost:            maxFloat(left.TitleBoost, right.TitleBoost),
+		SectionBoost:          maxFloat(left.SectionBoost, right.SectionBoost),
+		SymbolBoost:           maxFloat(left.SymbolBoost, right.SymbolBoost),
+		ExactMatchBoost:       maxFloat(left.ExactMatchBoost, right.ExactMatchBoost),
+		CanonicalBoost:        maxFloat(left.CanonicalBoost, right.CanonicalBoost),
+		CoverageBoost:         maxFloat(left.CoverageBoost, right.CoverageBoost),
+		FallbackBoost:         maxFloat(left.FallbackBoost, right.FallbackBoost),
+		VectorBoost:           maxFloat(left.VectorBoost, right.VectorBoost),
+		VectorOnlyPenalty:     maxFloat(left.VectorOnlyPenalty, right.VectorOnlyPenalty),
+		StaleEmbeddingPenalty: maxFloat(left.StaleEmbeddingPenalty, right.StaleEmbeddingPenalty),
+		MatchedFields:         uniqueStrings(append(left.MatchedFields, right.MatchedFields...)),
+		MatchedTerms:          uniqueStrings(append(left.MatchedTerms, right.MatchedTerms...)),
+		MatchedSymbols:        uniqueStrings(append(left.MatchedSymbols, right.MatchedSymbols...)),
 	}
-	merged.Total = merged.UnicodeBM25Boost +
-		merged.TrigramBM25Boost +
-		merged.TitleBoost +
-		merged.SectionBoost +
-		merged.SymbolBoost +
-		merged.ExactMatchBoost +
-		merged.CanonicalBoost +
-		merged.CoverageBoost +
-		merged.FallbackBoost
+	if hasNonVectorEvidence(merged) {
+		merged.VectorOnlyPenalty = 0
+	}
+	merged.Total = scoreBreakdownTotal(merged)
 	return merged
 }
 
@@ -4963,6 +5512,21 @@ func substringSearchTerms(query string) []string {
 	return uniqueStrings(nonEmptyStrings(terms))
 }
 
+func vectorQueryLabel(opts domain.SearchOptions) string {
+	parts := []string{strings.TrimSpace(opts.OriginalQuery)}
+	parts = append(parts, opts.SemanticIntents...)
+	parts = uniqueStrings(nonEmptyStrings(parts))
+	return strings.Join(parts, " | ")
+}
+
+func truncateForSearchAttempt(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
+}
+
 func profileSearchTerms(query string) []string {
 	terms := searchTerms(query)
 	filtered := make([]string, 0, len(terms))
@@ -5123,7 +5687,12 @@ func weightedScoreBreakdown(hit domain.SearchHit, query string, terms []string, 
 		breakdown.MatchedFields = uniqueStrings(append(hit.QueryMatch.MatchedFields, breakdown.MatchedFields...))
 	}
 	breakdown.MatchedTerms = uniqueStrings(breakdown.MatchedTerms)
-	breakdown.Total = breakdown.UnicodeBM25Boost +
+	breakdown.Total = scoreBreakdownTotal(breakdown)
+	return breakdown
+}
+
+func scoreBreakdownTotal(breakdown domain.ScoreBreakdown) float64 {
+	return breakdown.UnicodeBM25Boost +
 		breakdown.TrigramBM25Boost +
 		breakdown.TitleBoost +
 		breakdown.SectionBoost +
@@ -5131,8 +5700,42 @@ func weightedScoreBreakdown(hit domain.SearchHit, query string, terms []string, 
 		breakdown.ExactMatchBoost +
 		breakdown.CanonicalBoost +
 		breakdown.CoverageBoost +
-		breakdown.FallbackBoost
-	return breakdown
+		breakdown.FallbackBoost +
+		breakdown.VectorBoost -
+		breakdown.VectorOnlyPenalty -
+		breakdown.StaleEmbeddingPenalty
+}
+
+func vectorOnlyPenalty(breakdown domain.ScoreBreakdown) float64 {
+	if hasNonVectorEvidence(breakdown) {
+		return 0
+	}
+	return 30
+}
+
+func hasNonVectorEvidence(breakdown domain.ScoreBreakdown) bool {
+	return breakdown.UnicodeBM25Boost > 0 ||
+		breakdown.TrigramBM25Boost > 0 ||
+		breakdown.TitleBoost > 0 ||
+		breakdown.SectionBoost > 0 ||
+		breakdown.SymbolBoost > 0 ||
+		breakdown.ExactMatchBoost > 0 ||
+		breakdown.CoverageBoost > 0 ||
+		breakdown.FallbackBoost > 0 ||
+		len(breakdown.MatchedSymbols) > 0
+}
+
+func evidenceLevelForBreakdown(breakdown domain.ScoreBreakdown) string {
+	if breakdown.ExactMatchBoost >= 160 || breakdown.SymbolBoost > 0 {
+		return "strong_exact"
+	}
+	if breakdown.VectorBoost > 0 && hasNonVectorEvidence(breakdown) {
+		return "strong_hybrid"
+	}
+	if breakdown.VectorBoost > 0 {
+		return "weak_vector_only"
+	}
+	return "medium_semantic"
 }
 
 func coverageBoost(hit domain.SearchHit, terms []string) float64 {

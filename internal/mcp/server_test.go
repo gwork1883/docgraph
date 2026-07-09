@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/docgraph/docgraph/internal/domain"
+	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage"
 )
@@ -139,6 +141,16 @@ func TestToolsList(t *testing.T) {
 					t.Fatalf("doc_search limit description missing %q: %s", want, limitDescription)
 				}
 			}
+			for _, name := range []string{"exact_terms", "semantic_intents"} {
+				if _, ok := properties[name].(map[string]any); !ok {
+					t.Fatalf("doc_search properties missing %q: %#v", name, properties)
+				}
+			}
+			for _, name := range []string{"use_vector_search", "vector_weight", "chunk_size", "batch_size"} {
+				if _, ok := properties[name]; ok {
+					t.Fatalf("doc_search exposes internal vector parameter %q: %#v", name, properties)
+				}
+			}
 		}
 	}
 	for _, name := range []string{"doc_search", "doc_get_section", "doc_get_node", "doc_related", "doc_impact"} {
@@ -254,6 +266,26 @@ func TestProductSearchToolCall(t *testing.T) {
 	}
 	if !strings.Contains(hit.Snippet, "member/benefits") {
 		t.Fatalf("summary mode hit snippet = %q, want highlighted match", hit.Snippet)
+	}
+}
+
+func TestDocSearchFallsBackWhenEmbeddingFails(t *testing.T) {
+	store := newTestStore(t)
+	queryService := query.NewService(store)
+	responses := runTestServerWithEmbedding(t, queryService, store, mcpFailingEmbedder{}, `{"jsonrpc":"2.0","id":"fallback","method":"tools/call","params":{"name":"doc_search","arguments":{"query":"member benefits","limit":5}}}`)
+	resp := requireResponse(t, responses, 0, `"fallback"`)
+	requireNoRPCError(t, resp)
+
+	var payload struct {
+		Attempts []storage.SearchAttempt `json:"attempts"`
+		Hits     []storage.SearchHit     `json:"hits"`
+	}
+	unmarshalToolText(t, resp, &payload)
+	if len(payload.Hits) == 0 || payload.Hits[0].DocumentID != "doc-member" {
+		t.Fatalf("doc_search hits = %+v, want lexical fallback hit", payload.Hits)
+	}
+	if !hasMCPAttemptError(payload.Attempts, "vector", "embedding_failed") {
+		t.Fatalf("doc_search attempts = %+v, want vector embedding_failed attempt", payload.Attempts)
 	}
 }
 
@@ -577,6 +609,45 @@ func runTestServerWithStore(t *testing.T, queryService *query.Service, store sto
 	return responses
 }
 
+func runTestServerWithEmbedding(t *testing.T, queryService *query.Service, store storage.Store, embedder embedding.Embedder, messages ...string) []rpcResponse {
+	t.Helper()
+
+	input := bytes.NewBufferString(strings.Join(messages, "\n") + "\n")
+	var output bytes.Buffer
+	server := NewServerWithStoreAndEmbedding(queryService, store, embedder, "test-generator", 0.4, input, &output)
+	if err := server.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	var responses []rpcResponse
+	scanner := bufio.NewScanner(&output)
+	for scanner.Scan() {
+		var resp rpcResponse
+		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response line %q: %v", scanner.Text(), err)
+		}
+		responses = append(responses, resp)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan responses: %v", err)
+	}
+	return responses
+}
+
+type mcpFailingEmbedder struct{}
+
+func (mcpFailingEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	return nil, fmt.Errorf("embedding unavailable")
+}
+
+func (mcpFailingEmbedder) Model() string {
+	return "test-embedding"
+}
+
+func (mcpFailingEmbedder) Dimensions() int {
+	return 2
+}
+
 func newTestQueryService(t *testing.T) *query.Service {
 	t.Helper()
 	return query.NewService(newTestStore(t))
@@ -756,6 +827,15 @@ func findMCPSearchHit(hits []storage.SearchHit, sectionID string) *storage.Searc
 func jsonArrayContains(values []any, want string) bool {
 	for _, value := range values {
 		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMCPAttemptError(attempts []storage.SearchAttempt, kind string, contains string) bool {
+	for _, attempt := range attempts {
+		if attempt.Kind == kind && strings.Contains(attempt.Error, contains) {
 			return true
 		}
 	}

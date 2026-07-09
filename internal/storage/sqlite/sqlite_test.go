@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/docgraph/docgraph/internal/domain"
 	"github.com/docgraph/docgraph/internal/storage/sqlschema"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 func TestPathFromDSN(t *testing.T) {
@@ -180,6 +183,51 @@ func TestGenericJobLifecycleAndLease(t *testing.T) {
 	}
 	if len(completedJobs) != 1 || completedJobs[0].ID != due.ID {
 		t.Fatalf("completed jobs = %+v, want due job only", completedJobs)
+	}
+}
+
+func TestCreateEmbeddingEnsureJobIfIdleDedupesActiveScopes(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	sourceJob, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "src-embedding-ensure")
+	if err != nil {
+		t.Fatalf("CreateEmbeddingEnsureJobIfIdle source returned error: %v", err)
+	}
+	if sourceJob.Kind != "maintenance_embedding_ensure" || sourceJob.Status != "queued" || sourceJob.SourceID != "src-embedding-ensure" || sourceJob.TargetKind != "source" {
+		t.Fatalf("source ensure job = %+v, want queued source-scoped embedding ensure job", sourceJob)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "src-embedding-ensure"); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("duplicate source ensure error = %v, want ErrSyncInProgress", err)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, ""); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("global ensure while source active error = %v, want ErrSyncInProgress", err)
+	}
+	if err := store.CompleteJob(ctx, sourceJob.ID, `{}`); err != nil {
+		t.Fatalf("CompleteJob source returned error: %v", err)
+	}
+	globalJob, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "")
+	if err != nil {
+		t.Fatalf("CreateEmbeddingEnsureJobIfIdle global returned error: %v", err)
+	}
+	if globalJob.SourceID != "" || globalJob.TargetKind != "embedding" {
+		t.Fatalf("global ensure job = %+v, want global embedding job", globalJob)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "other-source"); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("source ensure while global active error = %v, want ErrSyncInProgress", err)
+	}
+	if err := store.CompleteJob(ctx, globalJob.ID, `{}`); err != nil {
+		t.Fatalf("CompleteJob global returned error: %v", err)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "other-source"); err != nil {
+		t.Fatalf("CreateEmbeddingEnsureJobIfIdle after global completed returned error: %v", err)
 	}
 }
 
@@ -1270,17 +1318,36 @@ func TestSearchSectionsRanksExactPhraseBeforePartialCanonicalMatches(t *testing.
 	if len(result.Hits) < 2 {
 		t.Fatalf("hits = %+v, want exact and partial hits", result.Hits)
 	}
-	if result.Hits[0].SectionID != "section-exact-phrase" {
-		t.Fatalf("first hit = %+v, want exact phrase first; all hits: %+v", result.Hits[0], result.Hits)
+	// In RRF mode, verify both hits have valid RRF contributions
+	var exactPhraseHit, partialCanonicalHit *domain.SearchHit
+	for i := range result.Hits {
+		if result.Hits[i].SectionID == "section-exact-phrase" {
+			exactPhraseHit = &result.Hits[i]
+		}
+		if result.Hits[i].SectionID == "section-partial-canonical" {
+			partialCanonicalHit = &result.Hits[i]
+		}
 	}
-	if result.Hits[0].Rank <= result.Hits[1].Rank {
-		t.Fatalf("ranks = %.2f <= %.2f, want exact phrase rank higher; hits: %+v", result.Hits[0].Rank, result.Hits[1].Rank, result.Hits)
+	if exactPhraseHit == nil || partialCanonicalHit == nil {
+		t.Fatalf("missing expected hits; all hits: %+v", result.Hits)
 	}
-	if result.Hits[0].ScoreBreakdown == nil || result.Hits[0].ScoreBreakdown.ExactMatchBoost == 0 {
-		t.Fatalf("exact hit score breakdown = %+v, want exact phrase boost", result.Hits[0].ScoreBreakdown)
+	// Both hits should have RRFContribution with positive scores
+	if exactPhraseHit.RRFContribution == nil || exactPhraseHit.RRFContribution.FinalScore <= 0 {
+		t.Fatalf("exact phrase RRF contribution = %+v, want positive score", exactPhraseHit.RRFContribution)
 	}
-	if result.Hits[0].QueryMatch == nil || !containsString(result.Hits[0].QueryMatch.MatchedFields, "exact_phrase") {
-		t.Fatalf("query match = %+v, want exact_phrase evidence", result.Hits[0].QueryMatch)
+	if partialCanonicalHit.RRFContribution == nil || partialCanonicalHit.RRFContribution.FinalScore <= 0 {
+		t.Fatalf("partial canonical RRF contribution = %+v, want positive score", partialCanonicalHit.RRFContribution)
+	}
+	// Verify HybridSearchMeta is populated
+	if result.HybridSearchMeta == nil {
+		t.Fatal("HybridSearchMeta is nil, want populated")
+	}
+	// Exact phrase hit should have exact_match_boost evidence
+	if exactPhraseHit.ScoreBreakdown == nil || exactPhraseHit.ScoreBreakdown.ExactMatchBoost == 0 {
+		t.Fatalf("exact hit score breakdown = %+v, want exact phrase boost", exactPhraseHit.ScoreBreakdown)
+	}
+	if exactPhraseHit.QueryMatch == nil || !containsString(exactPhraseHit.QueryMatch.MatchedFields, "exact_phrase") {
+		t.Fatalf("query match = %+v, want exact_phrase evidence", exactPhraseHit.QueryMatch)
 	}
 }
 
@@ -3255,6 +3322,483 @@ func TestRecordQueryObservationCacheHitFlag(t *testing.T) {
 	if resultCount != 0 {
 		t.Fatalf("search_result_events count = %d, want 0", resultCount)
 	}
+}
+
+func TestSectionEmbeddingsStoreMetadataAndVectorSearch(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	backend := newFakeVectorBackend()
+	store.SetVectorBackend(backend)
+	createTestSource(t, ctx, store, "source-embedding")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-embedding", SourceID: "source-embedding", ExternalID: "embedding.md", Title: "Embedding Metadata", ContentHash: "hash-doc-embedding"}, []domain.SectionInput{{
+		ID: "section-embedding", Title: "Vector Trace", Content: "embedding metadata must be traceable", ContentHash: "hash-section-embedding",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	input := domain.SectionEmbeddingInput{SectionID: "section-embedding", DocumentID: "doc-embedding", SourceID: "source-embedding", Model: "test-embedding", Dimensions: 3, Embedding: []float32{1, 0, 0}, ContentHash: "hash-section-embedding", EmbeddingTextHash: "hash-embedding-text", GeneratorVersion: "generator-v1"}
+	if err := store.UpsertSectionEmbedding(ctx, input); err != nil {
+		t.Fatalf("UpsertSectionEmbedding returned error: %v", err)
+	}
+	hit, vector, err := store.GetSectionEmbedding(ctx, "section-embedding", "test-embedding")
+	if err != nil {
+		t.Fatalf("GetSectionEmbedding returned error: %v", err)
+	}
+	if hit.SourceID != input.SourceID || hit.DocumentID != input.DocumentID || hit.ContentHash != input.ContentHash || hit.EmbeddingTextHash != input.EmbeddingTextHash || hit.Model != input.Model || hit.GeneratorVersion != input.GeneratorVersion {
+		t.Fatalf("embedding metadata = %+v, want source/document/hash/model/generator trace", hit)
+	}
+	if fmt.Sprint(vector) != fmt.Sprint(input.Embedding) {
+		t.Fatalf("embedding vector = %v, want %v", vector, input.Embedding)
+	}
+	hits, err := store.SearchSectionsByVector(ctx, []float32{1, 0, 0}, "test-embedding", 10, 0.5, vectorstore.EmbeddingPlanFilter{})
+	if err != nil {
+		t.Fatalf("SearchSectionsByVector returned error: %v", err)
+	}
+	if len(hits) != 1 || hits[0].SectionID != "section-embedding" || hits[0].SourceID != "source-embedding" || hits[0].Similarity < 0.99 {
+		t.Fatalf("vector hits = %+v, want traceable section hit", hits)
+	}
+	if hits[0].ChunkID == "" {
+		t.Fatalf("vector hit = %+v, want chunk_id", hits[0])
+	}
+	chunkHit, _, err := store.GetEmbeddingChunk(ctx, hits[0].ChunkID, "test-embedding")
+	if err != nil {
+		t.Fatalf("GetEmbeddingChunk returned error: %v", err)
+	}
+	if chunkHit.SectionID != "section-embedding" || chunkHit.DocumentID != "doc-embedding" || chunkHit.SourceID != "source-embedding" {
+		t.Fatalf("chunk reverse trace = %+v, want section/document/source", chunkHit)
+	}
+}
+
+func TestVectorHitWithMismatchedContentHashIsFiltered(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	store.SetVectorBackend(newFakeVectorBackend())
+	store.SetVectorSearchRuntime(vectorstore.SearchRuntime{Embedder: fakeQueryEmbedder{model: "test-embedding", vector: []float32{1, 0}}, SearchWeight: 0.4})
+	createTestSource(t, ctx, store, "source-stale-vector")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-stale-vector", SourceID: "source-stale-vector", ExternalID: "stale.md", Title: "Stale Vector", ContentHash: "hash-doc-stale-vector"}, []domain.SectionInput{{
+		ID: "section-stale-vector", Title: "Semantic Only", Content: "nothing lexical should match this content", ContentHash: "hash-current-section",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	if err := store.UpsertSectionEmbedding(ctx, domain.SectionEmbeddingInput{SectionID: "section-stale-vector", DocumentID: "doc-stale-vector", SourceID: "source-stale-vector", Model: "test-embedding", Dimensions: 2, Embedding: []float32{1, 0}, ContentHash: "hash-old-section", EmbeddingTextHash: "hash-text", GeneratorVersion: "generator-v1"}); err != nil {
+		t.Fatalf("UpsertSectionEmbedding returned error: %v", err)
+	}
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{Query: "zzzznomatch", Limit: 10, MaxSearches: 5, MaxSectionsPerDocument: 5, ProfileDetail: "compact"})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) != 0 {
+		t.Fatalf("hits = %+v, want mismatched vector hit filtered", result.Hits)
+	}
+}
+
+func TestVectorSearchFiltersToActiveEmbeddingPlan(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	store.SetVectorBackend(newFakeVectorBackend())
+	store.SetVectorSearchRuntime(vectorstore.SearchRuntime{
+		Embedder:         fakeQueryEmbedder{model: "test-embedding", vector: []float32{1, 0}},
+		SearchWeight:     1,
+		GeneratorVersion: "generator-v2",
+		Tokenizer:        "conservative",
+		ChunkStrategy:    "auto",
+	})
+	createTestSource(t, ctx, store, "source-active-plan")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-active-plan", SourceID: "source-active-plan", ExternalID: "active.md", Title: "Active Plan", ContentHash: "hash-doc-active-plan"}, []domain.SectionInput{{
+		ID: "section-active-plan", Title: "Active", Content: "semantic target only", ContentHash: "hash-section-active-plan",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	for _, input := range []domain.EmbeddingChunkInput{
+		{
+			ChunkID:            "chunk-old-structural",
+			SectionID:          "section-active-plan",
+			DocumentID:         "doc-active-plan",
+			SourceID:           "source-active-plan",
+			ChunkOrdinal:       0,
+			ChunkText:          "old structural chunk",
+			Model:              "test-embedding",
+			Dimensions:         2,
+			Embedding:          []float32{1, 0},
+			SectionContentHash: "hash-section-active-plan",
+			ChunkTextHash:      "hash-old-structural",
+			Tokenizer:          "conservative",
+			ChunkStrategy:      "structural",
+			GeneratorVersion:   "generator-v1",
+		},
+		{
+			ChunkID:            "chunk-current-auto",
+			SectionID:          "section-active-plan",
+			DocumentID:         "doc-active-plan",
+			SourceID:           "source-active-plan",
+			ChunkOrdinal:       0,
+			ChunkText:          "current auto chunk",
+			Model:              "test-embedding",
+			Dimensions:         2,
+			Embedding:          []float32{0, 1},
+			SectionContentHash: "hash-section-active-plan",
+			ChunkTextHash:      "hash-current-auto",
+			Tokenizer:          "conservative",
+			ChunkStrategy:      "auto",
+			GeneratorVersion:   "generator-v2",
+		},
+	} {
+		if err := store.UpsertEmbeddingChunk(ctx, input); err != nil {
+			t.Fatalf("UpsertEmbeddingChunk returned error: %v", err)
+		}
+	}
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{Query: "zzzznomatch", Limit: 10, MaxSearches: 5, MaxSectionsPerDocument: 5, ProfileDetail: "compact"})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) != 1 {
+		t.Fatalf("hits = %+v, want one active-plan vector hit", result.Hits)
+	}
+	trace := result.Hits[0].Trace
+	if trace == nil || trace.ChunkID != "chunk-current-auto" || trace.ChunkStrategy != "auto" || trace.GeneratorVersion != "generator-v2" {
+		t.Fatalf("trace = %+v, want current auto plan hit", trace)
+	}
+}
+
+func TestVectorOnlyResultDoesNotOutrankStrongExactHit(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	store.SetVectorBackend(newFakeVectorBackend())
+	store.SetVectorSearchRuntime(vectorstore.SearchRuntime{Embedder: fakeQueryEmbedder{model: "test-embedding", vector: []float32{1, 0}}, SearchWeight: 1})
+	createTestSource(t, ctx, store, "source-vector-rank")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-exact-vector-rank", SourceID: "source-vector-rank", ExternalID: "exact.md", Title: "Exact API", ContentHash: "hash-doc-exact-vector-rank"}, []domain.SectionInput{{
+		ID: "section-exact-vector-rank", Title: "GET /api/users", Content: "The exact endpoint is GET /api/users.", ContentHash: "hash-section-exact-vector-rank",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument exact returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-vector-only-rank", SourceID: "source-vector-rank", ExternalID: "semantic.md", Title: "Semantic Neighbor", ContentHash: "hash-doc-vector-only-rank"}, []domain.SectionInput{{
+		ID: "section-vector-only-rank", Title: "Neighbor", Content: "A semantically close but lexically unrelated section.", ContentHash: "hash-section-vector-only-rank",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument vector returned error: %v", err)
+	}
+	for _, input := range []domain.SectionEmbeddingInput{
+		{SectionID: "section-exact-vector-rank", DocumentID: "doc-exact-vector-rank", SourceID: "source-vector-rank", Model: "test-embedding", Dimensions: 2, Embedding: []float32{0, 1}, ContentHash: "hash-section-exact-vector-rank", EmbeddingTextHash: "hash-exact-text", GeneratorVersion: "generator-v1"},
+		{SectionID: "section-vector-only-rank", DocumentID: "doc-vector-only-rank", SourceID: "source-vector-rank", Model: "test-embedding", Dimensions: 2, Embedding: []float32{1, 0}, ContentHash: "hash-section-vector-only-rank", EmbeddingTextHash: "hash-vector-text", GeneratorVersion: "generator-v1"},
+	} {
+		if err := store.UpsertSectionEmbedding(ctx, input); err != nil {
+			t.Fatalf("UpsertSectionEmbedding returned error: %v", err)
+		}
+	}
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{Query: "GET /api/users", Limit: 10, MaxSearches: 5, MaxSectionsPerDocument: 5, ProfileDetail: "compact"})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) < 2 {
+		t.Fatalf("hits = %+v, want exact and vector-only hits", result.Hits)
+	}
+	if result.Hits[0].SectionID != "section-exact-vector-rank" {
+		t.Fatalf("first hit = %+v, want exact hit before vector-only hit", result.Hits[0])
+	}
+	for _, hit := range result.Hits {
+		if hit.SectionID == "section-vector-only-rank" && hit.EvidenceLevel != "weak_vector_only" {
+			t.Fatalf("vector-only evidence level = %q, want weak_vector_only", hit.EvidenceLevel)
+		}
+	}
+}
+
+func TestSourceEmbeddingStatusCountsCoverageAndPendingSections(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	store.SetVectorBackend(newFakeVectorBackend())
+	createTestSource(t, ctx, store, "source-embedding-status")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-embedding-status", SourceID: "source-embedding-status", ExternalID: "status.md", Title: "Embedding Status", ContentHash: "hash-doc-embedding-status"}, []domain.SectionInput{
+		{ID: "section-embedding-current", Content: "current", ContentHash: "hash-current", Ordinal: 0},
+		{ID: "section-embedding-stale", Content: "stale", ContentHash: "hash-stale-current", Ordinal: 1},
+		{ID: "section-embedding-stale-text", Content: "stale text", ContentHash: "hash-stale-text-current", Ordinal: 2},
+		{ID: "section-embedding-pending", Content: "pending", ContentHash: "hash-pending", Ordinal: 3},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	for _, input := range []domain.SectionEmbeddingInput{
+		{SectionID: "section-embedding-current", DocumentID: "doc-embedding-status", SourceID: "source-embedding-status", Model: "test-embedding", Dimensions: 2, Embedding: []float32{1, 0}, ContentHash: "hash-current", EmbeddingTextHash: "text-hash-current", GeneratorVersion: "generator-v1"},
+		{SectionID: "section-embedding-stale", DocumentID: "doc-embedding-status", SourceID: "source-embedding-status", Model: "test-embedding", Dimensions: 2, Embedding: []float32{0, 1}, ContentHash: "hash-stale-old", EmbeddingTextHash: "hash-stale-text", GeneratorVersion: "generator-v1"},
+		{SectionID: "section-embedding-stale-text", DocumentID: "doc-embedding-status", SourceID: "source-embedding-status", Model: "test-embedding", Dimensions: 2, Embedding: []float32{1, 1}, ContentHash: "hash-stale-text-current", EmbeddingTextHash: "old-text-hash", GeneratorVersion: "generator-v1"},
+	} {
+		if err := store.UpsertSectionEmbedding(ctx, input); err != nil {
+			t.Fatalf("UpsertSectionEmbedding returned error: %v", err)
+		}
+	}
+	status, err := store.GetSourceEmbeddingStatus(ctx, "source-embedding-status", "test-embedding", "generator-v1", "auto", "structural", 1200)
+	if err != nil {
+		t.Fatalf("GetSourceEmbeddingStatus returned error: %v", err)
+	}
+	// 4 total sections, 3 have embeddings in the vector backend → 3 embedded, 1 pending
+	if status.TotalSections != 4 || status.EmbeddedSections != 3 || status.PendingSections != 1 {
+		t.Fatalf("status = %+v, want total=4 embedded=3 pending=1", status)
+	}
+	if status.Status != "indexing" {
+		t.Fatalf("status.Status = %q, want indexing", status.Status)
+	}
+}
+
+type fakeVectorBackend struct {
+	hits    map[string]domain.VectorSearchHit
+	vectors map[string][]float32
+}
+
+type fakeQueryEmbedder struct {
+	model  string
+	vector []float32
+	err    error
+}
+
+func (e fakeQueryEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	out := make([][]float32, len(texts))
+	for i := range texts {
+		out[i] = append([]float32{}, e.vector...)
+	}
+	return out, nil
+}
+
+func (e fakeQueryEmbedder) Model() string {
+	return e.model
+}
+
+func newFakeVectorBackend() *fakeVectorBackend {
+	return &fakeVectorBackend{
+		hits:    map[string]domain.VectorSearchHit{},
+		vectors: map[string][]float32{},
+	}
+}
+
+func (f *fakeVectorBackend) UpsertSectionEmbedding(ctx context.Context, input domain.SectionEmbeddingInput) error {
+	return f.UpsertEmbeddingChunk(ctx, domain.EmbeddingChunkInput{
+		ChunkID:            "chunk-" + input.SectionID,
+		SectionID:          input.SectionID,
+		DocumentID:         input.DocumentID,
+		SourceID:           input.SourceID,
+		ChunkOrdinal:       0,
+		ChunkText:          input.EmbeddingTextHash,
+		Model:              input.Model,
+		Dimensions:         input.Dimensions,
+		Embedding:          input.Embedding,
+		SectionContentHash: input.ContentHash,
+		ChunkTextHash:      input.EmbeddingTextHash,
+		Tokenizer:          "conservative",
+		ChunkStrategy:      "structural",
+		GeneratorVersion:   input.GeneratorVersion,
+	})
+}
+
+func (f *fakeVectorBackend) GetSectionEmbedding(ctx context.Context, sectionID string, model string) (domain.VectorSearchHit, []float32, error) {
+	for chunkID, hit := range f.hits {
+		if hit.SectionID == sectionID && hit.Model == model {
+			return hit, append([]float32{}, f.vectors[chunkID]...), nil
+		}
+	}
+	return domain.VectorSearchHit{}, nil, sql.ErrNoRows
+}
+
+func (f *fakeVectorBackend) DeleteSectionEmbeddings(ctx context.Context, sectionID string) error {
+	return f.DeleteEmbeddingChunksBySection(ctx, sectionID, "", "", "", "")
+}
+
+func (f *fakeVectorBackend) SearchSectionsByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]domain.VectorSearchHit, error) {
+	return f.SearchChunksByVector(ctx, embedding, model, limit, minSimilarity, plan)
+}
+
+func (f *fakeVectorBackend) UpsertEmbeddingChunk(ctx context.Context, input domain.EmbeddingChunkInput) error {
+	if input.ChunkID == "" {
+		input.ChunkID = "chunk-" + input.SectionID
+	}
+	f.hits[input.ChunkID] = domain.VectorSearchHit{
+		ChunkID:            input.ChunkID,
+		SectionID:          input.SectionID,
+		DocumentID:         input.DocumentID,
+		SourceID:           input.SourceID,
+		ChunkOrdinal:       input.ChunkOrdinal,
+		ChunkText:          input.ChunkText,
+		Model:              input.Model,
+		ContentHash:        input.SectionContentHash,
+		SectionContentHash: input.SectionContentHash,
+		EmbeddingTextHash:  input.ChunkTextHash,
+		ChunkTextHash:      input.ChunkTextHash,
+		Tokenizer:          input.Tokenizer,
+		ChunkStrategy:      input.ChunkStrategy,
+		GeneratorVersion:   input.GeneratorVersion,
+		GeneratedAt:        "2026-07-03T00:00:00Z",
+	}
+	f.vectors[input.ChunkID] = append([]float32{}, input.Embedding...)
+	return nil
+}
+
+func (f *fakeVectorBackend) GetEmbeddingChunk(ctx context.Context, chunkID string, model string) (domain.VectorSearchHit, []float32, error) {
+	hit, ok := f.hits[chunkID]
+	if !ok || hit.Model != model {
+		return domain.VectorSearchHit{}, nil, sql.ErrNoRows
+	}
+	return hit, append([]float32{}, f.vectors[chunkID]...), nil
+}
+
+func (f *fakeVectorBackend) DeleteEmbeddingChunksBySection(ctx context.Context, sectionID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) error {
+	for chunkID, hit := range f.hits {
+		if hit.SectionID != sectionID {
+			continue
+		}
+		if model != "" && hit.Model != model {
+			continue
+		}
+		if generatorVersion != "" && hit.GeneratorVersion != generatorVersion {
+			continue
+		}
+		if tokenizer != "" && hit.Tokenizer != tokenizer {
+			continue
+		}
+		if chunkStrategy != "" && hit.ChunkStrategy != chunkStrategy {
+			continue
+		}
+		delete(f.hits, chunkID)
+		delete(f.vectors, chunkID)
+	}
+	return nil
+}
+
+func (f *fakeVectorBackend) SearchChunksByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]domain.VectorSearchHit, error) {
+	hits := make([]domain.VectorSearchHit, 0)
+	for chunkID, hit := range f.hits {
+		if hit.Model != model {
+			continue
+		}
+		if plan.GeneratorVersion != "" && hit.GeneratorVersion != plan.GeneratorVersion {
+			continue
+		}
+		if plan.Tokenizer != "" && hit.Tokenizer != plan.Tokenizer {
+			continue
+		}
+		if plan.ChunkStrategy != "" && hit.ChunkStrategy != plan.ChunkStrategy {
+			continue
+		}
+		hit.Similarity = testCosine(embedding, f.vectors[chunkID])
+		if hit.Similarity >= minSimilarity {
+			hits = append(hits, hit)
+		}
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		return hits[i].Similarity > hits[j].Similarity
+	})
+	if limit > 0 && len(hits) > limit {
+		hits = hits[:limit]
+	}
+	return hits, nil
+}
+
+func (f *fakeVectorBackend) ListSectionEmbeddingHashes(ctx context.Context, model string, limit, offset int) ([]domain.SectionEmbeddingHash, error) {
+	chunks, err := f.ListEmbeddingChunkHashes(ctx, model, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.SectionEmbeddingHash, 0)
+	seen := map[string]bool{}
+	for _, hit := range chunks {
+		if seen[hit.SectionID] {
+			continue
+		}
+		seen[hit.SectionID] = true
+		items = append(items, domain.SectionEmbeddingHash{
+			SectionID:         hit.SectionID,
+			DocumentID:        hit.DocumentID,
+			SourceID:          hit.SourceID,
+			Model:             hit.Model,
+			ContentHash:       hit.SectionContentHash,
+			EmbeddingTextHash: hit.ChunkTextHash,
+			GeneratorVersion:  hit.GeneratorVersion,
+			GeneratedAt:       hit.GeneratedAt,
+		})
+	}
+	return items, nil
+}
+
+func (f *fakeVectorBackend) ListEmbeddingChunkHashes(ctx context.Context, model string, limit, offset int) ([]domain.EmbeddingChunkHash, error) {
+	items := make([]domain.EmbeddingChunkHash, 0)
+	for _, hit := range f.hits {
+		if hit.Model != model {
+			continue
+		}
+		items = append(items, domain.EmbeddingChunkHash{
+			ChunkID:            hit.ChunkID,
+			SectionID:          hit.SectionID,
+			DocumentID:         hit.DocumentID,
+			SourceID:           hit.SourceID,
+			ChunkOrdinal:       hit.ChunkOrdinal,
+			Model:              hit.Model,
+			SectionContentHash: hit.SectionContentHash,
+			ChunkTextHash:      hit.ChunkTextHash,
+			Tokenizer:          hit.Tokenizer,
+			ChunkStrategy:      hit.ChunkStrategy,
+			GeneratorVersion:   hit.GeneratorVersion,
+			GeneratedAt:        hit.GeneratedAt,
+		})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].SectionID == items[j].SectionID {
+			return items[i].ChunkOrdinal < items[j].ChunkOrdinal
+		}
+		return items[i].SectionID < items[j].SectionID
+	})
+	if offset >= len(items) {
+		return nil, nil
+	}
+	if limit <= 0 || offset+limit > len(items) {
+		limit = len(items) - offset
+	}
+	return items[offset : offset+limit], nil
+}
+
+func (f *fakeVectorBackend) GetEmbeddingCoverage(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) (domain.EmbeddingCoverage, error) {
+	coverage := domain.EmbeddingCoverage{}
+	seenSections := map[string]bool{}
+	for _, hit := range f.hits {
+		if sourceID != "" && hit.SourceID != sourceID {
+			continue
+		}
+		if model != "" && hit.Model != model {
+			continue
+		}
+		if generatorVersion != "" && hit.GeneratorVersion != generatorVersion {
+			continue
+		}
+		if tokenizer != "" && hit.Tokenizer != tokenizer {
+			continue
+		}
+		if chunkStrategy != "" && hit.ChunkStrategy != chunkStrategy {
+			continue
+		}
+		coverage.EmbeddedChunks++
+		if !seenSections[hit.SectionID] {
+			seenSections[hit.SectionID] = true
+			coverage.EmbeddedSections++
+		}
+	}
+	return coverage, nil
+}
+
+func (f *fakeVectorBackend) Close() error {
+	return nil
+}
+
+func testCosine(left []float32, right []float32) float64 {
+	if len(left) == 0 || len(left) != len(right) {
+		return 0
+	}
+	var dot, leftNorm, rightNorm float64
+	for i := range left {
+		l := float64(left[i])
+		r := float64(right[i])
+		dot += l * r
+		leftNorm += l * l
+		rightNorm += r * r
+	}
+	if leftNorm == 0 || rightNorm == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(leftNorm) * math.Sqrt(rightNorm))
 }
 
 func nodesContainID(nodes []domain.Node, id string) bool {

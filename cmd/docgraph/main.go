@@ -13,9 +13,6 @@ import (
 
 	"github.com/docgraph/docgraph/internal/app"
 	"github.com/docgraph/docgraph/internal/config"
-	"github.com/docgraph/docgraph/internal/mcp"
-	"github.com/docgraph/docgraph/internal/query"
-	"github.com/docgraph/docgraph/internal/storage"
 )
 
 var version = "dev"
@@ -206,17 +203,7 @@ func runMCP(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := storage.OpenExisting(ctx, cfg.Storage.DSN)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	if err := store.CheckSchema(ctx); err != nil {
-		return err
-	}
-
-	return mcp.NewServerWithStore(query.NewService(store), store, os.Stdin, os.Stdout).Run(ctx)
+	return app.MCP(ctx, cfg, os.Stdin, os.Stdout)
 }
 
 func printUsage() {

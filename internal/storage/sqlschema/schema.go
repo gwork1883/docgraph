@@ -1,6 +1,6 @@
 package sqlschema
 
-const CurrentSchemaVersion = 3
+const CurrentSchemaVersion = 4
 
 type Status struct {
 	StorageDSN string `json:"storage_dsn"`

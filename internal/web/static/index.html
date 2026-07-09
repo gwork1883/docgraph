@@ -341,7 +341,7 @@
       </section>
 
       <section class="view" data-view="sync-tasks">
-        <div id="sync-task-tabs" class="tab-bar" role="tablist" aria-label="Sync tasks">
+        <div id="sync-task-tabs" class="tab-bar" role="tablist" aria-label="Tasks">
           <button type="button" class="tab-button active" data-sync-tab="history" role="tab" aria-selected="true" data-i18n="sync.tab.history">History</button>
           <button type="button" class="tab-button" data-sync-tab="schedules" role="tab" aria-selected="false" data-i18n="sync.tab.schedules">Schedules</button>
         </div>
@@ -352,6 +352,17 @@
               <button id="sync-history-refresh" type="button" data-i18n="sync.refresh">Refresh</button>
             </div>
             <form id="sync-task-filters" class="form sync-filter-form">
+              <label class="field">
+                <span class="field-label">
+                  <span data-i18n="jobs.kind">Task Type</span>
+                  <span class="field-state optional" data-i18n="field.optional">Optional</span>
+                </span>
+                <select name="kind">
+                  <option value="" data-i18n="jobs.kind.all">All tasks</option>
+                  <option value="sync_source" data-i18n="jobs.kind.sync">Source sync</option>
+                  <option value="maintenance_embedding_ensure" data-i18n="jobs.kind.embedding">Vector sync</option>
+                </select>
+              </label>
               <label class="field">
                 <span class="field-label">
                   <span data-i18n="sync.source">Source</span>

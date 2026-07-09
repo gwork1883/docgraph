@@ -9,6 +9,7 @@ import (
 	"github.com/docgraph/docgraph/internal/domain"
 	"github.com/docgraph/docgraph/internal/storage/sqlite"
 	"github.com/docgraph/docgraph/internal/storage/sqlschema"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 var ErrSyncInProgress = domain.ErrSyncInProgress
@@ -68,6 +69,7 @@ type Store interface {
 	ListJobs(ctx context.Context, opts JobListOptions) ([]Job, error)
 	CountJobs(ctx context.Context, opts JobListOptions) (int, error)
 	GetJob(ctx context.Context, id string) (Job, error)
+	CreateEmbeddingEnsureJobIfIdle(ctx context.Context, sourceID string) (Job, error)
 	CreateSyncJob(ctx context.Context, sourceID string) (SyncJob, error)
 	CreateSyncJobIfIdle(ctx context.Context, sourceID string) (SyncJob, error)
 	CompleteSyncJob(ctx context.Context, id string, result ResultPayload) error
@@ -86,6 +88,20 @@ type Store interface {
 	SearchSections(ctx context.Context, query string, limit int) ([]SearchHit, error)
 	SearchSectionsWithOptions(ctx context.Context, opts SearchOptions) (SearchResult, error)
 	GetSection(ctx context.Context, id string) (SectionContent, error)
+	UpsertSectionEmbedding(ctx context.Context, input SectionEmbeddingInput) error
+	GetSectionEmbedding(ctx context.Context, sectionID string, model string) (VectorSearchHit, []float32, error)
+	DeleteSectionEmbeddings(ctx context.Context, sectionID string) error
+	SearchSectionsByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]VectorSearchHit, error)
+	ListSectionEmbeddingHashes(ctx context.Context, model string, limit, offset int) ([]SectionEmbeddingHash, error)
+	UpsertEmbeddingChunk(ctx context.Context, input EmbeddingChunkInput) error
+	GetEmbeddingChunk(ctx context.Context, chunkID string, model string) (VectorSearchHit, []float32, error)
+	DeleteEmbeddingChunksBySection(ctx context.Context, sectionID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) error
+	SearchChunksByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]VectorSearchHit, error)
+	ListEmbeddingChunkHashes(ctx context.Context, model string, limit, offset int) ([]EmbeddingChunkHash, error)
+	GetSourceEmbeddingStatus(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string, chunkTargetTokens int) (EmbeddingStatus, error)
+	GetSectionForEmbedding(ctx context.Context, sectionID string) (EmbeddingSection, error)
+	CountSectionsForEmbedding(ctx context.Context, sourceID string) (int, error)
+	ListSectionsForEmbedding(ctx context.Context, sourceID string, limit, offset int) ([]EmbeddingSection, error)
 	RecordQueryObservation(ctx context.Context, input QueryObservationInput) error
 	Close() error
 }
@@ -117,6 +133,13 @@ type SearchHit = domain.SearchHit
 type SearchOptions = domain.SearchOptions
 type SearchResult = domain.SearchResult
 type SearchAttempt = domain.SearchAttempt
+type SectionEmbeddingInput = domain.SectionEmbeddingInput
+type EmbeddingChunkInput = domain.EmbeddingChunkInput
+type VectorSearchHit = domain.VectorSearchHit
+type SectionEmbeddingHash = domain.SectionEmbeddingHash
+type EmbeddingChunkHash = domain.EmbeddingChunkHash
+type EmbeddingStatus = domain.EmbeddingStatus
+type EmbeddingSection = domain.EmbeddingSection
 type Job = domain.Job
 type JobInput = domain.JobInput
 type JobListOptions = domain.JobListOptions

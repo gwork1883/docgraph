@@ -3,6 +3,7 @@ let currentLang = "en";
 let authMessageKey = "";
 const syncingSourceIDs = new Set();
 const activeSyncSourceIDs = new Set();
+const activeEmbeddingSourceIDs = new Set();
 const sourcesByID = new Map();
 const credentialsByID = new Map();
 const sourceArtifactPages = new Map();
@@ -706,12 +707,14 @@ async function loadSources() {
   container.innerHTML = "";
   sourcesByID.clear();
   activeSyncSourceIDs.clear();
+  activeEmbeddingSourceIDs.clear();
   if (!body.sources?.length) {
     populateSyncSourceSelects();
     container.innerHTML = `<p class="muted">${escapeHTML(t("sources.empty"))}</p>`;
     return;
   }
   await loadActiveSyncSourceIDs();
+  await loadActiveEmbeddingSourceIDs();
   const sources = [...body.sources].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")) || String(b.id || "").localeCompare(String(a.id || "")));
   sources.forEach((source) => {
     sourcesByID.set(source.id, source);
@@ -727,10 +730,12 @@ async function loadSources() {
       <div class="source-meta">
         <span>${escapeHTML(t("source.schedule"))}: ${escapeHTML(formatSourceSchedule(source.sync_schedule))}</span>
         <span class="${escapeAttr(paused ? "source-state warn" : "source-state")}">${escapeHTML(formatSourceSyncStatus(source))}</span>
+        <span class="source-state" data-embedding-status="${escapeAttr(source.id)}">${escapeHTML(t("source.vector_status_loading"))}</span>
       </div>
       <div class="source-actions">
         <button data-edit="${escapeAttr(source.id)}" type="button">${escapeHTML(t("source.edit"))}</button>
         <button data-sync="${escapeAttr(source.id)}" type="button" ${syncing ? "disabled" : ""}>${escapeHTML(t(syncing ? "source.syncing" : "source.sync"))}</button>
+        <button data-embedding-ensure="${escapeAttr(source.id)}" type="button" ${activeEmbeddingSourceIDs.has(source.id) ? "disabled" : ""}>${escapeHTML(t(activeEmbeddingSourceIDs.has(source.id) ? "source.vector_ensuring" : "source.vector_ensure"))}</button>
         <button data-sync-tasks-source="${escapeAttr(source.id)}" type="button">${escapeHTML(t("sync.view_tasks"))}</button>
         <button data-artifacts="${escapeAttr(source.id)}" type="button">${escapeHTML(t("source.artifacts"))}</button>
         <button data-delete="${escapeAttr(source.id)}" type="button">${escapeHTML(t("source.delete"))}</button>
@@ -740,6 +745,47 @@ async function loadSources() {
     container.appendChild(item);
   });
   populateSyncSourceSelects();
+  await loadSourceEmbeddingStatuses(sources);
+}
+
+async function loadSourceEmbeddingStatuses(sources) {
+  await Promise.all(sources.map(async (source) => {
+    const target = document.querySelector(`[data-embedding-status="${CSS.escape(source.id)}"]`);
+    if (!target) return;
+    try {
+      const status = await request(`/api/sources/${encodeURIComponent(source.id)}/embedding-status`);
+      target.textContent = formatEmbeddingStatus(source.id, status);
+      target.classList.toggle("warn", status.status === "disabled" || (status.status === "indexing" && !activeEmbeddingSourceIDs.has(source.id)));
+    } catch (error) {
+      target.textContent = t("source.vector_status_error");
+      target.classList.add("warn");
+    }
+  }));
+}
+
+function formatEmbeddingStatus(sourceID, status) {
+  const label = t("source.vector_status");
+  if (!status?.enabled) {
+    return `${label}: ${t("source.vector_disabled")}`;
+  }
+  const total = Number(status.total_sections || 0);
+  const embedded = Number(status.embedded_sections || 0);
+  const stale = Number(status.stale_sections || 0);
+  const pending = Number(status.pending_sections || 0);
+  const state = embeddingStateLabel(sourceID, status);
+  return `${label}: ${state} ${embedded}/${total} (${pending} pending, ${stale} stale)`;
+}
+
+function embeddingStateLabel(sourceID, status) {
+  if (!status?.enabled) return t("source.vector_disabled");
+  if (activeEmbeddingSourceIDs.has(sourceID)) return t("source.vector_indexing");
+  if (status.status === "ready") return t("source.vector_ready");
+  const pending = Number(status.pending_sections || 0);
+  const stale = Number(status.stale_sections || 0);
+  if (pending > 0 && stale > 0) return t("source.vector_pending_stale");
+  if (pending > 0) return t("source.vector_pending");
+  if (stale > 0) return t("source.vector_stale");
+  return t("source.vector_ready");
 }
 
 async function loadActiveSyncSourceIDs() {
@@ -749,6 +795,18 @@ async function loadActiveSyncSourceIDs() {
     (body.jobs || []).forEach((job) => {
       if (job.source_id) {
         activeSyncSourceIDs.add(job.source_id);
+      }
+    });
+  }));
+}
+
+async function loadActiveEmbeddingSourceIDs() {
+  const statuses = ["queued", "running", "canceling"];
+  await Promise.all(statuses.map(async (status) => {
+    const body = await request(`/api/jobs?kind=maintenance_embedding_ensure&status=${encodeURIComponent(status)}&limit=100`);
+    (body.jobs || []).forEach((job) => {
+      if (job.source_id) {
+        activeEmbeddingSourceIDs.add(job.source_id);
       }
     });
   }));
@@ -997,7 +1055,7 @@ function formatSourceSyncStatus(source) {
 }
 
 async function onSourcesClick(event) {
-  const button = event.target.closest("button[data-edit], button[data-sync], button[data-sync-tasks-source], button[data-artifacts], button[data-artifact-page], button[data-delete], button[data-open-node], button[data-open-document], button[data-save-desc]");
+  const button = event.target.closest("button[data-edit], button[data-sync], button[data-embedding-ensure], button[data-sync-tasks-source], button[data-artifacts], button[data-artifact-page], button[data-delete], button[data-open-node], button[data-open-document], button[data-save-desc]");
   if (!button) return;
 
   if (button.dataset.edit) {
@@ -1077,6 +1135,28 @@ async function onSourcesClick(event) {
     switchSyncTaskTab("history");
     syncHistoryOffset = 0;
     await navigate("sync-tasks");
+    return;
+  }
+
+  if (button.dataset.embeddingEnsure) {
+    const sourceID = button.dataset.embeddingEnsure;
+    if (!sourceID || activeEmbeddingSourceIDs.has(sourceID)) {
+      return;
+    }
+    button.disabled = true;
+    button.textContent = t("source.vector_ensuring");
+    try {
+      await request(`/api/maintenance/embedding-ensure?source_id=${encodeURIComponent(sourceID)}`, { method: "POST" });
+      activeEmbeddingSourceIDs.add(sourceID);
+      showToast(t("source.vector_ensure_queued"));
+      await loadSources();
+      await loadSyncTasksView();
+      await loadStatus();
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = t("source.vector_ensure");
+      alert(error.message);
+    }
     return;
   }
 
@@ -1235,11 +1315,12 @@ async function loadSyncJobHistory() {
   const data = form ? new FormData(form) : new FormData();
   const limit = parseInt(data.get("limit"), 10) || SYNC_HISTORY_PAGE_SIZE;
   const params = new URLSearchParams();
-  params.set("kind", "sync_source");
   params.set("limit", String(limit));
   params.set("offset", String(syncHistoryOffset));
+  const kind = String(data.get("kind") || "").trim();
   const sourceID = String(data.get("source_id") || "").trim();
   const status = String(data.get("status") || "").trim();
+  if (kind) params.set("kind", kind);
   if (sourceID) params.set("source_id", sourceID);
   if (status) params.set("status", status);
   const body = await request(`/api/jobs?${params.toString()}`);
@@ -1264,19 +1345,19 @@ function renderSyncJobRow(job) {
   const brokenLinks = Array.isArray(summary.broken_links) ? summary.broken_links : [];
   const error = String(job.last_error || "").trim();
   const active = isActiveJobStatus(job.status);
-  const actionButton = active
+  const isSyncJob = job.kind === "sync_source";
+  const actionButton = active && isSyncJob
     ? `<button type="button" data-source-id="${escapeAttr(job.source_id || "")}" data-cancel-sync-job="${escapeAttr(job.id || "")}">${escapeHTML(t("jobs.cancel"))}</button>`
-    : `<button type="button" data-source-id="${escapeAttr(job.source_id || "")}" data-delete-sync-job="${escapeAttr(job.id || "")}">${escapeHTML(t("jobs.delete"))}</button>`;
+    : isSyncJob ? `<button type="button" data-source-id="${escapeAttr(job.source_id || "")}" data-delete-sync-job="${escapeAttr(job.id || "")}">${escapeHTML(t("jobs.delete"))}</button>` : "";
   return `
     <div class="job-row">
       <div class="job-main">
-        <strong>${escapeHTML(formatJobStatus(job.status))}</strong>
+        <strong>${escapeHTML(formatJobKind(job.kind))} · ${escapeHTML(formatJobStatus(job.status))}</strong>
         <small>${escapeHTML(formatJobTime(job.updated_at || job.created_at))}</small>
       </div>
       <small>${escapeHTML(sourceName)} · ${escapeHTML(job.id || "")}</small>
       <div class="job-meta">
-        <span>${escapeHTML(t("jobs.documents"))}: ${escapeHTML(summary.documents ?? 0)}</span>
-        <span>${escapeHTML(t("jobs.broken_links"))}: ${escapeHTML(brokenLinks.length)}</span>
+        ${renderJobMetrics(job, summary, progress, brokenLinks)}
         <span>${escapeHTML(t("sync.attempts"))}: ${escapeHTML(job.attempts ?? 0)}</span>
         ${progress.phase ? `<span>${escapeHTML(t("jobs.progress"))}: ${escapeHTML(formatJobProgress(progress))}</span>` : ""}
       </div>
@@ -1288,6 +1369,36 @@ function renderSyncJobRow(job) {
       </div>
     </div>
   `;
+}
+
+function renderJobMetrics(job, summary, progress, brokenLinks) {
+  if (job.kind === "maintenance_embedding_ensure") {
+    return `
+      <span>${escapeHTML(t("jobs.embedding.embedded"))}: ${escapeHTML(summary.embedded_sections ?? progress.embedded_sections ?? 0)}</span>
+      <span>${escapeHTML(t("jobs.embedding.skipped"))}: ${escapeHTML(summary.skipped_sections ?? progress.skipped_sections ?? 0)}</span>
+      <span>${escapeHTML(t("jobs.embedding.scanned"))}: ${escapeHTML(summary.scanned_sections ?? progress.scanned_sections ?? 0)}</span>
+      <span>${escapeHTML(t("jobs.embedding.embedded_chunks"))}: ${escapeHTML(summary.embedded_chunks ?? progress.embedded_chunks ?? 0)}</span>
+      <span>${escapeHTML(t("jobs.embedding.scanned_chunks"))}: ${escapeHTML(summary.scanned_chunks ?? progress.scanned_chunks ?? 0)}</span>
+      <span>${escapeHTML(t("jobs.embedding.pending_batch"))}: ${escapeHTML(progress.pending_batch_sections ?? 0)}</span>
+      <span>${escapeHTML(t("jobs.embedding.pending_batch_chunks"))}: ${escapeHTML(progress.pending_batch_chunks ?? 0)}</span>
+      <span>${escapeHTML(t("status.sections"))}: ${escapeHTML(summary.total_sections ?? progress.total_sections ?? 0)}</span>
+    `;
+  }
+  return `
+    <span>${escapeHTML(t("jobs.documents"))}: ${escapeHTML(summary.documents ?? 0)}</span>
+    <span>${escapeHTML(t("jobs.broken_links"))}: ${escapeHTML(brokenLinks.length)}</span>
+  `;
+}
+
+function formatJobKind(kind) {
+  switch (kind) {
+    case "sync_source":
+      return t("jobs.kind.sync");
+    case "maintenance_embedding_ensure":
+      return t("jobs.kind.embedding");
+    default:
+      return humanizeToken(kind || "job");
+  }
 }
 
 function isActiveJobStatus(status) {
@@ -1523,6 +1634,7 @@ function renderSourceArtifacts(body, page, limit) {
   const sectionEntities = body.section_entities || [];
   const nodes = body.nodes || [];
   const edges = body.edges || [];
+  const embeddingStatus = body.embedding_status || null;
   const totalDocs = counts.documents ?? 0;
   const start = page * limit;
   const end = Math.min(start + documents.length, totalDocs);
@@ -1544,6 +1656,7 @@ function renderSourceArtifacts(body, page, limit) {
       <span>${escapeHTML(t("status.nodes"))}: ${escapeHTML(counts.nodes ?? 0)}</span>
       <span>${escapeHTML(t("status.edges"))}: ${escapeHTML(counts.edges ?? 0)}</span>
     </div>
+    ${renderEmbeddingArtifactSummary(sourceID, embeddingStatus)}
     ${renderSourceHealth(health)}
     ${paginationBar}
     ${renderArtifactList(t("artifacts.documents"), documents.map((doc) => `
@@ -1582,6 +1695,33 @@ function renderSourceArtifacts(body, page, limit) {
         <small>${escapeHTML(edge.id)} · ${escapeHTML(edge.provenance)} ${escapeHTML(edge.evidence_section_id || "")}</small>
       </div>
     `))}
+  `;
+}
+
+function renderEmbeddingArtifactSummary(sourceID, status) {
+  if (!status) return "";
+  const total = Number(status.total_sections || 0);
+  const embedded = Number(status.embedded_sections || 0);
+  const pending = Number(status.pending_sections || 0);
+  const stale = Number(status.stale_sections || 0);
+  const totalChunks = Number(status.total_chunks || 0);
+  const embeddedChunks = Number(status.embedded_chunks || 0);
+  const pendingChunks = Number(status.pending_chunks || 0);
+  const staleChunks = Number(status.stale_chunks || 0);
+  return `
+    <div class="artifact-summary">
+      <span>${escapeHTML(t("artifacts.embedding_status"))}: ${escapeHTML(embeddingStateLabel(sourceID, status))}</span>
+      <span>${escapeHTML(t("source.vector_ready"))}: ${escapeHTML(`${embedded}/${total}`)}</span>
+      <span>${escapeHTML(t("source.vector_pending"))}: ${escapeHTML(pending)}</span>
+      <span>${escapeHTML(t("source.vector_stale"))}: ${escapeHTML(stale)}</span>
+      <span>${escapeHTML(t("artifacts.embedding_chunks"))}: ${escapeHTML(`${embeddedChunks}/${totalChunks}`)}</span>
+      <span>${escapeHTML(t("artifacts.embedding_chunk_pending"))}: ${escapeHTML(pendingChunks)}</span>
+      <span>${escapeHTML(t("artifacts.embedding_chunk_stale"))}: ${escapeHTML(staleChunks)}</span>
+      ${status.model ? `<span>${escapeHTML(t("artifacts.embedding_model"))}: ${escapeHTML(status.model)}</span>` : ""}
+      ${status.tokenizer ? `<span>${escapeHTML(t("artifacts.embedding_tokenizer"))}: ${escapeHTML(status.tokenizer)}</span>` : ""}
+      ${status.chunk_strategy ? `<span>${escapeHTML(t("artifacts.embedding_strategy"))}: ${escapeHTML(status.chunk_strategy)}</span>` : ""}
+      ${status.generator_version ? `<span>${escapeHTML(t("artifacts.embedding_generator"))}: ${escapeHTML(status.generator_version)}</span>` : ""}
+    </div>
   `;
 }
 
@@ -1762,6 +1902,8 @@ async function onSearchSubmit(event) {
       return;
     }
     summary.textContent = t("search.result_count", { count: body.hits.length, query });
+    container.insertAdjacentHTML("beforeend", renderHybridSearchMeta(body));
+    container.insertAdjacentHTML("beforeend", renderSearchAttempts(body));
     body.hits.forEach((hit) => {
       const item = document.createElement("div");
       item.className = "search-result";
@@ -1772,11 +1914,13 @@ async function onSearchSubmit(event) {
       const matchedFields = hit.query_match?.matched_fields || [];
       const matchedEntities = hit.matched_entities || [];
       const relationMatches = renderRelationMatches(hit.relation_matches || []);
-      const scoreBreakdown = renderScoreBreakdown(hit.score_breakdown, hit.rank);
+      const scoreBreakdown = renderScoreBreakdown(hit.score_breakdown, hit.rank, hit.rrf_contribution);
+      const evidence = renderEvidence(hit);
       item.innerHTML = `
         <button class="result-title result-title-button" type="button" data-open-document="${escapeAttr(hit.document_id || "")}">${escapeHTML(title)}</button>
         <div class="result-url">${escapeHTML(url)}</div>
         <div class="result-path">${escapeHTML(path || hit.document_id)}</div>
+        ${evidence}
         ${hit.desc ? `<p class="result-desc">${escapeHTML(hit.desc)}</p>` : ""}
         ${tags.length ? `<div class="result-tags">${tags.slice(0, 6).map((tag) => `<span>${escapeHTML(tag)}</span>`).join("")}</div>` : ""}
         ${matchedFields.length ? `<small class="result-match">${escapeHTML(t("search.matched_fields"))}: ${escapeHTML(matchedFields.join(", "))}</small>` : ""}
@@ -1801,6 +1945,48 @@ async function onSearchSubmit(event) {
   }
 }
 
+function renderHybridSearchMeta(body) {
+  const meta = body.hybrid_search_meta;
+  if (!meta) return "";
+  const routeLabel = { entity: "Entity/Code", conceptual: "Conceptual/Q&A", general: "General" };
+  const route = routeLabel[meta.intent_route] || meta.intent_route || "general";
+  const wText = Number(meta.w_text ?? 0.5);
+  const wVector = Number(meta.w_vector ?? 0.5);
+  const rrfK = Number(meta.rrf_k ?? 60);
+  const textCount = Number(meta.text_candidates ?? 0);
+  const vecCount = Number(meta.vector_candidates ?? 0);
+  const minSim = Number(meta.vector_min_similarity ?? 0);
+  return `
+    <div class="hybrid-search-meta">
+      <span class="meta-route">${escapeHTML(route)}</span>
+      <span>w_text=${formatScore(wText)} w_vec=${formatScore(wVector)}</span>
+      <span>k=${rrfK}</span>
+      <span>text:${textCount} vec:${vecCount}</span>
+      ${vecCount ? `<span>min_sim=${formatScore(minSim)}</span>` : ""}
+    </div>
+  `;
+}
+
+function renderSearchAttempts(body) {
+  const attempts = body.attempts || [];
+  if (!attempts.length && !body.searches_used) return "";
+  return `
+    <details class="result-score search-attempts" open>
+      <summary>
+        <span>${escapeHTML(t("search.attempts"))}</span>
+        <strong>${escapeHTML(String(body.searches_used || attempts.length || 0))}</strong>
+        ${attempts.length ? `<small>${attempts.map((attempt) => `${escapeHTML(attempt.kind || "")} ${Number(attempt.hits || 0)}`).join(" · ")}</small>` : ""}
+      </summary>
+      <div class="score-grid">
+        ${attempts.map((attempt) => `
+          <span>${escapeHTML([attempt.kind || "", attempt.query || (attempt.terms || []).join(", ")].filter(Boolean).join(": "))}</span>
+          <strong>${escapeHTML(attempt.error ? `${Number(attempt.hits || 0)} · ${attempt.error}` : String(Number(attempt.hits || 0)))}</strong>
+        `).join("")}
+      </div>
+    </details>
+  `;
+}
+
 function renderRelationMatches(matches) {
   if (!matches.length) return "";
   return `
@@ -1817,8 +2003,93 @@ function renderRelationMatches(matches) {
   `;
 }
 
-function renderScoreBreakdown(score, rank) {
-  if (!score && rank === undefined) return "";
+function renderEvidence(hit) {
+  const trace = hit.trace || {};
+  const evidenceLevel = hit.evidence_level || "";
+  const traceParts = [
+    trace.source_id ? `source ${trace.source_id}` : "",
+    trace.document_id ? `doc ${trace.document_id}` : "",
+    trace.section_id ? `section ${trace.section_id}` : "",
+    trace.chunk_id ? `chunk ${trace.chunk_id}` : "",
+    Number.isFinite(Number(trace.chunk_ordinal)) && Number(trace.chunk_ordinal) > 0 ? `chunk# ${trace.chunk_ordinal}` : "",
+    trace.vector_trace_valid ? "trace valid" : "",
+  ].filter(Boolean);
+  if (!evidenceLevel && !traceParts.length) return "";
+  return `
+    <div class="result-tags">
+      ${evidenceLevel ? `<span>${escapeHTML(evidenceLevel)}</span>` : ""}
+      ${traceParts.length ? `<span>${escapeHTML(traceParts.join(" · "))}</span>` : ""}
+    </div>
+  `;
+}
+
+function renderScoreBreakdown(score, rank, rrf) {
+  if (!score && rank === undefined && !rrf) return "";
+  // When RRF contribution exists, show RRF score as primary, ScoreBreakdown as explanation
+  if (rrf) {
+    const rrfScore = Number(rrf.final_score ?? rrf.rrf_score ?? 0);
+    const textRank = rrf.text_rank || "-";
+    const vectorRank = rrf.vector_rank || "-";
+    const rawSim = Number(rrf.raw_similarity ?? 0);
+    const rawBM25 = Number(rrf.raw_bm25_score ?? 0);
+    const multiplier = Number(rrf.multiplier ?? 1);
+    const sources = (rrf.source_evidence || []).join(", ");
+    const rrfSummaryParts = [
+      rrf.text_rank ? `text#${textRank}` : "",
+      rrf.vector_rank ? `vec#${vectorRank}` : "",
+      rawSim ? `sim=${formatScore(rawSim)}` : "",
+      rawBM25 ? `bm25=${formatScore(rawBM25)}` : "",
+      multiplier !== 1 ? `×${formatScore(multiplier)}` : "",
+    ].filter(Boolean);
+    const breakdownParts = score ? [
+      ["unicode", score.unicode_bm25_boost],
+      ["trigram", score.trigram_bm25_boost],
+      ["title", score.title_boost],
+      ["section", score.section_boost],
+      ["symbol", score.symbol_boost],
+      ["exact", score.exact_match_boost],
+      ["canonical", score.canonical_boost],
+      ["coverage", score.coverage_boost],
+      ["fallback", score.fallback_boost],
+      ["vector", score.vector_boost],
+    ].filter(([, value]) => Number(value || 0) !== 0) : [];
+    const terms = score?.matched_terms || [];
+    const symbols = score?.matched_symbols || [];
+    const fields = score?.matched_fields || [];
+    return `
+      <details class="result-score">
+        <summary>
+          <span>RRF</span>
+          <strong>${formatScore(rrfScore)}</strong>
+          ${rrfSummaryParts.length ? `<small>${rrfSummaryParts.map(p => escapeHTML(p)).join(" · ")}</small>` : ""}
+        </summary>
+        <div class="score-grid">
+          <span>rrf_score</span><strong>${formatScore(rrf.rrf_score)}</strong>
+          <span>final_score</span><strong>${formatScore(rrfScore)}</strong>
+          <span>text_rank</span><strong>${escapeHTML(String(textRank))}</strong>
+          <span>vector_rank</span><strong>${escapeHTML(String(vectorRank))}</strong>
+          <span>text_rrf</span><strong>${formatScore(rrf.text_rrf)}</strong>
+          <span>vector_rrf</span><strong>${formatScore(rrf.vector_rrf)}</strong>
+          ${rawSim ? `<span>raw_similarity</span><strong>${formatScore(rawSim)}</strong>` : ""}
+          ${rawBM25 ? `<span>raw_bm25</span><strong>${formatScore(rawBM25)}</strong>` : ""}
+          <span>multiplier</span><strong>${formatScore(multiplier)}</strong>
+          ${sources ? `<span>sources</span><strong>${escapeHTML(sources)}</strong>` : ""}
+        </div>
+        ${breakdownParts.length ? `
+          <div class="score-grid" style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px">
+            ${breakdownParts.map(([name, value]) => `
+              <span>${escapeHTML(name)}</span>
+              <strong>${formatScore(value)}</strong>
+            `).join("")}
+          </div>
+        ` : ""}
+        ${fields.length ? `<p><b>fields</b> ${escapeHTML(fields.join(", "))}</p>` : ""}
+        ${symbols.length ? `<p><b>symbols</b> ${escapeHTML(symbols.slice(0, 12).join(", "))}</p>` : ""}
+        ${terms.length ? `<p><b>terms</b> ${escapeHTML(terms.slice(0, 16).join(", "))}</p>` : ""}
+      </details>
+    `;
+  }
+  // No RRF data — show legacy ScoreBreakdown (text-only mode)
   const total = Number(score?.total ?? rank ?? 0);
   if (!score) {
     return `<div class="result-score"><span>Total ${formatScore(total)}</span></div>`;
@@ -1833,6 +2104,9 @@ function renderScoreBreakdown(score, rank) {
     ["canonical", score.canonical_boost],
     ["coverage", score.coverage_boost],
     ["fallback", score.fallback_boost],
+    ["vector", score.vector_boost],
+    ["vector penalty", -Number(score.vector_only_penalty || 0)],
+    ["stale embedding", -Number(score.stale_embedding_penalty || 0)],
   ].filter(([, value]) => Number(value || 0) !== 0);
   const terms = score.matched_terms || [];
   const symbols = score.matched_symbols || [];
@@ -1860,7 +2134,11 @@ function renderScoreBreakdown(score, rank) {
 function formatScore(value) {
   const n = Number(value || 0);
   if (!Number.isFinite(n)) return "0";
-  return n.toFixed(Math.abs(n) >= 10 ? 1 : 2);
+  if (Math.abs(n) >= 100) return n.toFixed(0);
+  if (Math.abs(n) >= 10) return n.toFixed(1);
+  if (Math.abs(n) >= 0.1) return n.toFixed(2);
+  if (Math.abs(n) >= 0.001) return n.toFixed(4);
+  return n.toFixed(6);
 }
 
 async function onSearchFeedbackClick(event) {

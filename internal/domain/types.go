@@ -192,8 +192,10 @@ type EntityDiagnostics struct {
 type SearchHit struct {
 	SectionID              string            `json:"section_id"`
 	DocumentID             string            `json:"document_id"`
+	SourceID               string            `json:"source_id,omitempty"`
 	DocumentTitle          string            `json:"document_title"`
 	DocumentURL            string            `json:"document_url"`
+	ContentHash            string            `json:"content_hash,omitempty"`
 	Desc                   string            `json:"desc,omitempty"`
 	Canonical              bool              `json:"canonical"`
 	Title                  string            `json:"title"`
@@ -209,6 +211,26 @@ type SearchHit struct {
 	ScoreBreakdown         *ScoreBreakdown   `json:"score_breakdown,omitempty"`
 	MatchedEntities        []MatchedEntity   `json:"matched_entities,omitempty"`
 	RelationMatches        []RelationMatch   `json:"relation_matches,omitempty"`
+	EvidenceLevel          string            `json:"evidence_level,omitempty"`
+	Trace                  *SearchHitTrace   `json:"trace,omitempty"`
+	RRFContribution        *RRFContribution  `json:"rrf_contribution,omitempty"`
+}
+
+type SearchHitTrace struct {
+	SourceID             string `json:"source_id,omitempty"`
+	DocumentID           string `json:"document_id,omitempty"`
+	SectionID            string `json:"section_id,omitempty"`
+	ChunkID              string `json:"chunk_id,omitempty"`
+	ChunkOrdinal         int    `json:"chunk_ordinal,omitempty"`
+	ContentHash          string `json:"content_hash,omitempty"`
+	EmbeddingModel       string `json:"embedding_model,omitempty"`
+	EmbeddingTextHash    string `json:"embedding_text_hash,omitempty"`
+	ChunkTextHash        string `json:"chunk_text_hash,omitempty"`
+	EmbeddingGeneratedAt string `json:"embedding_generated_at,omitempty"`
+	GeneratorVersion     string `json:"generator_version,omitempty"`
+	Tokenizer            string `json:"tokenizer,omitempty"`
+	ChunkStrategy        string `json:"chunk_strategy,omitempty"`
+	VectorTraceValid     bool   `json:"vector_trace_valid,omitempty"`
 }
 
 type SearchHitProfile struct {
@@ -235,32 +257,154 @@ type QueryMatch struct {
 }
 
 type ScoreBreakdown struct {
-	UnicodeBM25Boost float64  `json:"unicode_bm25_boost,omitempty"`
-	TrigramBM25Boost float64  `json:"trigram_bm25_boost,omitempty"`
-	TitleBoost       float64  `json:"title_boost,omitempty"`
-	SectionBoost     float64  `json:"section_boost,omitempty"`
-	SymbolBoost      float64  `json:"symbol_boost,omitempty"`
-	ExactMatchBoost  float64  `json:"exact_match_boost,omitempty"`
-	CanonicalBoost   float64  `json:"canonical_boost,omitempty"`
-	CoverageBoost    float64  `json:"coverage_boost,omitempty"`
-	FallbackBoost    float64  `json:"fallback_boost,omitempty"`
-	Total            float64  `json:"total"`
-	MatchedFields    []string `json:"matched_fields,omitempty"`
-	MatchedTerms     []string `json:"matched_terms,omitempty"`
-	MatchedSymbols   []string `json:"matched_symbols,omitempty"`
+	UnicodeBM25Boost      float64  `json:"unicode_bm25_boost,omitempty"`
+	TrigramBM25Boost      float64  `json:"trigram_bm25_boost,omitempty"`
+	TitleBoost            float64  `json:"title_boost,omitempty"`
+	SectionBoost          float64  `json:"section_boost,omitempty"`
+	SymbolBoost           float64  `json:"symbol_boost,omitempty"`
+	ExactMatchBoost       float64  `json:"exact_match_boost,omitempty"`
+	CanonicalBoost        float64  `json:"canonical_boost,omitempty"`
+	CoverageBoost         float64  `json:"coverage_boost,omitempty"`
+	FallbackBoost         float64  `json:"fallback_boost,omitempty"`
+	VectorBoost           float64  `json:"vector_boost,omitempty"`
+	VectorOnlyPenalty     float64  `json:"vector_only_penalty,omitempty"`
+	StaleEmbeddingPenalty float64  `json:"stale_embedding_penalty,omitempty"`
+	Total                 float64  `json:"total"`
+	MatchedFields         []string `json:"matched_fields,omitempty"`
+	MatchedTerms          []string `json:"matched_terms,omitempty"`
+	MatchedSymbols        []string `json:"matched_symbols,omitempty"`
 }
 
 type SearchOptions struct {
-	Query                  string
-	Limit                  int
-	MaxSearches            int
-	MaxSectionsPerDocument int
-	ProfileDetail          string
-	MaxCharsPerResult      int
-	Detail                 string // "summary" (default) or "content"
-	UseRelationExpansion   bool
-	RelationDepth          int
-	RelationTypes          []string
+	Query                     string
+	Limit                     int
+	MaxSearches               int
+	MaxSectionsPerDocument    int
+	ProfileDetail             string
+	MaxCharsPerResult         int
+	Detail                    string // "summary" (default) or "content"
+	UseRelationExpansion      bool
+	RelationDepth             int
+	RelationTypes             []string
+	OriginalQuery             string
+	ExactTerms                []string
+	SemanticIntents           []string
+	EmbeddingGeneratorVersion string
+}
+
+type SectionEmbeddingInput struct {
+	SectionID         string
+	DocumentID        string
+	SourceID          string
+	Model             string
+	Dimensions        int
+	Embedding         []float32
+	ContentHash       string
+	EmbeddingTextHash string
+	GeneratorVersion  string
+}
+
+type EmbeddingChunkInput struct {
+	ChunkID            string
+	SectionID          string
+	DocumentID         string
+	SourceID           string
+	ChunkOrdinal       int
+	ChunkStartToken    int
+	ChunkTokenCount    int
+	ChunkText          string
+	Model              string
+	Dimensions         int
+	Embedding          []float32
+	SectionContentHash string
+	ChunkTextHash      string
+	Tokenizer          string
+	ChunkStrategy      string
+	GeneratorVersion   string
+}
+
+type VectorSearchHit struct {
+	ChunkID            string  `json:"chunk_id,omitempty"`
+	SectionID          string  `json:"section_id"`
+	DocumentID         string  `json:"document_id"`
+	SourceID           string  `json:"source_id"`
+	ChunkOrdinal       int     `json:"chunk_ordinal,omitempty"`
+	ChunkText          string  `json:"chunk_text,omitempty"`
+	Similarity         float64 `json:"similarity"`
+	Model              string  `json:"model"`
+	ContentHash        string  `json:"content_hash,omitempty"`
+	SectionContentHash string  `json:"section_content_hash,omitempty"`
+	EmbeddingTextHash  string  `json:"embedding_text_hash,omitempty"`
+	ChunkTextHash      string  `json:"chunk_text_hash,omitempty"`
+	Tokenizer          string  `json:"tokenizer,omitempty"`
+	ChunkStrategy      string  `json:"chunk_strategy,omitempty"`
+	GeneratorVersion   string  `json:"generator_version"`
+	GeneratedAt        string  `json:"generated_at"`
+}
+
+type SectionEmbeddingHash struct {
+	SectionID         string `json:"section_id"`
+	DocumentID        string `json:"document_id,omitempty"`
+	SourceID          string `json:"source_id,omitempty"`
+	Model             string `json:"model,omitempty"`
+	ContentHash       string `json:"content_hash"`
+	EmbeddingTextHash string `json:"embedding_text_hash"`
+	GeneratorVersion  string `json:"generator_version"`
+	GeneratedAt       string `json:"generated_at,omitempty"`
+}
+
+type EmbeddingCoverage struct {
+	EmbeddedSections int `json:"embedded_sections"`
+	EmbeddedChunks   int `json:"embedded_chunks"`
+}
+
+type EmbeddingChunkHash struct {
+	ChunkID            string `json:"chunk_id"`
+	SectionID          string `json:"section_id"`
+	DocumentID         string `json:"document_id,omitempty"`
+	SourceID           string `json:"source_id,omitempty"`
+	ChunkOrdinal       int    `json:"chunk_ordinal"`
+	Model              string `json:"model,omitempty"`
+	SectionContentHash string `json:"section_content_hash"`
+	ChunkTextHash      string `json:"chunk_text_hash"`
+	Tokenizer          string `json:"tokenizer,omitempty"`
+	ChunkStrategy      string `json:"chunk_strategy,omitempty"`
+	GeneratorVersion   string `json:"generator_version"`
+	GeneratedAt        string `json:"generated_at,omitempty"`
+}
+
+type EmbeddingStatus struct {
+	SourceID         string `json:"source_id,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	Status           string `json:"status,omitempty"`
+	Reason           string `json:"reason,omitempty"`
+	Backend          string `json:"backend,omitempty"`
+	TotalSections    int    `json:"total_sections"`
+	EmbeddedSections int    `json:"embedded_sections"`
+	PendingSections  int    `json:"pending_sections"`
+	StaleSections    int    `json:"stale_sections"`
+	TotalChunks      int    `json:"total_chunks"`
+	EmbeddedChunks   int    `json:"embedded_chunks"`
+	PendingChunks    int    `json:"pending_chunks"`
+	StaleChunks      int    `json:"stale_chunks"`
+	Model            string `json:"model"`
+	Tokenizer        string `json:"tokenizer,omitempty"`
+	ChunkStrategy    string `json:"chunk_strategy,omitempty"`
+	GeneratorVersion string `json:"generator_version"`
+}
+
+type EmbeddingSection struct {
+	SectionID     string
+	DocumentID    string
+	SourceID      string
+	SourceName    string
+	ProductHint   string
+	ModuleHint    string
+	DocumentTitle string
+	HeadingPath   string
+	Title         string
+	Content       string
+	ContentHash   string
 }
 
 type SearchAttempt struct {
@@ -268,14 +412,40 @@ type SearchAttempt struct {
 	Query string   `json:"query,omitempty"`
 	Terms []string `json:"terms,omitempty"`
 	Hits  int      `json:"hits"`
+	Error string   `json:"error,omitempty"`
 }
 
 type SearchResult struct {
-	Query          string          `json:"query"`
-	SearchesUsed   int             `json:"searches_used"`
-	Attempts       []SearchAttempt `json:"attempts"`
-	Hits           []SearchHit     `json:"hits"`
-	SuggestedReads SuggestedReads  `json:"suggested_reads"`
+	Query            string            `json:"query"`
+	SearchesUsed     int               `json:"searches_used"`
+	Attempts         []SearchAttempt   `json:"attempts"`
+	Hits             []SearchHit       `json:"hits"`
+	SuggestedReads   SuggestedReads    `json:"suggested_reads"`
+	HybridSearchMeta *HybridSearchMeta `json:"hybrid_search_meta,omitempty"`
+}
+
+type HybridSearchMeta struct {
+	IntentRoute         string  `json:"intent_route"`
+	WText               float64 `json:"w_text"`
+	WVector             float64 `json:"w_vector"`
+	RRFK                float64 `json:"rrf_k"`
+	TextCandidates      int     `json:"text_candidates"`
+	VectorCandidates    int     `json:"vector_candidates"`
+	VectorMinSimilarity float64 `json:"vector_min_similarity"`
+}
+
+type RRFContribution struct {
+	TextRank       int      `json:"text_rank,omitempty"`
+	VectorRank     int      `json:"vector_rank,omitempty"`
+	TextRRF        float64  `json:"text_rrf,omitempty"`
+	VectorRRF      float64  `json:"vector_rrf,omitempty"`
+	RRFScore       float64  `json:"rrf_score"`
+	FinalScore     float64  `json:"final_score"`
+	Multiplier     float64  `json:"multiplier"`
+	RawSimilarity  float64  `json:"raw_similarity,omitempty"`
+	RawBM25Score   float64  `json:"raw_bm25_score,omitempty"`
+	SourceEvidence []string `json:"source_evidence,omitempty"`
+	DocumentID     string   `json:"document_id,omitempty"` // needed for per-doc section cap
 }
 
 type SuggestedReads struct {
@@ -423,6 +593,7 @@ type SectionSummary struct {
 	Title          string `json:"title"`
 	HeadingPath    string `json:"heading_path"`
 	ContentSnippet string `json:"content_snippet"`
+	ContentHash    string `json:"content_hash,omitempty"`
 	Ordinal        int    `json:"ordinal"`
 	NodeID         string `json:"node_id"`
 }
@@ -452,6 +623,7 @@ type SourceArtifactCounts struct {
 type SourceArtifacts struct {
 	SourceID          string               `json:"source_id"`
 	Counts            SourceArtifactCounts `json:"counts"`
+	EmbeddingStatus   *EmbeddingStatus     `json:"embedding_status,omitempty"`
 	EntityDiagnostics EntityDiagnostics    `json:"entity_diagnostics"`
 	Documents         []DocumentSummary    `json:"documents"`
 	Sections          []SectionSummary     `json:"sections"`

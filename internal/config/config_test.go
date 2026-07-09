@@ -32,8 +32,32 @@ func TestDefault(t *testing.T) {
 	if cfg.Search.DSN != wantDSN {
 		t.Fatalf("Search.DSN = %q, want %q", cfg.Search.DSN, wantDSN)
 	}
-	if cfg.Vector.DSN != "none://" {
-		t.Fatalf("Vector.DSN = %q, want %q", cfg.Vector.DSN, "none://")
+	if cfg.VectorSearch.Enabled {
+		t.Fatal("VectorSearch.Enabled = true, want false")
+	}
+	if cfg.VectorSearch.SearchWeight != DefaultVectorSearchWeight {
+		t.Fatalf("VectorSearch.SearchWeight = %v, want %v", cfg.VectorSearch.SearchWeight, DefaultVectorSearchWeight)
+	}
+	if cfg.VectorSearch.VectorDB.DSN != "none://" {
+		t.Fatalf("VectorSearch.VectorDB.DSN = %q, want %q", cfg.VectorSearch.VectorDB.DSN, "none://")
+	}
+	if cfg.VectorSearch.Embedding.Provider != "none" {
+		t.Fatalf("VectorSearch.Embedding.Provider = %q, want none", cfg.VectorSearch.Embedding.Provider)
+	}
+	if cfg.VectorSearch.Embedding.BatchSize != 64 {
+		t.Fatalf("VectorSearch.Embedding.BatchSize = %d, want 64", cfg.VectorSearch.Embedding.BatchSize)
+	}
+	if cfg.VectorSearch.Embedding.Tokenizer != "auto" {
+		t.Fatalf("VectorSearch.Embedding.Tokenizer = %q, want auto", cfg.VectorSearch.Embedding.Tokenizer)
+	}
+	if cfg.VectorSearch.Embedding.ChunkStrategy != "auto" {
+		t.Fatalf("VectorSearch.Embedding.ChunkStrategy = %q, want auto", cfg.VectorSearch.Embedding.ChunkStrategy)
+	}
+	if cfg.VectorSearch.Embedding.GeneratorVersion != "embedding-chunk-v1" {
+		t.Fatalf("VectorSearch.Embedding.GeneratorVersion = %q, want embedding-chunk-v1", cfg.VectorSearch.Embedding.GeneratorVersion)
+	}
+	if cfg.VectorSearch.Embedding.Timeout.String() != "5m0s" {
+		t.Fatalf("VectorSearch.Embedding.Timeout = %s, want 5m0s", cfg.VectorSearch.Embedding.Timeout)
 	}
 	if cfg.Auth.Mode != "none" {
 		t.Fatalf("Auth.Mode = %q, want %q", cfg.Auth.Mode, "none")
@@ -71,8 +95,8 @@ func TestDefaultWithTokenAuthGeneratesLoadableConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile returned error: %v", err)
 	}
-	if !strings.Contains(string(data), "web_prefix:") || !strings.Contains(string(data), "job_workers:") {
-		t.Fatalf("written config = %s, want server.web_prefix and server.job_workers", string(data))
+	if !strings.Contains(string(data), "web_prefix:") || !strings.Contains(string(data), "job_workers:") || !strings.Contains(string(data), "search_weight:") || !strings.Contains(string(data), "chunk_strategy:") || !strings.Contains(string(data), "chunk_target_tokens:") || !strings.Contains(string(data), "max_batch_tokens:") {
+		t.Fatalf("written config = %s, want server.web_prefix, server.job_workers, vector_search.search_weight, and chunk embedding options", string(data))
 	}
 	loaded, err := Load(path)
 	if err != nil {
@@ -90,6 +114,36 @@ func TestDefaultWithTokenAuthGeneratesLoadableConfig(t *testing.T) {
 	}
 }
 
+func TestWriteMasksEmbeddingAPIKey(t *testing.T) {
+	cfg := Default()
+	cfg.VectorSearch.Embedding.APIKey = "sk-real-embedded-key-should-not-leak"
+	t.Setenv("DOCGRAPH_EMBEDDING_API_KEY", "from-env-embedding-key")
+	path := filepath.Join(t.TempDir(), "docgraph.yaml")
+
+	if err := Write(path, cfg); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	contents := string(data)
+	if strings.Contains(contents, cfg.VectorSearch.Embedding.APIKey) {
+		t.Fatalf("config write includes unmasked API key: %s", contents)
+	}
+	if !strings.Contains(contents, "api_key: \"${DOCGRAPH_EMBEDDING_API_KEY}\"") {
+		t.Fatalf("config write = %s, want embedded api key placeholder", contents)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(%q) returned error: %v", path, err)
+	}
+	if got := loaded.VectorSearch.Embedding.APIKey; got != "from-env-embedding-key" {
+		t.Fatalf("loaded config api_key = %q, want env var value", got)
+	}
+}
+
 func TestLoadAppliesOverridesAndKeepsDefaults(t *testing.T) {
 	path := writeConfig(t, `
 server:
@@ -102,6 +156,12 @@ storage:
   dsn: sqlite:///var/lib/docgraph/docgraph.db
 search:
   dsn: sqlite:///var/lib/docgraph/docgraph.db
+vector_search:
+  enabled: true
+  search_weight: 0.25
+  embedding:
+    tokenizer: conservative
+    chunk_strategy: recursive
 auth:
   mode: token
   token: test-token
@@ -133,8 +193,17 @@ auth:
 	if cfg.Search.DSN != cfg.Storage.DSN {
 		t.Fatalf("Search.DSN = %q, want storage DSN %q", cfg.Search.DSN, cfg.Storage.DSN)
 	}
-	if cfg.Vector.DSN != "none://" {
-		t.Fatalf("Vector.DSN = %q, want default %q", cfg.Vector.DSN, "none://")
+	if !cfg.VectorSearch.Enabled {
+		t.Fatal("VectorSearch.Enabled = false, want true")
+	}
+	if cfg.VectorSearch.SearchWeight != 0.25 {
+		t.Fatalf("VectorSearch.SearchWeight = %v, want 0.25", cfg.VectorSearch.SearchWeight)
+	}
+	if cfg.VectorSearch.VectorDB.DSN != "none://" {
+		t.Fatalf("VectorSearch.VectorDB.DSN = %q, want default %q", cfg.VectorSearch.VectorDB.DSN, "none://")
+	}
+	if cfg.VectorSearch.Embedding.Tokenizer != "conservative" || cfg.VectorSearch.Embedding.ChunkStrategy != "recursive" {
+		t.Fatalf("embedding tokenizer/strategy = %q/%q, want conservative/recursive", cfg.VectorSearch.Embedding.Tokenizer, cfg.VectorSearch.Embedding.ChunkStrategy)
 	}
 	if cfg.Auth.Mode != "token" {
 		t.Fatalf("Auth.Mode = %q, want %q", cfg.Auth.Mode, "token")

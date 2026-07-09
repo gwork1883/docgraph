@@ -1133,7 +1133,7 @@ code {
   font-weight: 700;
   font-style: italic;
   color: var(--text-emphasis);
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   line-height: 1.05;
 }
 
@@ -1431,6 +1431,29 @@ div.result-score {
   margin: 0;
   padding: 0 12px 10px;
   color: var(--text-muted);
+}
+
+.hybrid-search-meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 6px 12px;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--ink);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.hybrid-search-meta .meta-route {
+  background: var(--accent);
+  color: var(--paper);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
 }
 
 .result-snippet {

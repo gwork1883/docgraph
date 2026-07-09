@@ -8,18 +8,47 @@ import (
 	"io"
 	"strings"
 
+	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 // Handler processes individual MCP JSON-RPC messages, independent of transport.
 type Handler struct {
-	query *query.Service
-	store storage.Store
+	query                     *query.Service
+	store                     storage.Store
+	embedder                  embedding.Embedder
+	embeddingGeneratorVersion string
+	vectorSearchWeight        float64
 }
 
 func NewHandler(queryService *query.Service, store storage.Store) *Handler {
-	return &Handler{query: queryService, store: store}
+	return NewHandlerWithEmbedding(queryService, store, embedding.NewNoOpEmbedder(), embedding.DefaultGeneratorVersion)
+}
+
+func NewHandlerWithEmbedding(queryService *query.Service, store storage.Store, embedder embedding.Embedder, generatorVersion string) *Handler {
+	return NewHandlerWithEmbeddingAndSearchWeight(queryService, store, embedder, generatorVersion, 0.4)
+}
+
+func NewHandlerWithEmbeddingAndSearchWeight(queryService *query.Service, store storage.Store, embedder embedding.Embedder, generatorVersion string, vectorSearchWeight float64) *Handler {
+	if embedder == nil {
+		embedder = embedding.NewNoOpEmbedder()
+	}
+	if strings.TrimSpace(generatorVersion) == "" {
+		generatorVersion = embedding.DefaultGeneratorVersion
+	}
+	return &Handler{query: queryService, store: store, embedder: embedder, embeddingGeneratorVersion: generatorVersion, vectorSearchWeight: normalizeVectorSearchWeight(vectorSearchWeight)}
+}
+
+func normalizeVectorSearchWeight(weight float64) float64 {
+	if weight <= 0 {
+		return 0.4
+	}
+	if weight > 1 {
+		return 1
+	}
+	return weight
 }
 
 // Handle dispatches a single JSON-RPC request and returns the response.
@@ -40,6 +69,33 @@ func NewServer(queryService *query.Service, in io.Reader, out io.Writer) *Server
 
 func NewServerWithStore(queryService *query.Service, store storage.Store, in io.Reader, out io.Writer) *Server {
 	return &Server{handler: NewHandler(queryService, store), in: in, out: out}
+}
+
+func NewServerWithStoreAndEmbedding(queryService *query.Service, store storage.Store, embedder embedding.Embedder, generatorVersion string, vectorSearchWeight float64, in io.Reader, out io.Writer) *Server {
+	return NewServerWithStoreAndEmbeddingAndPlan(queryService, store, embedder, generatorVersion, vectorSearchWeight, "auto", "auto", in, out)
+}
+
+func NewServerWithStoreAndEmbeddingAndPlan(queryService *query.Service, store storage.Store, embedder embedding.Embedder, generatorVersion string, vectorSearchWeight float64, tokenizer string, chunkStrategy string, in io.Reader, out io.Writer) *Server {
+	if runtimeSetter, ok := store.(vectorstore.SearchRuntimeSetter); ok && embedder != nil && strings.TrimSpace(embedder.Model()) != "" {
+		tokenizer = strings.TrimSpace(tokenizer)
+		if tokenizer == "" {
+			tokenizer = "auto"
+		}
+		chunkStrategy = strings.TrimSpace(chunkStrategy)
+		if chunkStrategy == "" {
+			chunkStrategy = "auto"
+		}
+		runtimeSetter.SetVectorSearchRuntime(vectorstore.SearchRuntime{
+			Embedder:         embedder,
+			SearchWeight:     normalizeVectorSearchWeight(vectorSearchWeight),
+			VectorCandidates: 60,
+			MinSimilarity:    0,
+			GeneratorVersion: generatorVersion,
+			Tokenizer:        tokenizer,
+			ChunkStrategy:    chunkStrategy,
+		})
+	}
+	return &Server{handler: NewHandlerWithEmbeddingAndSearchWeight(queryService, store, embedder, generatorVersion, vectorSearchWeight), in: in, out: out}
 }
 
 type Request struct {
@@ -205,6 +261,8 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 			Detail                 string   `json:"detail"`
 			UseRelationExpansion   *bool    `json:"use_relation_expansion"`
 			RelationTypes          []string `json:"relation_types"`
+			ExactTerms             []string `json:"exact_terms"`
+			SemanticIntents        []string `json:"semantic_intents"`
 		}
 		if err := json.Unmarshal(call.Arguments, &args); err != nil {
 			return nil, fmt.Errorf("invalid doc_search arguments: %w", err)
@@ -222,16 +280,20 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 			useRelationExpansion = *args.UseRelationExpansion
 		}
 		opts := storage.SearchOptions{
-			Query:                  args.Query,
-			Limit:                  clampBudget(maxResults, 8, 30),
-			MaxSearches:            clampBudget(args.MaxSearches, 5, 5),
-			MaxSectionsPerDocument: clampBudget(args.MaxSectionsPerDocument, 2, 5),
-			ProfileDetail:          strings.TrimSpace(args.ProfileDetail),
-			MaxCharsPerResult:      clampBudget(args.MaxCharsPerResult, 1000, 4000),
-			Detail:                 detail,
-			UseRelationExpansion:   useRelationExpansion,
-			RelationDepth:          1,
-			RelationTypes:          args.RelationTypes,
+			Query:                     args.Query,
+			Limit:                     clampBudget(maxResults, 8, 30),
+			MaxSearches:               clampBudget(args.MaxSearches, 5, 5),
+			MaxSectionsPerDocument:    clampBudget(args.MaxSectionsPerDocument, 2, 5),
+			ProfileDetail:             strings.TrimSpace(args.ProfileDetail),
+			MaxCharsPerResult:         clampBudget(args.MaxCharsPerResult, 1000, 4000),
+			Detail:                    detail,
+			UseRelationExpansion:      useRelationExpansion,
+			RelationDepth:             1,
+			RelationTypes:             args.RelationTypes,
+			OriginalQuery:             args.Query,
+			ExactTerms:                args.ExactTerms,
+			SemanticIntents:           args.SemanticIntents,
+			EmbeddingGeneratorVersion: h.embeddingGeneratorVersion,
 		}
 		// In summary mode, profile_detail and max_chars_per_result are irrelevant
 		if detail == "summary" {
@@ -443,6 +505,30 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 	}
 }
 
+func (h *Handler) queryEmbedding(ctx context.Context, queryText string, intents []string, enabled bool) ([]float32, string, error) {
+	if !enabled || h.embedder == nil || strings.TrimSpace(h.embedder.Model()) == "" {
+		return nil, "", nil
+	}
+	texts := []string{strings.TrimSpace(queryText)}
+	texts = append(texts, intents...)
+	text := strings.Join(nonEmptyStrings(texts), "\n")
+	if text == "" {
+		return nil, "", nil
+	}
+	vectors, err := h.embedder.Embed(ctx, []string{text})
+	if err != nil {
+		return nil, "", err
+	}
+	if len(vectors) == 0 {
+		return nil, "", nil
+	}
+	return vectors[0], h.embedder.Model(), nil
+}
+
+func (h *Handler) canUseVectorCandidates() bool {
+	return h.embedder != nil && strings.TrimSpace(h.embedder.Model()) != ""
+}
+
 func toolResult(value any) any {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -463,6 +549,17 @@ func clampBudget(value int, fallback int, hardLimit int) int {
 		return hardLimit
 	}
 	return value
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func canonicalToolName(name string) string {
@@ -542,8 +639,8 @@ func tools() []map[string]any {
 	return []map[string]any{
 		{
 			"name": "doc_search",
-			"description": "Search indexed local documentation with hybrid retrieval over Chinese terms, technical symbols, identifier subterms, Unicode FTS, trigram matching, profile fallback, substring fallback, and maintained terminology dictionaries. " +
-				"Default detail='summary' returns section IDs, titles, heading paths, snippets, suggested_reads.explicit_references, and hit metadata; use detail='content' for one-shot full text or call doc_get_section for selected section IDs. " +
+			"description": "Search indexed local documentation with hybrid retrieval over Chinese terms, technical symbols, identifier subterms, Unicode FTS, trigram matching, profile fallback, substring fallback, and maintained terminology dictionaries. When vector search is enabled, results also include semantic vector candidates fused via intent-adaptive RRF. " +
+				"Default detail='summary' returns section IDs, titles, heading paths, snippets, suggested_reads.explicit_references, and hit metadata (plus hybrid diagnostics when vector search is enabled); use detail='content' for one-shot full text or call doc_get_section for selected section IDs. " +
 				"Preserve product names, business terms, config keys, schema fields, enum values, API names, paths, and code symbols verbatim; add clear aliases or module names only when they clarify intent. " +
 				"For troubleshooting, search with a concise issue intent plus exact user-provided terms; prefer evidence directly tied to the issue chain over keyword-only matches.",
 			"annotations": map[string]any{
@@ -600,6 +697,16 @@ func tools() []map[string]any {
 					"use_relation_expansion": map[string]any{
 						"type":        "boolean",
 						"description": "Whether to use approved knowledge relations for one-hop retrieval expansion and result explanations. Default true.",
+					},
+					"exact_terms": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Must-keep exact terms such as API paths, config keys, error codes, symbols, or identifiers. They continue through exact/lexical search even when semantic intents are supplied.",
+					},
+					"semantic_intents": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Optional semantic intent expansions for recall planning. They do not replace query or exact_terms. When vector search is enabled, providing intents biases retrieval toward semantic matching over exact-text lookup.",
 					},
 					"relation_types": map[string]any{
 						"type":        "array",

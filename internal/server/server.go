@@ -16,23 +16,34 @@ import (
 	"time"
 
 	"github.com/docgraph/docgraph/internal/config"
+	"github.com/docgraph/docgraph/internal/embedding"
+	"github.com/docgraph/docgraph/internal/embeddingchunk"
+	"github.com/docgraph/docgraph/internal/embeddingeval"
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/mcp"
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage"
 	"github.com/docgraph/docgraph/internal/syncschedule"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 	"github.com/docgraph/docgraph/internal/web"
 )
 
 type Server struct {
-	addr      string
-	store     storage.Store
-	logger    *slog.Logger
-	auth      config.AuthConfig
-	webPrefix string
-	mcpServer *mcp.SSEServer
-	mcpHTTP   *mcp.StreamableHTTPServer
-	jobs      JobController
+	addr                      string
+	store                     storage.Store
+	logger                    *slog.Logger
+	auth                      config.AuthConfig
+	webPrefix                 string
+	mcpServer                 *mcp.SSEServer
+	mcpHTTP                   *mcp.StreamableHTTPServer
+	jobs                      JobController
+	embedder                  embedding.Embedder
+	embeddingGeneratorVersion string
+	embeddingTokenizer        string
+	embeddingChunkStrategy    string
+	embeddingMaxInputTokens   int
+	embeddingLimits           embedding.ResolvedEmbeddingLimits
+	vectorSearchWeight        float64
 }
 
 type JobController interface {
@@ -52,22 +63,109 @@ func NewWithAuthAndPrefix(addr string, store storage.Store, logger *slog.Logger,
 }
 
 func NewWithAuthAndPrefixAndJobs(addr string, store storage.Store, logger *slog.Logger, auth config.AuthConfig, webPrefix string, jobs JobController) *Server {
+	return NewWithAuthAndPrefixAndJobsAndEmbedding(addr, store, logger, auth, webPrefix, jobs, embedding.NewNoOpEmbedder(), embedding.DefaultGeneratorVersion, 1200, config.DefaultVectorSearchWeight)
+}
+
+func NewWithAuthAndPrefixAndJobsAndEmbedding(addr string, store storage.Store, logger *slog.Logger, auth config.AuthConfig, webPrefix string, jobs JobController, embedder embedding.Embedder, generatorVersion string, embeddingMaxInputTokens int, vectorSearchWeight float64) *Server {
 	if auth.Mode == "" {
 		auth.Mode = "none"
 	}
 	webPrefix = cleanWebPrefix(webPrefix)
-	queryService := query.NewService(store)
-	mcpHandler := mcp.NewHandler(queryService, store)
-	return &Server{
-		addr:      addr,
-		store:     store,
-		logger:    logger,
-		auth:      auth,
-		webPrefix: webPrefix,
-		mcpServer: mcp.NewSSEServerWithBasePath(mcpHandler, logger, webPrefix),
-		mcpHTTP:   mcp.NewStreamableHTTPServer(mcpHandler, logger),
-		jobs:      jobs,
+	if embedder == nil {
+		embedder = embedding.NewNoOpEmbedder()
 	}
+	if strings.TrimSpace(generatorVersion) == "" {
+		generatorVersion = embedding.DefaultGeneratorVersion
+	}
+	if embeddingMaxInputTokens <= 0 {
+		embeddingMaxInputTokens = 1200
+	}
+	limits := embedding.ResolveEmbeddingLimits(config.EmbeddingConfig{
+		ChunkTargetTokens: embeddingMaxInputTokens,
+		BatchSize:         64,
+	}, embedding.ProviderCapabilities{})
+	vectorSearchWeight = normalizeVectorSearchWeight(vectorSearchWeight)
+	queryService := query.NewService(store)
+	mcpHandler := mcp.NewHandlerWithEmbeddingAndSearchWeight(queryService, store, embedder, generatorVersion, vectorSearchWeight)
+	if runtimeSetter, ok := store.(vectorstore.SearchRuntimeSetter); ok && strings.TrimSpace(embedder.Model()) != "" {
+		runtimeSetter.SetVectorSearchRuntime(vectorstore.SearchRuntime{
+			Embedder:         embedder,
+			SearchWeight:     vectorSearchWeight,
+			VectorCandidates: 60,
+			MinSimilarity:    0,
+			GeneratorVersion: generatorVersion,
+			Tokenizer:        "auto",
+			ChunkStrategy:    "auto",
+		})
+	}
+	return &Server{
+		addr:                      addr,
+		store:                     store,
+		logger:                    logger,
+		auth:                      auth,
+		webPrefix:                 webPrefix,
+		mcpServer:                 mcp.NewSSEServerWithBasePath(mcpHandler, logger, webPrefix),
+		mcpHTTP:                   mcp.NewStreamableHTTPServer(mcpHandler, logger),
+		jobs:                      jobs,
+		embedder:                  embedder,
+		embeddingGeneratorVersion: generatorVersion,
+		embeddingTokenizer:        "auto",
+		embeddingChunkStrategy:    "auto",
+		embeddingMaxInputTokens:   embeddingMaxInputTokens,
+		embeddingLimits:           limits,
+		vectorSearchWeight:        vectorSearchWeight,
+	}
+}
+
+func (s *Server) SetEmbeddingChunkOptions(tokenizer string, chunkStrategy string) {
+	if s == nil {
+		return
+	}
+	tokenizer = strings.TrimSpace(tokenizer)
+	if tokenizer == "" {
+		tokenizer = "auto"
+	}
+	chunkStrategy = strings.TrimSpace(chunkStrategy)
+	if chunkStrategy == "" {
+		chunkStrategy = "auto"
+	}
+	s.embeddingTokenizer = tokenizer
+	s.embeddingChunkStrategy = chunkStrategy
+	if runtimeSetter, ok := s.store.(vectorstore.SearchRuntimeSetter); ok && s.embedder != nil && strings.TrimSpace(s.embedder.Model()) != "" {
+		runtimeSetter.SetVectorSearchRuntime(vectorstore.SearchRuntime{
+			Embedder:         s.embedder,
+			SearchWeight:     s.vectorSearchWeight,
+			VectorCandidates: 60,
+			MinSimilarity:    0,
+			GeneratorVersion: s.embeddingGeneratorVersion,
+			Tokenizer:        tokenizer,
+			ChunkStrategy:    chunkStrategy,
+		})
+	}
+}
+
+func (s *Server) SetEmbeddingLimits(limits embedding.ResolvedEmbeddingLimits) {
+	if s == nil {
+		return
+	}
+	if limits.ChunkTargetTokens <= 0 || limits.BatchSize <= 0 || limits.MaxBatchTokens <= 0 {
+		limits = embedding.ResolveEmbeddingLimits(config.EmbeddingConfig{
+			ChunkTargetTokens: s.embeddingMaxInputTokens,
+			BatchSize:         64,
+		}, embedding.ProviderCapabilities{})
+	}
+	s.embeddingLimits = limits
+	s.embeddingMaxInputTokens = limits.ChunkTargetTokens
+}
+
+func normalizeVectorSearchWeight(weight float64) float64 {
+	if weight <= 0 {
+		return config.DefaultVectorSearchWeight
+	}
+	if weight > 1 {
+		return 1
+	}
+	return weight
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -115,6 +213,8 @@ func (s *Server) routes() (http.Handler, error) {
 
 	mux.HandleFunc(s.pattern("GET", "/api/health"), s.handleHealth)
 	mux.HandleFunc(s.pattern("GET", "/api/status"), s.handleStatus)
+	mux.HandleFunc(s.pattern("GET", "/api/embedding/chunk-options"), s.handleEmbeddingChunkOptions)
+	mux.HandleFunc(s.pattern("POST", "/api/embedding/chunk-plans/compare"), s.handleCompareEmbeddingChunkPlans)
 	mux.HandleFunc(s.pattern("POST", "/api/search"), s.handleSearch)
 	mux.HandleFunc(s.pattern("POST", "/api/context"), s.handleContext)
 	mux.HandleFunc(s.pattern("GET", "/api/jobs"), s.handleListJobs)
@@ -127,6 +227,7 @@ func (s *Server) routes() (http.Handler, error) {
 	mux.HandleFunc(s.pattern("DELETE", "/api/sync-schedules/{sourceID}"), s.handleDeleteSyncSchedule)
 	mux.HandleFunc(s.pattern("POST", "/api/maintenance/profile-rebuild"), s.handleEnqueueMaintenanceJob("maintenance_profile_rebuild"))
 	mux.HandleFunc(s.pattern("POST", "/api/maintenance/graph-repair"), s.handleEnqueueMaintenanceJob("maintenance_graph_repair"))
+	mux.HandleFunc(s.pattern("POST", "/api/maintenance/embedding-ensure"), s.handleEmbeddingEnsure)
 	mux.HandleFunc(s.pattern("GET", "/api/sources"), s.handleListSources)
 	mux.HandleFunc(s.pattern("POST", "/api/sources"), s.handleCreateSource)
 	mux.HandleFunc(s.pattern("GET", "/api/confluence-cookie-credentials"), s.handleListConfluenceCookieCredentials)
@@ -148,6 +249,7 @@ func (s *Server) routes() (http.Handler, error) {
 	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/health"), s.handleGetSourceHealth)
 	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/documents"), s.handleListSourceDocuments)
 	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/sections"), s.handleListSourceSections)
+	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/embedding-status"), s.handleGetSourceEmbeddingStatus)
 	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/nodes"), s.handleListSourceNodes)
 	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/edges"), s.handleListSourceEdges)
 	mux.HandleFunc(s.pattern("GET", "/api/documents/{id}"), s.handleGetDocument)
@@ -209,6 +311,82 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleEmbeddingChunkOptions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tokenizers": embeddingchunk.AvailableTokenizers(),
+		"strategies": embeddingchunk.AvailableChunkStrategies(),
+		"default_plan": embeddingchunk.ChunkPlan{
+			Tokenizer:          "auto",
+			Strategy:           "auto",
+			ContextTokens:      s.embeddingLimits.ContextTokens,
+			ChunkTargetTokens:  s.embeddingLimits.ChunkTargetTokens,
+			ChunkOverlapTokens: s.embeddingLimits.ChunkOverlapTokens,
+		},
+		"resolved_limits": s.embeddingLimits,
+	})
+}
+
+func (s *Server) handleCompareEmbeddingChunkPlans(w http.ResponseWriter, r *http.Request) {
+	var req chunkPlanCompareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
+		return
+	}
+	req.SectionID = strings.TrimSpace(req.SectionID)
+	if req.SectionID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("section_id is required"))
+		return
+	}
+	section, err := s.store.GetSectionForEmbedding(r.Context(), req.SectionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("section %q not found", req.SectionID))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	model := s.embeddingModel()
+	if model == "" {
+		model = "default"
+	}
+	summaries, err := embeddingeval.CompareChunkPlans(section, model, s.embeddingGeneratorVersion, applyResolvedLimitsToChunkPlans(req.Plans, s.embeddingLimits))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"section_id": req.SectionID,
+		"plans":      summaries,
+	})
+}
+
+func applyResolvedLimitsToChunkPlans(plans []embeddingchunk.ChunkPlan, limits embedding.ResolvedEmbeddingLimits) []embeddingchunk.ChunkPlan {
+	if len(plans) == 0 {
+		return []embeddingchunk.ChunkPlan{{
+			Tokenizer:          "auto",
+			Strategy:           "auto",
+			ContextTokens:      limits.ContextTokens,
+			ChunkTargetTokens:  limits.ChunkTargetTokens,
+			ChunkOverlapTokens: limits.ChunkOverlapTokens,
+		}}
+	}
+	out := make([]embeddingchunk.ChunkPlan, len(plans))
+	for i, plan := range plans {
+		out[i] = plan
+		if out[i].ContextTokens <= 0 {
+			out[i].ContextTokens = limits.ContextTokens
+		}
+		if out[i].ChunkTargetTokens <= 0 {
+			out[i].ChunkTargetTokens = limits.ChunkTargetTokens
+		}
+		if out[i].ChunkOverlapTokens <= 0 {
+			out[i].ChunkOverlapTokens = limits.ChunkOverlapTokens
+		}
+	}
+	return out
 }
 
 func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request) {
@@ -1106,6 +1284,112 @@ func (s *Server) handleEnqueueMaintenanceJob(kind string) http.HandlerFunc {
 	}
 }
 
+func (s *Server) handleEmbeddingEnsure(w http.ResponseWriter, r *http.Request) {
+	sourceID := strings.TrimSpace(r.URL.Query().Get("source_id"))
+	job, err := s.store.CreateEmbeddingEnsureJobIfIdle(r.Context(), sourceID)
+	if err != nil {
+		if errors.Is(err, storage.ErrSyncInProgress) {
+			activeJob, active, activeErr := s.activeEmbeddingEnsureJob(r.Context(), sourceID)
+			if activeErr != nil {
+				writeError(w, http.StatusInternalServerError, activeErr)
+				return
+			}
+			body := map[string]any{
+				"error": map[string]string{
+					"code":    http.StatusText(http.StatusConflict),
+					"message": "embedding ensure already in progress",
+				},
+			}
+			if active {
+				body["job"] = activeJob
+			}
+			writeJSON(w, http.StatusConflict, body)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
+}
+
+func (s *Server) activeEmbeddingEnsureJob(ctx context.Context, sourceID string) (storage.Job, bool, error) {
+	for _, status := range []string{"queued", "running", "canceling"} {
+		jobs, err := s.store.ListJobs(ctx, storage.JobListOptions{
+			Kind:     "maintenance_embedding_ensure",
+			Status:   status,
+			SourceID: sourceID,
+			Limit:    1,
+		})
+		if err != nil {
+			return storage.Job{}, false, err
+		}
+		if len(jobs) > 0 {
+			return jobs[0], true, nil
+		}
+	}
+	return storage.Job{}, false, nil
+}
+
+func (s *Server) handleGetSourceEmbeddingStatus(w http.ResponseWriter, r *http.Request) {
+	sourceID := strings.TrimSpace(r.PathValue("id"))
+	if sourceID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("source id is required"))
+		return
+	}
+	model := s.embeddingModel()
+	if override := strings.TrimSpace(r.URL.Query().Get("model")); override != "" {
+		model = override
+	}
+	generatorVersion := s.embeddingGeneratorVersion
+	if override := strings.TrimSpace(r.URL.Query().Get("generator_version")); override != "" {
+		generatorVersion = override
+	}
+	status, err := s.store.GetSourceEmbeddingStatus(r.Context(), sourceID, model, generatorVersion, s.embeddingTokenizer, s.embeddingChunkStrategy, s.embeddingLimits.ChunkTargetTokens)
+	if err != nil {
+		writeSourceArtifactError(w, sourceID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) queryEmbedding(ctx context.Context, queryText string, intents []string, enabled bool) ([]float32, string, error) {
+	if !enabled || s.embedder == nil || strings.TrimSpace(s.embedder.Model()) == "" {
+		return nil, "", nil
+	}
+	texts := []string{strings.TrimSpace(queryText)}
+	texts = append(texts, intents...)
+	text := strings.Join(nonEmptyStrings(texts), "\n")
+	if text == "" {
+		return nil, "", nil
+	}
+	vectors, err := s.embedder.Embed(ctx, []string{text})
+	if err != nil {
+		return nil, "", err
+	}
+	if len(vectors) == 0 {
+		return nil, "", nil
+	}
+	return vectors[0], s.embedder.Model(), nil
+}
+
+func (s *Server) embeddingModel() string {
+	if s.embedder == nil {
+		return ""
+	}
+	return s.embedder.Model()
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 func (s *Server) handleCreateSyncTask(w http.ResponseWriter, r *http.Request) {
 	var req syncTaskRequest
 	if r.Body != nil {
@@ -1501,6 +1785,9 @@ func (s *Server) handleListSourceArtifacts(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if status, err := s.store.GetSourceEmbeddingStatus(r.Context(), id, s.embeddingModel(), s.embeddingGeneratorVersion, s.embeddingTokenizer, s.embeddingChunkStrategy, s.embeddingLimits.ChunkTargetTokens); err == nil {
+		artifacts.EmbeddingStatus = &status
+	}
 	writeJSON(w, http.StatusOK, artifacts)
 }
 
@@ -1616,6 +1903,13 @@ type searchRequest struct {
 	Limit                int      `json:"limit"`
 	UseRelationExpansion *bool    `json:"use_relation_expansion"`
 	RelationTypes        []string `json:"relation_types"`
+	ExactTerms           []string `json:"exact_terms"`
+	SemanticIntents      []string `json:"semantic_intents"`
+}
+
+type chunkPlanCompareRequest struct {
+	SectionID string                     `json:"section_id"`
+	Plans     []embeddingchunk.ChunkPlan `json:"plans"`
 }
 
 type documentProfileRequest struct {
@@ -1661,14 +1955,18 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		useRelationExpansion = *req.UseRelationExpansion
 	}
 	result, err := s.store.SearchSectionsWithOptions(r.Context(), storage.SearchOptions{
-		Query:                  req.Query,
-		Limit:                  req.Limit,
-		MaxSearches:            5,
-		MaxSectionsPerDocument: 5,
-		ProfileDetail:          "compact",
-		UseRelationExpansion:   useRelationExpansion,
-		RelationDepth:          1,
-		RelationTypes:          req.RelationTypes,
+		Query:                     req.Query,
+		Limit:                     req.Limit,
+		MaxSearches:               5,
+		MaxSectionsPerDocument:    5,
+		ProfileDetail:             "compact",
+		UseRelationExpansion:      useRelationExpansion,
+		RelationDepth:             1,
+		RelationTypes:             req.RelationTypes,
+		OriginalQuery:             req.Query,
+		ExactTerms:                req.ExactTerms,
+		SemanticIntents:           req.SemanticIntents,
+		EmbeddingGeneratorVersion: s.embeddingGeneratorVersion,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1676,6 +1974,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordSearchObservation(r.Context(), req.Query, result, time.Since(start))
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) canUseVectorCandidates() bool {
+	return s.embedder != nil && strings.TrimSpace(s.embedder.Model()) != ""
 }
 
 func (s *Server) recordSearchObservation(ctx context.Context, queryText string, result storage.SearchResult, elapsed time.Duration) {

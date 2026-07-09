@@ -1949,7 +1949,7 @@ func TestGetSectionExplicitReferencesResolveHeadingNumberAndMarkdownAnchor(t *te
 	ctx := context.Background()
 	store := openMigratedTempStore(t, ctx)
 	createTestSource(t, ctx, store, "source-1")
-	seedExplicitReferenceDocument(t, ctx, store, "详细规则见 §5 Propagation 传播规则。另见 [Operation 配置](#operation-config)。")
+	seedExplicitReferenceDocument(t, ctx, store, "See §5 Baking Temperatures for details. Also see [Cookie Settings](#cookie-settings).")
 
 	section, err := store.GetSection(ctx, "section-source")
 	if err != nil {
@@ -1962,7 +1962,7 @@ func TestGetSectionExplicitReferencesResolveHeadingNumberAndMarkdownAnchor(t *te
 	if !headingRef.Resolved || headingRef.TargetSectionID != "section-propagation" || headingRef.TargetDocumentID != "doc-explicit" {
 		t.Fatalf("heading reference = %+v, want resolved propagation section", *headingRef)
 	}
-	if headingRef.TargetHeadingPath != "Schema > 5 Propagation 传播规则" {
+	if headingRef.TargetHeadingPath != "Schema > 5 Baking Temperatures" {
 		t.Fatalf("heading target path = %q, want propagation heading path", headingRef.TargetHeadingPath)
 	}
 
@@ -1979,7 +1979,7 @@ func TestGetSectionExplicitReferencesReturnAmbiguousCandidates(t *testing.T) {
 	ctx := context.Background()
 	store := openMigratedTempStore(t, ctx)
 	createTestSource(t, ctx, store, "source-1")
-	seedExplicitReferenceDocument(t, ctx, store, "详见 Propagation 传播规则。")
+	seedExplicitReferenceDocument(t, ctx, store, "See Baking Temperatures for details.")
 	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
 		ID:          "doc-explicit",
 		SourceID:    "source-1",
@@ -1993,24 +1993,24 @@ func TestGetSectionExplicitReferencesReturnAmbiguousCandidates(t *testing.T) {
 			DocumentID:  "doc-explicit",
 			HeadingPath: "Schema > Operation",
 			Title:       "Operation",
-			Content:     "详见 Propagation 传播规则。",
+			Content:     "See Baking Temperatures for details.",
 			ContentHash: "hash-section-source-ambiguous",
 			Ordinal:     0,
 		},
 		{
 			ID:          "section-propagation",
 			DocumentID:  "doc-explicit",
-			HeadingPath: "Schema > 5 Propagation 传播规则",
-			Title:       "5 Propagation 传播规则",
-			Content:     "Propagation propagation rules.",
+			HeadingPath: "Schema > 5 Baking Temperatures",
+			Title:       "5 Baking Temperatures",
+			Content:     "Baking temperature rules for oven settings.",
 			ContentHash: "hash-section-propagation",
 			Ordinal:     1,
 		},
 		{
 			ID:          "section-propagation-other",
 			DocumentID:  "doc-explicit",
-			HeadingPath: "Schema > Appendix > Propagation 传播规则",
-			Title:       "Propagation 传播规则",
+			HeadingPath: "Schema > Appendix > Baking Temperatures",
+			Title:       "Baking Temperatures",
 			Content:     "Another propagation section.",
 			ContentHash: "hash-section-propagation-other",
 			Ordinal:     2,
@@ -2039,7 +2039,7 @@ func TestSearchSectionsExplicitReferenceMetadataAndSuggestedReads(t *testing.T) 
 	ctx := context.Background()
 	store := openMigratedTempStore(t, ctx)
 	createTestSource(t, ctx, store, "source-1")
-	seedExplicitReferenceDocument(t, ctx, store, "When configuring operations, detailed rules see §5 Propagation 传播规则.")
+	seedExplicitReferenceDocument(t, ctx, store, "When configuring cookies, detailed rules see §5 Baking Temperatures.")
 
 	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
 		Query:                  "configuring operations",
@@ -2782,18 +2782,18 @@ func seedExplicitReferenceDocument(t *testing.T, ctx context.Context, store *Sto
 		{
 			ID:          "section-operation",
 			DocumentID:  "doc-explicit",
-			HeadingPath: "Schema > Operation Config",
-			Title:       "Operation Config",
-			Content:     "Operation configuration syntax.",
+			HeadingPath: "Schema > Cookie Settings",
+			Title:       "Cookie Settings",
+			Content:     "Cookie configuration syntax.",
 			ContentHash: "hash-section-operation",
 			Ordinal:     1,
 		},
 		{
 			ID:          "section-propagation",
 			DocumentID:  "doc-explicit",
-			HeadingPath: "Schema > 5 Propagation 传播规则",
-			Title:       "5 Propagation 传播规则",
-			Content:     "Propagation propagation rules.",
+			HeadingPath: "Schema > 5 Baking Temperatures",
+			Title:       "5 Baking Temperatures",
+			Content:     "Baking temperature rules for oven settings.",
 			ContentHash: "hash-section-propagation",
 			Ordinal:     2,
 		},

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,10 +14,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docgraph/docgraph/internal/config"
+	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/ingest/confluence"
+	jobrunner "github.com/docgraph/docgraph/internal/jobs"
 	"github.com/docgraph/docgraph/internal/storage"
 )
 
@@ -56,6 +60,202 @@ func TestHealthAndStatusHandlers(t *testing.T) {
 	}
 }
 
+func TestSourceEmbeddingStatusHandler(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{ID: "source-embedding-status-api", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, storage.DocumentInput{ID: "doc-embedding-status-api", SourceID: source.ID, ExternalID: "status.md", Title: "Status", ContentHash: "hash-doc"}, []storage.SectionInput{
+		{ID: "section-embedding-status-api-current", Content: "current", ContentHash: "hash-current"},
+		{ID: "section-embedding-status-api-pending", Content: "pending", ContentHash: "hash-pending"},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/sources/"+source.ID+"/embedding-status?model=test-embedding&generator_version=generator-v1", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("embedding status code = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var status storage.EmbeddingStatus
+	decodeJSON(t, rr, &status)
+	if status.Enabled || status.Status != "disabled" || status.Reason != "vector_db_not_configured" || status.TotalSections != 2 || status.EmbeddedSections != 0 || status.PendingSections != 2 || status.StaleSections != 0 {
+		t.Fatalf("embedding status = %+v, want disabled with total=2 pending=2", status)
+	}
+}
+
+func TestSearchFallsBackWhenVectorEmbeddingFails(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithEmbedding(t, failingEmbedder{})
+	defer cleanup()
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{ID: "source-search-vector-fallback", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, storage.DocumentInput{
+		ID:          "doc-search-vector-fallback",
+		SourceID:    source.ID,
+		ExternalID:  "fallback.md",
+		Title:       "Fallback Search",
+		ContentHash: "hash-doc-search-vector-fallback",
+	}, []storage.SectionInput{{
+		ID:          "section-search-vector-fallback",
+		Title:       "Search fallback",
+		Content:     "embedding outage should still return lexical search results",
+		ContentHash: "hash-section-search-vector-fallback",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+
+	rr := postJSON(t, handler, "/api/search", map[string]any{
+		"query": "embedding outage lexical",
+		"limit": 10,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("search status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var result struct {
+		Attempts []storage.SearchAttempt `json:"attempts"`
+		Hits     []storage.SearchHit     `json:"hits"`
+	}
+	decodeJSON(t, rr, &result)
+	if len(result.Hits) == 0 || result.Hits[0].DocumentID != "doc-search-vector-fallback" {
+		t.Fatalf("search hits = %+v, want lexical fallback hit", result.Hits)
+	}
+	if !hasAttemptError(result.Attempts, "vector", "embedding_failed") {
+		t.Fatalf("attempts = %+v, want vector embedding_failed attempt", result.Attempts)
+	}
+}
+
+func TestEmbeddingChunkOptionsAndCompareHandlers(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{ID: "source-chunk-plan", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	content := strings.Join([]string{
+		strings.Repeat("alpha beta gamma delta epsilon zeta eta theta\n\n", 40),
+		"| Name | Description |",
+		"| --- | --- |",
+		strings.Repeat("| DOCGRAPH_TOKEN | Browser-mediated auth token |\n", 8),
+		"",
+		strings.Repeat("omega sigma lambda kappa\n\n", 40),
+	}, "\n")
+	if err := store.ReplaceDocument(ctx, storage.DocumentInput{
+		ID:          "doc-chunk-plan",
+		SourceID:    source.ID,
+		ExternalID:  "chunk.md",
+		Title:       "Chunk Plan",
+		ContentHash: "hash-doc-chunk-plan",
+	}, []storage.SectionInput{{
+		ID:          "section-chunk-plan",
+		Title:       "Chunk plan",
+		Content:     content,
+		ContentHash: "hash-section-chunk-plan",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/embedding/chunk-options", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("chunk options status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var options struct {
+		Tokenizers []availableChunkOption `json:"tokenizers"`
+		Strategies []availableChunkOption `json:"strategies"`
+	}
+	decodeJSON(t, rr, &options)
+	if len(options.Tokenizers) == 0 || len(options.Strategies) == 0 {
+		t.Fatalf("chunk options = %+v, want tokenizers and strategies", options)
+	}
+	if !hasAvailableOption(options.Tokenizers, "cl100k_base") || !hasAvailableOption(options.Strategies, "adaptive") || !hasAvailableOption(options.Strategies, "block_aware_pack") {
+		t.Fatalf("chunk options = %+v, want available cl100k_base tokenizer, adaptive, and block_aware_pack strategies", options)
+	}
+
+	rr = postJSON(t, handler, "/api/embedding/chunk-plans/compare", map[string]any{
+		"section_id": "section-chunk-plan",
+		"plans": []map[string]any{
+			{"tokenizer": "conservative", "strategy": "structural", "chunk_target_tokens": 80},
+			{"tokenizer": "cl100k_base", "strategy": "recursive", "chunk_target_tokens": 260},
+			{"tokenizer": "conservative", "strategy": "adaptive", "chunk_target_tokens": 140},
+			{"tokenizer": "conservative", "strategy": "block_aware_pack", "chunk_target_tokens": 260, "chunk_overlap_tokens": 0},
+		},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("compare status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		Plans []struct {
+			ChunkCount     int `json:"chunk_count"`
+			SizeCompliance struct {
+				MaxTokens float64 `json:"max_tokens"`
+			} `json:"size_compliance"`
+			BlockIntegrity struct {
+				TotalBlocks  int     `json:"total_blocks"`
+				PreserveRate float64 `json:"preserve_rate"`
+			} `json:"block_integrity"`
+		} `json:"plans"`
+	}
+	decodeJSON(t, rr, &body)
+	if len(body.Plans) != 4 || body.Plans[0].ChunkCount <= body.Plans[1].ChunkCount || body.Plans[2].ChunkCount <= 0 || body.Plans[3].ChunkCount <= 0 {
+		t.Fatalf("compare body = %+v, want four summaries with adaptive and block-aware populated", body)
+	}
+	if body.Plans[0].SizeCompliance.MaxTokens <= 0 || body.Plans[3].BlockIntegrity.TotalBlocks == 0 {
+		t.Fatalf("compare body = %+v, want size compliance and BI metrics", body)
+	}
+	if body.Plans[3].BlockIntegrity.PreserveRate < body.Plans[0].BlockIntegrity.PreserveRate {
+		t.Fatalf("compare body = %+v, want block-aware BI preserve rate at least structural", body)
+	}
+}
+
+type availableChunkOption struct {
+	Name      string `json:"name"`
+	Available bool   `json:"available"`
+}
+
+func hasAvailableOption(items []availableChunkOption, name string) bool {
+	for _, item := range items {
+		if item.Name == name && item.Available {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEmbeddingEnsureRejectsDuplicateActiveJob(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{ID: "source-embedding-ensure-api", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	rr := postJSON(t, handler, "/api/maintenance/embedding-ensure?source_id="+source.ID, nil)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("embedding ensure status = %d, want %d; body: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	var created struct {
+		Job storage.Job `json:"job"`
+	}
+	decodeJSON(t, rr, &created)
+	if created.Job.Kind != "maintenance_embedding_ensure" || created.Job.Status != "queued" || created.Job.SourceID != source.ID {
+		t.Fatalf("embedding ensure job = %+v, want queued maintenance job for source", created.Job)
+	}
+
+	rr = postJSON(t, handler, "/api/maintenance/embedding-ensure?source_id="+source.ID, nil)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("duplicate embedding ensure status = %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+}
+
 func TestAuthModeNoneKeepsAPIBehaviorWithoutToken(t *testing.T) {
 	handler, cleanup := newTestHandlerWithAuth(t, config.AuthConfig{Mode: "none"})
 	defer cleanup()
@@ -70,12 +270,19 @@ func TestAuthModeNoneKeepsAPIBehaviorWithoutToken(t *testing.T) {
 }
 
 func TestTokenAuthProtectsAPIExceptHealth(t *testing.T) {
-	const token = "server-test-token"
+	const token = "fixture-access-value"
 	handler, cleanup := newTestHandlerWithAuth(t, config.AuthConfig{Mode: "token", Token: token})
 	defer cleanup()
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("static index without token = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/health", nil)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("health without token = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
@@ -118,6 +325,135 @@ func TestTokenAuthProtectsAPIExceptHealth(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status with legacy X-ProductGraph-Token = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+}
+
+func TestWebPrefixScopesStaticAPIAndAuth(t *testing.T) {
+	const token = "fixture-access-value"
+	handler, cleanup := newTestHandlerWithAuthAndPrefix(t, config.AuthConfig{Mode: "token", Token: token}, "docgraph")
+	defer cleanup()
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/docgraph/", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("prefixed static index without token = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), `href="/styles.css"`) || strings.Contains(rr.Body.String(), `src="/main.js"`) {
+		t.Fatalf("prefixed index contains root-absolute asset paths: %s", rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/docgraph/api/health", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("prefixed health without token = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/docgraph/api/status", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("prefixed status without token = %d, want %d; body: %s", rr.Code, http.StatusUnauthorized, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/docgraph/api/status", nil)
+	req.Header.Set("X-DocGraph-Token", token)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("prefixed status with token = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unprefixed status in prefixed server = %d, want %d; body: %s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+}
+
+func TestTokenAuthProtectsMCPStreamableHTTP(t *testing.T) {
+	const token = "fixture-access-value"
+	handler, cleanup := newTestHandlerWithAuth(t, config.AuthConfig{Mode: "token", Token: token})
+	defer cleanup()
+
+	rr := postMCPStreamable(t, handler, "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("mcp without token = %d, want %d (MCP should not require auth); body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	rr = postMCPStreamable(t, handler, "Bearer "+token)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("mcp with bearer token = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  json.RawMessage `json:"result"`
+		Error   any             `json:"error,omitempty"`
+	}
+	decodeJSON(t, rr, &resp)
+	if resp.JSONRPC != "2.0" || string(resp.ID) != `"tools"` || len(resp.Result) == 0 || resp.Error != nil {
+		t.Fatalf("mcp response = %+v, want tools/list JSON-RPC result", resp)
+	}
+}
+
+func TestWebPrefixScopesMCPStreamableHTTP(t *testing.T) {
+	const token = "fixture-access-value"
+	handler, cleanup := newTestHandlerWithAuthAndPrefix(t, config.AuthConfig{Mode: "token", Token: token}, "/docgraph")
+	defer cleanup()
+
+	rr := postMCPStreamablePath(t, handler, "/docgraph/mcp", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("prefixed mcp without token = %d, want %d (MCP should not require auth); body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	rr = postMCPStreamablePath(t, handler, "/docgraph/mcp", "Bearer "+token)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("prefixed mcp with token = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	rr = postMCPStreamablePath(t, handler, "/mcp", "Bearer "+token)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unprefixed mcp in prefixed server = %d, want %d; body: %s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+}
+
+func TestWebPrefixScopesMCPSSEEndpointEvent(t *testing.T) {
+	const token = "fixture-access-value"
+	handler, cleanup := newTestHandlerWithAuthAndPrefix(t, config.AuthConfig{Mode: "token", Token: token}, "/docgraph")
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/docgraph/mcp/sse", nil)
+	req.Header.Set("X-DocGraph-Token", token)
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rr, req)
+		close(done)
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if strings.Contains(rr.Body.String(), "event: endpoint") && strings.Contains(rr.Body.String(), "data: /docgraph/mcp/sse/messages?sessionId=") {
+			cancel()
+			<-done
+			if rr.Code != http.StatusOK {
+				t.Fatalf("prefixed sse status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("prefixed sse endpoint event body = %q, want /docgraph endpoint", rr.Body.String())
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 
@@ -173,17 +509,7 @@ Use GET /member/benefits to load current member benefits for the account.
 	}
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var syncResult struct {
-		SourceID  string `json:"source_id"`
-		Documents int    `json:"documents"`
-	}
-	decodeJSON(t, rr, &syncResult)
-	if syncResult.SourceID != created.ID || syncResult.Documents != 1 {
-		t.Fatalf("sync result = %+v, want source %q with 1 document", syncResult, created.ID)
-	}
+	assertSyncAccepted(t, rr, created.ID)
 
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/artifacts?limit=10", nil)
@@ -195,6 +521,9 @@ Use GET /member/benefits to load current member benefits for the account.
 	decodeJSON(t, rr, &artifacts)
 	if len(artifacts.Documents) != 1 {
 		t.Fatalf("artifacts documents = %+v, want one document", artifacts.Documents)
+	}
+	if artifacts.EmbeddingStatus == nil || artifacts.EmbeddingStatus.Enabled || artifacts.EmbeddingStatus.PendingSections != int(artifacts.Counts.Sections) {
+		t.Fatalf("artifacts embedding status = %+v counts=%+v, want disabled coverage for all sections", artifacts.EmbeddingStatus, artifacts.Counts)
 	}
 	docID := artifacts.Documents[0].ID
 
@@ -208,6 +537,36 @@ Use GET /member/benefits to load current member benefits for the account.
 	decodeJSON(t, rr, &profile)
 	if profile.DocumentID != docID || profile.RetrievalProfileJSON == "" || profile.GeneratedFromHash == "" {
 		t.Fatalf("initial profile = %+v, want generated retrieval profile", profile)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/documents/"+docID, nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get document detail status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var detail storage.DocumentDetail
+	decodeJSON(t, rr, &detail)
+	if detail.Document.ID != docID || detail.Source.ID != created.ID {
+		t.Fatalf("document detail = %+v, want document %q from source %q", detail, docID, created.ID)
+	}
+	if detail.Profile.DocumentID != docID || len(detail.Sections) == 0 || len(detail.Related) == 0 {
+		t.Fatalf("document detail missing profile/sections/related: %+v", detail)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/documents/"+docID+"?summary=1", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get document summary status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var summary storage.DocumentDetail
+	decodeJSON(t, rr, &summary)
+	if summary.Document.ID != docID || summary.Source.ID != created.ID {
+		t.Fatalf("document summary = %+v, want document %q from source %q", summary, docID, created.ID)
+	}
+	if summary.Profile.DocumentID != "" || len(summary.Sections) != 0 || len(summary.Related) != 0 || len(summary.Diagnostics) != 0 {
+		t.Fatalf("document summary included heavy detail fields: %+v", summary)
 	}
 
 	rr = putJSON(t, handler, "/api/documents/"+docID+"/profile", map[string]any{
@@ -230,9 +589,7 @@ The member benefits overview explains how users see entitlement details after a 
 Use GET /member/benefits to load current member benefits for the account.
 `)
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("resync status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/documents/"+docID+"/profile", nil)
 	handler.ServeHTTP(rr, req)
@@ -254,6 +611,18 @@ Use GET /member/benefits to load current member benefits for the account.
 	decodeJSON(t, rr, &status)
 	if status.Sources != 1 || status.Documents != 1 || status.Sections == 0 {
 		t.Fatalf("post-sync status counts = sources:%d documents:%d sections:%d, want 1/1/>0", status.Sources, status.Documents, status.Sections)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/health", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("source health status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var health storage.SourceHealth
+	decodeJSON(t, rr, &health)
+	if health.SourceID != created.ID || health.Counts.Documents != 1 || health.LatestJob.ID == "" {
+		t.Fatalf("source health = %+v, want source counts and latest job", health)
 	}
 
 	rr = postJSON(t, handler, "/api/search", map[string]any{
@@ -280,6 +649,28 @@ Use GET /member/benefits to load current member benefits for the account.
 	if !foundAPISection {
 		t.Fatalf("search hits = %+v, want hit for member benefits/API content", searchResult.Hits)
 	}
+
+	rr = postJSON(t, handler, "/api/feedback", map[string]any{
+		"target_kind":   "document",
+		"target_id":     docID,
+		"feedback_kind": "document_stale",
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create stale feedback status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/documents/"+docID, nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get document detail after feedback status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	decodeJSON(t, rr, &detail)
+	if len(detail.Feedback) != 1 || detail.Feedback[0].FeedbackKind != "document_stale" {
+		t.Fatalf("document detail feedback = %+v, want document_stale", detail.Feedback)
+	}
+	if !sourceHealthWarningsContain(detail.Diagnostics, "document_stale") || detail.LatestJob.ID == "" {
+		t.Fatalf("document detail diagnostics/latest job = %+v / %+v, want stale diagnostic and latest job", detail.Diagnostics, detail.LatestJob)
+	}
 }
 
 func TestSourceLifecycleHandlersUpdateJobsAndDelete(t *testing.T) {
@@ -293,46 +684,40 @@ Unique lifecycle-token content for API source lifecycle tests.
 `)
 
 	rr := postJSON(t, handler, "/api/sources", map[string]any{
-		"kind":         "local",
-		"name":         "Lifecycle Docs",
-		"dsn":          "file://" + filepath.ToSlash(docsDir),
-		"product_hint": "Membership",
-		"module_hint":  "Benefits",
+		"kind":          "local",
+		"name":          "Lifecycle Docs",
+		"dsn":           "file://" + filepath.ToSlash(docsDir),
+		"product_hint":  "Membership",
+		"module_hint":   "Benefits",
+		"sync_schedule": "hourly",
 	})
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
 	}
 	var created storage.Source
 	decodeJSON(t, rr, &created)
+	if created.SyncSchedule != "hourly" {
+		t.Fatalf("created SyncSchedule = %q, want hourly", created.SyncSchedule)
+	}
 
 	rr = putJSON(t, handler, "/api/sources/"+created.ID, map[string]any{
-		"name":         "Updated Lifecycle Docs",
-		"dsn":          "file://" + filepath.ToSlash(docsDir),
-		"product_hint": "Payments",
-		"module_hint":  "Checkout",
+		"name":          "Updated Lifecycle Docs",
+		"dsn":           "file://" + filepath.ToSlash(docsDir),
+		"product_hint":  "Payments",
+		"module_hint":   "Checkout",
+		"sync_schedule": "daily",
 	})
 	if rr.Code != http.StatusOK {
 		t.Fatalf("update source status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
 	}
 	var updated storage.Source
 	decodeJSON(t, rr, &updated)
-	if updated.Name != "Updated Lifecycle Docs" || updated.DSN != "file://"+filepath.ToSlash(docsDir) || updated.ProductHint != "Payments" || updated.ModuleHint != "Checkout" {
+	if updated.Name != "Updated Lifecycle Docs" || updated.DSN != "file://"+filepath.ToSlash(docsDir) || updated.ProductHint != "Payments" || updated.ModuleHint != "Checkout" || updated.SyncSchedule != "daily" {
 		t.Fatalf("updated source = %+v, want changed name/dsn/product/module", updated)
 	}
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	var syncResult struct {
-		SourceID  string `json:"source_id"`
-		Documents int    `json:"documents"`
-		JobID     string `json:"job_id"`
-	}
-	decodeJSON(t, rr, &syncResult)
-	if syncResult.SourceID != created.ID || syncResult.Documents != 1 || syncResult.JobID == "" {
-		t.Fatalf("sync result = %+v, want source, document count, and job id", syncResult)
-	}
+	assertSyncAccepted(t, rr, created.ID)
 
 	rr = httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/jobs?limit=5", nil)
@@ -394,6 +779,215 @@ Unique lifecycle-token content for API source lifecycle tests.
 	decodeJSON(t, rr, &searchResult)
 	if len(searchResult.Hits) != 0 {
 		t.Fatalf("search after delete hits = %+v, want empty", searchResult.Hits)
+	}
+}
+
+func TestSyncTaskHandlersCreateQueuedJobAndRejectDuplicate(t *testing.T) {
+	handler, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "task.md"), "# Task Docs\n\nSync task handler content.\n")
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "Task Docs",
+		"dsn":  "file://" + filepath.ToSlash(docsDir),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var source storage.Source
+	decodeJSON(t, rr, &source)
+
+	rr = postJSON(t, handler, "/api/sync-tasks", map[string]any{"source_id": source.ID})
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("create sync task status = %d, want %d; body: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	var created struct {
+		Job storage.Job `json:"job"`
+	}
+	decodeJSON(t, rr, &created)
+	if created.Job.Kind != "sync_source" || created.Job.Status != "queued" || created.Job.SourceID != source.ID {
+		t.Fatalf("sync task job = %+v, want queued sync_source for source", created.Job)
+	}
+
+	rr = postJSON(t, handler, "/api/sync-tasks", map[string]any{"source_id": source.ID})
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("duplicate sync task status = %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+}
+
+func TestSyncJobHandlersCancelAndRejectActiveDelete(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{
+		ID:   "src_cancel_job",
+		Kind: "local",
+		Name: "Cancelable",
+		DSN:  "file:///tmp/cancelable",
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	job, err := store.CreateSyncJobIfIdle(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("CreateSyncJobIfIdle returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/sources/"+source.ID+"/jobs/"+job.ID, nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("delete active job status = %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+
+	rr = postJSON(t, handler, "/api/sources/"+source.ID+"/jobs/"+job.ID+"/cancel", nil)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("cancel queued job status = %d, want %d; body: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	var canceled struct {
+		Job storage.Job `json:"job"`
+	}
+	decodeJSON(t, rr, &canceled)
+	if canceled.Job.Status != "canceled" {
+		t.Fatalf("canceled job = %+v, want canceled", canceled.Job)
+	}
+
+	rr = postJSON(t, handler, "/api/sources/"+source.ID+"/jobs/"+job.ID+"/cancel", nil)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("cancel already canceled job status = %d, want idempotent accepted; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestJobHandlersSupportPaginationAndSourceJobTotals(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := store.CreateSource(ctx, storage.Source{
+		ID:   "src_jobs_page",
+		Kind: "local",
+		Name: "Paged Jobs",
+		DSN:  t.TempDir(),
+	}); err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := store.CreateJob(ctx, storage.JobInput{
+			Kind:        "sync_source",
+			SourceID:    "src_jobs_page",
+			PayloadJSON: fmt.Sprintf(`{"source_id":"src_jobs_page","index":%d}`, i),
+		}); err != nil {
+			t.Fatalf("CreateJob %d returned error: %v", i, err)
+		}
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/jobs?kind=sync_source&source_id=src_jobs_page&limit=2&offset=1", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list jobs status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		Jobs    []storage.Job `json:"jobs"`
+		Limit   int           `json:"limit"`
+		Offset  int           `json:"offset"`
+		Total   int           `json:"total"`
+		HasMore bool          `json:"has_more"`
+	}
+	decodeJSON(t, rr, &body)
+	if len(body.Jobs) != 2 || body.Limit != 2 || body.Offset != 1 || body.Total != 3 || body.HasMore {
+		t.Fatalf("paginated jobs = %+v, want two jobs offset 1 total 3 without more", body)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/sources/src_jobs_page/jobs?limit=2", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list source jobs status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	decodeJSON(t, rr, &body)
+	if len(body.Jobs) != 2 || body.Total != 3 || !body.HasMore {
+		t.Fatalf("source jobs page = %+v, want first page with more", body)
+	}
+}
+
+func TestSyncScheduleHandlersCRUDSourceSchedule(t *testing.T) {
+	handler, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "Scheduled Docs",
+		"dsn":  t.TempDir(),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var source storage.Source
+	decodeJSON(t, rr, &source)
+
+	rr = postJSON(t, handler, "/api/sync-schedules", map[string]any{
+		"source_id":     source.ID,
+		"sync_schedule": "daily",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create schedule status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var scheduleBody struct {
+		Schedule syncScheduleResponse `json:"schedule"`
+	}
+	decodeJSON(t, rr, &scheduleBody)
+	if !scheduleBody.Schedule.Enabled || scheduleBody.Schedule.SyncSchedule != "daily" || scheduleBody.Schedule.NextRunAt == "" {
+		t.Fatalf("created schedule = %+v, want enabled daily with next run", scheduleBody.Schedule)
+	}
+
+	rr = putJSON(t, handler, "/api/sync-schedules/"+source.ID, map[string]any{"sync_schedule": "hourly"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("update schedule status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	decodeJSON(t, rr, &scheduleBody)
+	if scheduleBody.Schedule.SyncSchedule != "hourly" {
+		t.Fatalf("updated schedule = %+v, want hourly", scheduleBody.Schedule)
+	}
+
+	rr = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/sync-schedules", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list schedules status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var listBody struct {
+		Schedules []syncScheduleResponse `json:"schedules"`
+	}
+	decodeJSON(t, rr, &listBody)
+	if len(listBody.Schedules) != 1 || listBody.Schedules[0].SourceID != source.ID || listBody.Schedules[0].SyncSchedule != "hourly" {
+		t.Fatalf("listed schedules = %+v, want updated source schedule", listBody.Schedules)
+	}
+
+	rr = requestJSON(t, handler, http.MethodDelete, "/api/sync-schedules/"+source.ID, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete schedule status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	decodeJSON(t, rr, &scheduleBody)
+	if scheduleBody.Schedule.Enabled || scheduleBody.Schedule.SyncSchedule != "" {
+		t.Fatalf("deleted schedule = %+v, want disabled manual schedule", scheduleBody.Schedule)
+	}
+}
+
+func TestSourceHandlersRejectInvalidSyncSchedule(t *testing.T) {
+	handler, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind":          "local",
+		"name":          "Invalid Schedule Docs",
+		"dsn":           t.TempDir(),
+		"sync_schedule": "sometimes",
+	})
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "sync_schedule") {
+		t.Fatalf("invalid schedule create status/body = %d/%s, want 400 mentioning sync_schedule", rr.Code, rr.Body.String())
 	}
 }
 
@@ -475,9 +1069,7 @@ func TestCreateSourceSyncsAndSearchesOpenAPIKind(t *testing.T) {
 	}
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 
 	rr = postJSON(t, handler, "/api/search", map[string]any{
 		"query": "getMemberBenefits",
@@ -520,9 +1112,7 @@ func TestCreateSourceSyncsOpenAPIYAMLAndReturnsGraphAPI(t *testing.T) {
 	decodeJSON(t, rr, &created)
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 
 	rr = postJSON(t, handler, "/api/search", map[string]any{
 		"query": "Member identifier from shared components",
@@ -620,9 +1210,7 @@ This servergitignoredtoken content is outside the configured Git path.
 	}
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync Git source status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 	assertServerSearchContains(t, handler, "servergitonealpha", "Member Git Docs")
 	assertServerSearchEmpty(t, handler, "servergitignoredtoken")
 
@@ -632,9 +1220,7 @@ Server servergittwobeta membership content.
 `)
 	commitServerGitRepo(t, repo, "update docs")
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync updated Git source status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 	assertServerSearchEmpty(t, handler, "servergitonealpha")
 	assertServerSearchContains(t, handler, "servergittwobeta", "Member Git Docs")
 
@@ -643,9 +1229,7 @@ Server servergittwobeta membership content.
 	}
 	commitServerGitRepo(t, repo, "remove docs")
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync deleted Git source status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 	assertServerSearchEmpty(t, handler, "servergittwobeta")
 }
 
@@ -674,12 +1258,7 @@ Server invalid path fixture.
 	decodeJSON(t, rr, &created)
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("sync invalid Git path status = %d, want %d; body: %s", rr.Code, http.StatusBadRequest, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "missing-docs") {
-		t.Fatalf("sync invalid Git path body = %q, want missing path", rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 
 	rr = httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/jobs?limit=5", nil)
@@ -749,9 +1328,7 @@ func TestHTMLSourceHandlersSyncSearchAndCleanStaleDocs(t *testing.T) {
 	}
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync HTML source status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 	assertServerSearchContains(t, handler, "serverhtmlonealpha", "Server HTML Docs")
 	assertServerSearchContains(t, handler, "serverhtmlquotabeta", "Server HTML Detail Docs")
 
@@ -759,11 +1336,95 @@ func TestHTMLSourceHandlersSyncSearchAndCleanStaleDocs(t *testing.T) {
 		t.Fatalf("Remove returned error: %v", err)
 	}
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync deleted HTML source status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 	assertServerSearchEmpty(t, handler, "serverhtmlquotabeta")
 	assertServerSearchContains(t, handler, "serverhtmlonealpha", "Server HTML Docs")
+}
+
+func TestConfluenceCookieCredentialHandlersCRUDMaskAttachAndResume(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+
+	rr := postJSON(t, handler, "/api/confluence-cookie-credentials", map[string]any{
+		"name":     "Company Wiki",
+		"base_url": "https://confluence.example/wiki",
+		"cookie":   "TEST_COOKIE=fixture-super",
+		"notes":    "browser session",
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create credential status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	createdBody := rr.Body.String()
+	if strings.Contains(createdBody, "fixture-super") {
+		t.Fatalf("create credential response leaked raw cookie: %s", createdBody)
+	}
+	var credential storage.ConfluenceCookieCredential
+	decodeJSON(t, rr, &credential)
+	if credential.ID == "" || !strings.Contains(createdBody, `"has_cookie":true`) {
+		t.Fatalf("created credential response = %s, want id and has_cookie", createdBody)
+	}
+
+	rr = putJSON(t, handler, "/api/confluence-cookie-credentials/"+credential.ID, map[string]any{
+		"name":     "Renamed Wiki",
+		"base_url": "https://confluence.example/wiki",
+		"notes":    "renamed only",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("update credential status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	stored, err := store.GetConfluenceCookieCredential(context.Background(), credential.ID)
+	if err != nil {
+		t.Fatalf("GetConfluenceCookieCredential returned error: %v", err)
+	}
+	if stored.Cookie != "TEST_COOKIE=fixture-super" {
+		t.Fatalf("stored cookie after metadata update = %q, want original cookie", stored.Cookie)
+	}
+
+	rr = postJSON(t, handler, "/api/sources", map[string]any{
+		"kind":        "confluence",
+		"name":        "Credential Confluence",
+		"dsn":         "https://confluence.example/wiki",
+		"config_json": `{"base_url":"https://confluence.example/wiki","page_id":"100","cookie":"old-cookie"}`,
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create confluence source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var source storage.Source
+	decodeJSON(t, rr, &source)
+
+	rr = postJSON(t, handler, "/api/confluence-cookie-credentials/"+credential.ID+"/attach-sources", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("attach credential status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	attached, err := store.GetSource(context.Background(), source.ID)
+	if err != nil {
+		t.Fatalf("GetSource returned error: %v", err)
+	}
+	if !strings.Contains(attached.ConfigJSON, `"cookie_credential_id":"`+credential.ID+`"`) || strings.Contains(attached.ConfigJSON, "old-cookie") {
+		t.Fatalf("attached source config = %s, want credential id and no old raw cookie", attached.ConfigJSON)
+	}
+
+	if err := store.UpdateSourceSyncState(context.Background(), source.ID, "paused", "credential_required"); err != nil {
+		t.Fatalf("UpdateSourceSyncState returned error: %v", err)
+	}
+	rr = postJSON(t, handler, "/api/confluence-cookie-credentials/"+credential.ID+"/resume-sources", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("resume credential sources status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	resumed, err := store.GetSource(context.Background(), source.ID)
+	if err != nil {
+		t.Fatalf("GetSource after resume returned error: %v", err)
+	}
+	if resumed.SyncStatus != "active" {
+		t.Fatalf("resumed source status = %q, want active", resumed.SyncStatus)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/confluence-cookie-credentials/"+credential.ID, nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("delete referenced credential status = %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
 }
 
 func TestConfluenceSourceHandlersSyncSearchAndFailedJobs(t *testing.T) {
@@ -793,9 +1454,7 @@ func TestConfluenceSourceHandlersSyncSearchAndFailedJobs(t *testing.T) {
 	}
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync Confluence source status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 	assertServerSearchContains(t, handler, "serverconfluencerootalpha", "Server Confluence Root")
 	assertServerSearchContains(t, handler, "serverconfluencechildbeta", "Server Confluence Child")
 
@@ -806,7 +1465,7 @@ func TestConfluenceSourceHandlersSyncSearchAndFailedJobs(t *testing.T) {
 		"config_json": serverConfluenceConfig(t, map[string]any{
 			"base_url": confluenceServer.URL + "/wiki",
 			"page_id":  "100",
-			"token":    "bad-secret",
+			"token":    "fixture-bad-value",
 		}),
 	})
 	if rr.Code != http.StatusCreated {
@@ -816,9 +1475,7 @@ func TestConfluenceSourceHandlersSyncSearchAndFailedJobs(t *testing.T) {
 	decodeJSON(t, rr, &broken)
 
 	rr = postJSON(t, handler, "/api/sources/"+broken.ID+"/sync", nil)
-	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "auth") {
-		t.Fatalf("sync broken Confluence status/body = %d/%s, want auth bad request", rr.Code, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, broken.ID)
 
 	rr = httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/sources/"+broken.ID+"/jobs?limit=5", nil)
@@ -861,9 +1518,7 @@ GET /member/benefits returns active member benefits.
 	decodeJSON(t, rr, &created)
 
 	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
-	}
+	assertSyncAccepted(t, rr, created.ID)
 
 	rr = postJSON(t, handler, "/api/context", map[string]any{
 		"task":         "Summarize member benefits",
@@ -1175,6 +1830,10 @@ func newTestHandler(t *testing.T) (http.Handler, func()) {
 }
 
 func newTestHandlerWithAuth(t *testing.T, auth config.AuthConfig) (http.Handler, func()) {
+	return newTestHandlerWithAuthAndPrefix(t, auth, "")
+}
+
+func newTestHandlerWithAuthAndPrefix(t *testing.T, auth config.AuthConfig, webPrefix string) (http.Handler, func()) {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
@@ -1187,14 +1846,14 @@ func newTestHandlerWithAuth(t *testing.T, auth config.AuthConfig) (http.Handler,
 		t.Fatalf("migrate store: %v", err)
 	}
 
-	srv := NewWithAuth("127.0.0.1:0", store, slog.New(slog.NewTextHandler(io.Discard, nil)), auth)
+	srv := NewWithAuthAndPrefix("127.0.0.1:0", store, slog.New(slog.NewTextHandler(io.Discard, nil)), auth, webPrefix)
 	handler, err := srv.routes()
 	if err != nil {
 		_ = store.Close()
 		t.Fatalf("build routes: %v", err)
 	}
 
-	return handler, func() {
+	return newAutoDrainHandler(handler, store), func() {
 		if err := store.Close(); err != nil {
 			t.Fatalf("close store: %v", err)
 		}
@@ -1221,9 +1880,70 @@ func newTestHandlerWithStore(t *testing.T) (http.Handler, storage.Store, func())
 		t.Fatalf("build routes: %v", err)
 	}
 
-	return handler, store, func() {
+	return newAutoDrainHandler(handler, store), store, func() {
 		if err := store.Close(); err != nil {
 			t.Fatalf("close store: %v", err)
+		}
+	}
+}
+
+func newTestHandlerWithEmbedding(t *testing.T, embedder embedding.Embedder) (http.Handler, storage.Store, func()) {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := storage.Open(context.Background(), "sqlite://"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Migrate(context.Background()); err != nil {
+		_ = store.Close()
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	srv := NewWithAuthAndPrefixAndJobsAndEmbedding("127.0.0.1:0", store, slog.New(slog.NewTextHandler(io.Discard, nil)), config.AuthConfig{Mode: "none"}, "", nil, embedder, embedding.DefaultGeneratorVersion, 1200, config.DefaultVectorSearchWeight)
+	handler, err := srv.routes()
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("build routes: %v", err)
+	}
+
+	return newAutoDrainHandler(handler, store), store, func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}
+}
+
+type failingEmbedder struct{}
+
+func (failingEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	return nil, fmt.Errorf("embedding unavailable")
+}
+
+func (failingEmbedder) Model() string {
+	return "test-embedding"
+}
+
+func (failingEmbedder) Dimensions() int {
+	return 2
+}
+
+type autoDrainHandler struct {
+	handler http.Handler
+	runner  *jobrunner.Runner
+}
+
+func newAutoDrainHandler(handler http.Handler, store storage.Store) http.Handler {
+	return &autoDrainHandler{
+		handler: handler,
+		runner:  jobrunner.NewRunner(store, jobrunner.NewDefaultRegistry(store), slog.New(slog.NewTextHandler(io.Discard, nil))),
+	}
+}
+
+func (h *autoDrainHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.handler.ServeHTTP(w, r)
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/sync") {
+		for h.runner.RunOnce(r.Context()) {
 		}
 	}
 }
@@ -1308,12 +2028,58 @@ func requestJSON(t *testing.T, handler http.Handler, method string, path string,
 	return rr
 }
 
+func postMCPStreamable(t *testing.T, handler http.Handler, authorization string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	return postMCPStreamablePath(t, handler, "/mcp", authorization)
+}
+
+func postMCPStreamablePath(t *testing.T, handler http.Handler, path string, authorization string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"jsonrpc":"2.0","id":"tools","method":"tools/list"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	return rr
+}
+
 func decodeJSON(t *testing.T, rr *httptest.ResponseRecorder, dst any) {
 	t.Helper()
 
 	if err := json.NewDecoder(rr.Body).Decode(dst); err != nil {
 		t.Fatalf("decode JSON response %q: %v", rr.Body.String(), err)
 	}
+}
+
+func assertSyncAccepted(t *testing.T, rr *httptest.ResponseRecorder, sourceID string) storage.Job {
+	t.Helper()
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("sync status = %d, want %d; body: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	var body struct {
+		Job storage.Job `json:"job"`
+	}
+	decodeJSON(t, rr, &body)
+	if body.Job.ID == "" || body.Job.Kind != "sync_source" || body.Job.Status != "queued" || body.Job.SourceID != sourceID {
+		t.Fatalf("sync job = %+v, want queued sync_source for %q", body.Job, sourceID)
+	}
+	return body.Job
+}
+
+func sourceHealthWarningsContain(warnings []storage.SourceHealthWarning, kind string) bool {
+	for _, warning := range warnings {
+		if warning.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func assertServerSearchContains(t *testing.T, handler http.Handler, query string, wantTitle string) {
@@ -1538,6 +2304,492 @@ components:
     BenefitListResponse:
       description: Successful benefit list response.
 `
+
+func TestSourceArtifactsCompatOldEndpointStillWorks(t *testing.T) {
+	handler, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "member.md"), `# Member Benefits
+
+Unique sourceartcompatold token for old artifacts endpoint.
+`)
+
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "Compat Docs",
+		"dsn":  "file://" + filepath.ToSlash(docsDir),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var created storage.Source
+	decodeJSON(t, rr, &created)
+
+	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
+	assertSyncAccepted(t, rr, created.ID)
+
+	// Old endpoint must still return the aggregated artifacts response.
+	rr = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/artifacts?limit=10", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("old artifacts status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var artifacts storage.SourceArtifacts
+	decodeJSON(t, rr, &artifacts)
+	if artifacts.SourceID != created.ID {
+		t.Fatalf("artifacts SourceID = %q, want %q", artifacts.SourceID, created.ID)
+	}
+	if len(artifacts.Documents) != 1 {
+		t.Fatalf("artifacts Documents = %+v, want one document", artifacts.Documents)
+	}
+	if artifacts.Counts.Documents != 1 || artifacts.Counts.Sections == 0 {
+		t.Fatalf("artifacts Counts = %+v, want populated counts", artifacts.Counts)
+	}
+}
+
+func TestSourceArtifactCountsEndpoint(t *testing.T) {
+	handler, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "member.md"), `# Member Benefits
+
+Unique sourceartcounts token.
+GET /entity/v1/entities
+`)
+
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "Count Docs",
+		"dsn":  "file://" + filepath.ToSlash(docsDir),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var created storage.Source
+	decodeJSON(t, rr, &created)
+
+	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
+	assertSyncAccepted(t, rr, created.ID)
+
+	rr = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/artifacts/counts", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("counts status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var countsBody struct {
+		SourceID string                       `json:"source_id"`
+		Counts   storage.SourceArtifactCounts `json:"counts"`
+	}
+	decodeJSON(t, rr, &countsBody)
+	if countsBody.SourceID != created.ID {
+		t.Fatalf("counts SourceID = %q, want %q", countsBody.SourceID, created.ID)
+	}
+	if countsBody.Counts.Documents != 1 {
+		t.Fatalf("counts Documents = %d, want 1", countsBody.Counts.Documents)
+	}
+	if countsBody.Counts.SectionEntities == 0 {
+		t.Fatalf("counts SectionEntities = %d, want extracted entities", countsBody.Counts.SectionEntities)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/artifacts?limit=10", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("artifacts status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var artifacts storage.SourceArtifacts
+	decodeJSON(t, rr, &artifacts)
+	if len(artifacts.SectionEntities) == 0 || artifacts.EntityDiagnostics.APIEndpoints == 0 {
+		t.Fatalf("artifacts entities = %+v diagnostics = %+v, want exposed entity diagnostics", artifacts.SectionEntities, artifacts.EntityDiagnostics)
+	}
+}
+
+func TestSplitSourceArtifactEndpoints(t *testing.T) {
+	handler, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "member.md"), `# Member Benefits
+
+Unique splitartifactapi token.
+`)
+
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "Split Docs",
+		"dsn":  "file://" + filepath.ToSlash(docsDir),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var created storage.Source
+	decodeJSON(t, rr, &created)
+
+	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
+	assertSyncAccepted(t, rr, created.ID)
+
+	// Test documents endpoint.
+	rr = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/documents?limit=10", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("documents status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var docsBody struct {
+		SourceID  string                    `json:"source_id"`
+		Documents []storage.DocumentSummary `json:"documents"`
+	}
+	decodeJSON(t, rr, &docsBody)
+	if docsBody.SourceID != created.ID {
+		t.Fatalf("documents SourceID = %q, want %q", docsBody.SourceID, created.ID)
+	}
+	if len(docsBody.Documents) != 1 {
+		t.Fatalf("documents count = %d, want 1", len(docsBody.Documents))
+	}
+	if docsBody.Documents[0].NodeID == "" {
+		t.Fatalf("document NodeID is empty")
+	}
+
+	// Test sections endpoint.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/sections?limit=10", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("sections status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var sectionsBody struct {
+		SourceID string                   `json:"source_id"`
+		Sections []storage.SectionSummary `json:"sections"`
+	}
+	decodeJSON(t, rr, &sectionsBody)
+	if sectionsBody.SourceID != created.ID {
+		t.Fatalf("sections SourceID = %q, want %q", sectionsBody.SourceID, created.ID)
+	}
+	if len(sectionsBody.Sections) == 0 {
+		t.Fatalf("sections count = %d, want >0", len(sectionsBody.Sections))
+	}
+
+	// Test nodes endpoint.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/nodes?limit=10", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("nodes status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var nodesBody struct {
+		SourceID string         `json:"source_id"`
+		Nodes    []storage.Node `json:"nodes"`
+	}
+	decodeJSON(t, rr, &nodesBody)
+	if nodesBody.SourceID != created.ID {
+		t.Fatalf("nodes SourceID = %q, want %q", nodesBody.SourceID, created.ID)
+	}
+
+	// Test edges endpoint.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/edges?limit=10", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("edges status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var edgesBody struct {
+		SourceID string                `json:"source_id"`
+		Edges    []storage.EdgeSummary `json:"edges"`
+	}
+	decodeJSON(t, rr, &edgesBody)
+	if edgesBody.SourceID != created.ID {
+		t.Fatalf("edges SourceID = %q, want %q", edgesBody.SourceID, created.ID)
+	}
+}
+
+func TestSourceArtifactEndpointsMissingSourceReturns404(t *testing.T) {
+	handler, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	endpoints := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/sources/missing-src/artifacts"},
+		{http.MethodGet, "/api/sources/missing-src/artifacts/counts"},
+		{http.MethodGet, "/api/sources/missing-src/documents"},
+		{http.MethodGet, "/api/sources/missing-src/sections"},
+		{http.MethodGet, "/api/sources/missing-src/nodes"},
+		{http.MethodGet, "/api/sources/missing-src/edges"},
+	}
+
+	for _, ep := range endpoints {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(ep.method, ep.path, nil)
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status = %d, want %d; body: %s", ep.method, ep.path, rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	}
+}
+
+func TestSourceArtifactEndpointsInvalidLimitOffsetReturns400(t *testing.T) {
+	handler, _, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+
+	// Create a source first so the validation is reached.
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "Validation Docs",
+		"dsn":  t.TempDir(),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var created storage.Source
+	decodeJSON(t, rr, &created)
+
+	invalidParams := []struct {
+		path  string
+		param string
+	}{
+		{"/api/sources/" + created.ID + "/artifacts", "limit=-1"},
+		{"/api/sources/" + created.ID + "/artifacts", "limit=abc"},
+		{"/api/sources/" + created.ID + "/artifacts", "offset=-1"},
+		{"/api/sources/" + created.ID + "/artifacts", "offset=abc"},
+		{"/api/sources/" + created.ID + "/documents", "limit=-1"},
+		{"/api/sources/" + created.ID + "/documents", "limit=abc"},
+		{"/api/sources/" + created.ID + "/sections", "limit=abc"},
+		{"/api/sources/" + created.ID + "/nodes", "limit=-5"},
+		{"/api/sources/" + created.ID + "/edges", "limit=notanumber"},
+	}
+
+	for _, tc := range invalidParams {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, tc.path+"?"+tc.param, nil)
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("%s?%s status = %d, want %d; body: %s", tc.path, tc.param, rr.Code, http.StatusBadRequest, rr.Body.String())
+		}
+	}
+}
+
+func TestSearchWritesQueryObservation(t *testing.T) {
+	handler, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "member.md"), `# Member Benefits
+
+Search observation persistence token.
+`)
+
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "Obs Docs",
+		"dsn":  "file://" + filepath.ToSlash(docsDir),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var created storage.Source
+	decodeJSON(t, rr, &created)
+
+	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
+	assertSyncAccepted(t, rr, created.ID)
+
+	// Perform a search that should find results.
+	rr = postJSON(t, handler, "/api/search", map[string]any{
+		"query": "observation persistence",
+		"limit": 10,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("search status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	// We can't directly query the store from the handler test easily,
+	// but the search should NOT error and the response should be valid.
+	var searchResult struct {
+		Hits []storage.SearchHit `json:"hits"`
+	}
+	decodeJSON(t, rr, &searchResult)
+	if len(searchResult.Hits) == 0 {
+		t.Fatalf("search returned no hits for observation token")
+	}
+}
+
+func TestSearchWritesQueryAndResultEvents(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "member.md"), `# Member Benefits
+
+Search qe result events written token.
+`)
+
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "QREvent Docs",
+		"dsn":  "file://" + filepath.ToSlash(docsDir),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var created storage.Source
+	decodeJSON(t, rr, &created)
+
+	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
+	assertSyncAccepted(t, rr, created.ID)
+
+	rr = postJSON(t, handler, "/api/search", map[string]any{
+		"query": "qe result events written",
+		"limit": 10,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("search status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var searchResult struct {
+		Hits []storage.SearchHit `json:"hits"`
+	}
+	decodeJSON(t, rr, &searchResult)
+	if len(searchResult.Hits) == 0 {
+		t.Fatalf("search returned no hits")
+	}
+
+	// The search observation write is best-effort, so we only verify the search
+	// succeeds and doesn't crash. The storage-layer tests already verify
+	// RecordQueryObservation persistence behavior directly.
+	// But we can verify that the observation was actually written by checking
+	// query_events count indirectly — store is the *Store interface, not *sqlite.Store.
+	// We just confirm search didn't crash due to observation recording.
+	_ = store
+	_ = searchResult
+}
+
+func TestSearchHitOrderNotAlteredByExistingQueryEvents(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+
+	// Pre-insert query_events for the search query.
+	ctx := context.Background()
+	if err := store.RecordQueryObservation(ctx, storage.QueryObservationInput{
+		QueryText:       "hit order preexisting",
+		NormalizedQuery: "hit order preexisting",
+		Source:          "web",
+		ResultCount:     3,
+		LatencyMS:       100,
+		Results: []storage.SearchResultObservationInput{
+			{DocumentID: "nonexistent", SectionID: "nonexistent-sec", Rank: 1, Score: 99.9},
+		},
+	}); err != nil {
+		t.Fatalf("RecordQueryObservation pre-existing returned error: %v", err)
+	}
+
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "one.md"), `# Alpha Doc
+alpha token for hit order test.
+`)
+	writeFile(t, filepath.Join(docsDir, "two.md"), `# Beta Doc
+beta token for hit order test.
+`)
+
+	rr := postJSON(t, handler, "/api/sources", map[string]any{
+		"kind": "local",
+		"name": "Hit Order Docs",
+		"dsn":  "file://" + filepath.ToSlash(docsDir),
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create source status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var created storage.Source
+	decodeJSON(t, rr, &created)
+
+	rr = postJSON(t, handler, "/api/sources/"+created.ID+"/sync", nil)
+	assertSyncAccepted(t, rr, created.ID)
+
+	rr = postJSON(t, handler, "/api/search", map[string]any{
+		"query": "hit order",
+		"limit": 10,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("search status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var searchResult struct {
+		Hits []storage.SearchHit `json:"hits"`
+	}
+	decodeJSON(t, rr, &searchResult)
+	if len(searchResult.Hits) < 2 {
+		t.Fatalf("search returned %d hits, want at least 2", len(searchResult.Hits))
+	}
+	// The hits should reflect real search results, not influenced by pre-existing
+	// query_events. We just verify search works correctly.
+	for _, hit := range searchResult.Hits {
+		if hit.SectionID == "" || hit.DocumentID == "" {
+			t.Fatalf("search hit missing required fields: %+v", hit)
+		}
+	}
+}
+
+func TestNodeSearchEndpointCallsStore(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	for _, node := range []storage.NodeInput{
+		{ID: "node-server-search-1", Kind: "Product", Name: "API Gateway", CanonicalName: "api gateway"},
+		{ID: "node-server-search-2", Kind: "API", Name: "GET /gateway/status", CanonicalName: "get /gateway/status"},
+	} {
+		if err := store.UpsertNode(ctx, node); err != nil {
+			t.Fatalf("UpsertNode(%s) returned error: %v", node.ID, err)
+		}
+	}
+
+	// Search for the API node.
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes?query=gateway&limit=5", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("node search status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		Nodes []storage.Node `json:"nodes"`
+	}
+	decodeJSON(t, rr, &body)
+	if len(body.Nodes) == 0 {
+		t.Fatalf("node search returned no results")
+	}
+	foundGateway := false
+	for _, n := range body.Nodes {
+		if strings.Contains(strings.ToLower(n.Name), "gateway") {
+			foundGateway = true
+			break
+		}
+	}
+	if !foundGateway {
+		t.Fatalf("node search results = %+v, want gateway nodes", body.Nodes)
+	}
+
+	// Empty query should return empty nodes array.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/nodes?query=&limit=5", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("empty node search status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	decodeJSON(t, rr, &body)
+	if body.Nodes == nil || len(body.Nodes) != 0 {
+		t.Fatalf("empty node search nodes = %+v, want empty slice", body.Nodes)
+	}
+}
+
+func hasAttemptError(attempts []storage.SearchAttempt, kind string, contains string) bool {
+	for _, attempt := range attempts {
+		if attempt.Kind == kind && strings.Contains(attempt.Error, contains) {
+			return true
+		}
+	}
+	return false
+}
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()

@@ -14,6 +14,7 @@ import (
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage"
 	syncsvc "github.com/docgraph/docgraph/internal/sync"
+	"github.com/docgraph/docgraph/internal/syncschedule"
 )
 
 func runSource(args []string) error {
@@ -38,6 +39,44 @@ func runSource(args []string) error {
 	}
 }
 
+func runMaintenance(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("maintenance command requires section-entities-backfill")
+	}
+	switch args[0] {
+	case "section-entities-backfill":
+		return runMaintenanceSectionEntitiesBackfill(args[1:])
+	default:
+		return fmt.Errorf("unknown maintenance command %q", args[0])
+	}
+}
+
+func runMaintenanceSectionEntitiesBackfill(args []string) error {
+	fs := flag.NewFlagSet("maintenance section-entities-backfill", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config file path")
+	dataDir := fs.String("data", "", "data directory")
+	sourceID := fs.String("source-id", "", "source id to backfill")
+	documentID := fs.String("document-id", "", "document id to backfill")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	store, closeStore, err := openStoreFromFlags(*cfgPath, *dataDir)
+	if err != nil {
+		return err
+	}
+	defer closeStore()
+
+	result, err := syncsvc.NewService(store).BackfillSectionEntities(context.Background(), syncsvc.SectionEntityBackfillOptions{
+		SourceID:   *sourceID,
+		DocumentID: *documentID,
+	})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
 func runSourceAdd(args []string) error {
 	fs := flag.NewFlagSet("source add", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config file path")
@@ -47,6 +86,7 @@ func runSourceAdd(args []string) error {
 	dsn := fs.String("dsn", "", "source DSN or local path")
 	product := fs.String("product", "", "product hint")
 	module := fs.String("module", "", "module hint")
+	syncSchedule := fs.String("sync-schedule", "", "automatic sync schedule: manual, hourly, daily, weekly, or every 6h")
 	branch := fs.String("branch", "", "git branch")
 	sourcePath := fs.String("path", "", "git source path")
 	cache := fs.String("cache", "", "explicit clone directory for remote Git sources")
@@ -70,6 +110,7 @@ func runSourceAdd(args []string) error {
 	bearerToken := fs.String("bearer-token", "", "webdocs bearer token")
 	cookie := fs.String("cookie", "", "webdocs cookie header")
 	headersJSON := fs.String("headers-json", "", "webdocs custom headers JSON")
+	crawlMode := fs.String("crawl-mode", "", "webdocs crawl mode: auto, static, browser, or in_page")
 	isSPA := fs.Bool("is-spa", false, "mark webdocs source as single-page app requiring browser rendering")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -80,6 +121,9 @@ func runSourceAdd(args []string) error {
 	if *dsn == "" {
 		return fmt.Errorf("--dsn is required")
 	}
+	if _, _, err := syncschedule.Parse(*syncSchedule); err != nil {
+		return err
+	}
 
 	store, closeStore, err := openStoreFromFlags(*cfgPath, *dataDir)
 	if err != nil {
@@ -87,6 +131,13 @@ func runSourceAdd(args []string) error {
 	}
 	defer closeStore()
 
+	boolsMap := map[string]bool{
+		"include_children": *includeChildren,
+		"strict_host_key":  *strictHostKey,
+	}
+	if *isSPA {
+		boolsMap["is_spa"] = true
+	}
 	source, err := store.CreateSource(context.Background(), storage.Source{
 		ID:   ids.Random("src", 12),
 		Kind: strings.TrimSpace(*kind),
@@ -114,13 +165,11 @@ func runSourceAdd(args []string) error {
 			"bearer_token":  *bearerToken,
 			"cookie":        *cookie,
 			"headers_json":  *headersJSON,
-		}, map[string]bool{
-			"include_children": *includeChildren,
-			"strict_host_key":  *strictHostKey,
-			"is_spa":           *isSPA,
-		}),
-		ProductHint: strings.TrimSpace(*product),
-		ModuleHint:  strings.TrimSpace(*module),
+			"crawl_mode":    *crawlMode,
+		}, boolsMap),
+		ProductHint:  strings.TrimSpace(*product),
+		ModuleHint:   strings.TrimSpace(*module),
+		SyncSchedule: strings.TrimSpace(*syncSchedule),
 	})
 	if err != nil {
 		return err
@@ -159,6 +208,7 @@ func runSourceUpdate(args []string) error {
 	dsn := fs.String("dsn", "", "source DSN or local path")
 	product := fs.String("product", "", "product hint")
 	module := fs.String("module", "", "module hint")
+	syncSchedule := fs.String("sync-schedule", "", "automatic sync schedule: manual, hourly, daily, weekly, or every 6h")
 	branch := fs.String("branch", "", "git branch")
 	sourcePath := fs.String("path", "", "git source path")
 	cache := fs.String("cache", "", "explicit clone directory for remote Git sources")
@@ -182,6 +232,7 @@ func runSourceUpdate(args []string) error {
 	bearerToken := fs.String("bearer-token", "", "webdocs bearer token")
 	cookie := fs.String("cookie", "", "webdocs cookie header")
 	headersJSON := fs.String("headers-json", "", "webdocs custom headers JSON")
+	crawlMode := fs.String("crawl-mode", "", "webdocs crawl mode: auto, static, browser, or in_page")
 	isSPA := fs.Bool("is-spa", false, "mark webdocs source as single-page app requiring browser rendering")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -216,6 +267,12 @@ func runSourceUpdate(args []string) error {
 	if strings.TrimSpace(*module) != "" {
 		source.ModuleHint = strings.TrimSpace(*module)
 	}
+	if strings.TrimSpace(*syncSchedule) != "" {
+		if _, _, err := syncschedule.Parse(*syncSchedule); err != nil {
+			return err
+		}
+		source.SyncSchedule = strings.TrimSpace(*syncSchedule)
+	}
 	if strings.TrimSpace(*branch) != "" || strings.TrimSpace(*sourcePath) != "" || strings.TrimSpace(*cache) != "" || strings.TrimSpace(*include) != "" || strings.TrimSpace(*exclude) != "" || strings.TrimSpace(*urlPrefix) != "" || strings.TrimSpace(*identityFile) != "" || strings.TrimSpace(*password) != "" || strings.TrimSpace(*passphrase) != "" || strings.TrimSpace(*knownHosts) != "" || *strictHostKey {
 		source.ConfigJSON = mergeSourceConfigJSON(source.ConfigJSON, map[string]string{
 			"branch":        strings.TrimSpace(*branch),
@@ -230,7 +287,11 @@ func runSourceUpdate(args []string) error {
 			"known_hosts":   strings.TrimSpace(*knownHosts),
 		}, map[string]bool{"strict_host_key": *strictHostKey})
 	}
-	if strings.TrimSpace(*baseURL) != "" || strings.TrimSpace(*pageID) != "" || strings.TrimSpace(*spaceKey) != "" || strings.TrimSpace(*token) != "" || strings.TrimSpace(*username) != "" || strings.TrimSpace(*apiToken) != "" || strings.TrimSpace(*maxPages) != "" || strings.TrimSpace(*maxDepth) != "" || strings.TrimSpace(*bearerToken) != "" || strings.TrimSpace(*cookie) != "" || strings.TrimSpace(*headersJSON) != "" || *includeChildren {
+	if strings.TrimSpace(*baseURL) != "" || strings.TrimSpace(*pageID) != "" || strings.TrimSpace(*spaceKey) != "" || strings.TrimSpace(*token) != "" || strings.TrimSpace(*username) != "" || strings.TrimSpace(*apiToken) != "" || strings.TrimSpace(*maxPages) != "" || strings.TrimSpace(*maxDepth) != "" || strings.TrimSpace(*bearerToken) != "" || strings.TrimSpace(*cookie) != "" || strings.TrimSpace(*headersJSON) != "" || strings.TrimSpace(*crawlMode) != "" || *includeChildren || *isSPA {
+		boolsMap := map[string]bool{"include_children": *includeChildren}
+		if *isSPA {
+			boolsMap["is_spa"] = true
+		}
 		source.ConfigJSON = mergeSourceConfigJSON(source.ConfigJSON, map[string]string{
 			"base_url":     strings.TrimSpace(*baseURL),
 			"page_id":      strings.TrimSpace(*pageID),
@@ -243,7 +304,8 @@ func runSourceUpdate(args []string) error {
 			"bearer_token": strings.TrimSpace(*bearerToken),
 			"cookie":       strings.TrimSpace(*cookie),
 			"headers_json": strings.TrimSpace(*headersJSON),
-		}, map[string]bool{"include_children": *includeChildren, "is_spa": *isSPA})
+			"crawl_mode":   strings.TrimSpace(*crawlMode),
+		}, boolsMap)
 	}
 
 	updated, err := store.UpdateSource(context.Background(), source)
@@ -614,11 +676,11 @@ func openStoreFromFlags(cfgPath, dataDir string) (storage.Store, func(), error) 
 		cfg.Storage.DSN = "sqlite://" + filepath.ToSlash(filepath.Join(dataDir, "docgraph.db"))
 	}
 
-	store, err := storage.Open(context.Background(), cfg.Storage.DSN)
+	store, err := storage.OpenExisting(context.Background(), cfg.Storage.DSN)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := store.Migrate(context.Background()); err != nil {
+	if err := store.CheckSchema(context.Background()); err != nil {
 		_ = store.Close()
 		return nil, nil, err
 	}

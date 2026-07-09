@@ -2,12 +2,18 @@ package sync
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/ingest/confluence"
@@ -20,6 +26,7 @@ import (
 	"github.com/docgraph/docgraph/internal/ingest/webdocs"
 	"github.com/docgraph/docgraph/internal/profile"
 	"github.com/docgraph/docgraph/internal/storage"
+	"github.com/docgraph/docgraph/internal/technical/extract"
 )
 
 type Service struct {
@@ -31,15 +38,39 @@ func NewService(store storage.Store) *Service {
 }
 
 type Result struct {
-	SourceID    string               `json:"source_id"`
-	Documents   int                  `json:"documents"`
-	JobID       string               `json:"job_id,omitempty"`
-	BrokenLinks []storage.BrokenLink `json:"broken_links,omitempty"`
+	SourceID          string                    `json:"source_id"`
+	Documents         int                       `json:"documents"`
+	JobID             string                    `json:"job_id,omitempty"`
+	EntityDiagnostics storage.EntityDiagnostics `json:"entity_diagnostics,omitempty"`
+	BrokenLinks       []storage.BrokenLink      `json:"broken_links,omitempty"`
+}
+
+type SectionEntityBackfillOptions struct {
+	SourceID   string
+	DocumentID string
+}
+
+type SectionEntityBackfillResult struct {
+	Sources          int `json:"sources"`
+	Documents        int `json:"documents"`
+	Sections         int `json:"sections"`
+	Entities         int `json:"entities"`
+	APIEndpoints     int `json:"api_endpoints"`
+	PathLiterals     int `json:"path_literals"`
+	Operations       int `json:"operations"`
+	OpenAPIDocuments int `json:"openapi_documents"`
 }
 
 type indexedDocument struct {
 	doc      storage.DocumentInput
 	sections []storage.SectionInput
+	graph    bool
+}
+
+type documentSyncPlan struct {
+	replace bool
+	profile bool
+	graph   bool
 }
 
 func (s *Service) SyncSource(ctx context.Context, id string) (Result, error) {
@@ -51,19 +82,77 @@ func (s *Service) SyncSource(ctx context.Context, id string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	result, err := s.syncSource(ctx, source)
+	result, err := s.syncSource(ctx, source, job.ID)
 	if err != nil {
 		_ = s.store.FailSyncJob(ctx, job.ID, err.Error())
+		if isCredentialFailure(source.Kind, err) {
+			_ = s.store.UpdateSourceSyncState(ctx, source.ID, "paused", "credential_required")
+		}
 		return Result{}, err
 	}
 	result.JobID = job.ID
-	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, BrokenLinks: result.BrokenLinks}); err != nil {
+	if err := s.attachEntityDiagnostics(ctx, source.ID, &result); err != nil {
 		return Result{}, err
+	}
+	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, EntityDiagnostics: result.EntityDiagnostics, BrokenLinks: result.BrokenLinks}); err != nil {
+		return Result{}, err
+	}
+	if source.SyncStatus == "paused" {
+		_ = s.store.UpdateSourceSyncState(ctx, source.ID, "active", "")
 	}
 	return result, nil
 }
 
-func (s *Service) syncSource(ctx context.Context, source storage.Source) (Result, error) {
+func (s *Service) RunSyncJob(ctx context.Context, job storage.Job) (Result, error) {
+	if strings.TrimSpace(job.ID) == "" {
+		return Result{}, fmt.Errorf("job id is required")
+	}
+	sourceID := strings.TrimSpace(job.SourceID)
+	if sourceID == "" {
+		sourceID = sourceIDFromSyncJobPayload(job.PayloadJSON)
+	}
+	if sourceID == "" {
+		err := fmt.Errorf("sync_source job %q is missing source_id", job.ID)
+		_ = s.store.FailSyncJob(ctx, job.ID, err.Error())
+		return Result{}, err
+	}
+	source, err := s.store.GetSource(ctx, sourceID)
+	if err != nil {
+		err = fmt.Errorf("source %q not found", sourceID)
+		_ = s.store.FailSyncJob(ctx, job.ID, err.Error())
+		return Result{}, err
+	}
+	result, err := s.syncSource(ctx, source, job.ID)
+	if err != nil {
+		_ = s.store.FailSyncJob(ctx, job.ID, err.Error())
+		if isCredentialFailure(source.Kind, err) {
+			_ = s.store.UpdateSourceSyncState(ctx, source.ID, "paused", "credential_required")
+		}
+		return Result{}, err
+	}
+	result.JobID = job.ID
+	if err := s.attachEntityDiagnostics(ctx, source.ID, &result); err != nil {
+		return Result{}, err
+	}
+	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, EntityDiagnostics: result.EntityDiagnostics, BrokenLinks: result.BrokenLinks}); err != nil {
+		return Result{}, err
+	}
+	if source.SyncStatus == "paused" {
+		_ = s.store.UpdateSourceSyncState(ctx, source.ID, "active", "")
+	}
+	return result, nil
+}
+
+func (s *Service) attachEntityDiagnostics(ctx context.Context, sourceID string, result *Result) error {
+	health, err := s.store.GetSourceHealth(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	result.EntityDiagnostics = health.EntityDiagnostics
+	return nil
+}
+
+func (s *Service) syncSource(ctx context.Context, source storage.Source, jobID string) (Result, error) {
 	switch source.Kind {
 	case "local":
 		return s.syncLocal(ctx, source)
@@ -72,7 +161,7 @@ func (s *Service) syncSource(ctx context.Context, source storage.Source) (Result
 	case "html":
 		return s.syncHTML(ctx, source)
 	case "webdocs":
-		return s.syncWebDocs(ctx, source)
+		return s.syncWebDocs(ctx, source, jobID)
 	case "static":
 		return s.syncStatic(ctx, source)
 	case "sftp":
@@ -84,6 +173,164 @@ func (s *Service) syncSource(ctx context.Context, source storage.Source) (Result
 	default:
 		return Result{}, fmt.Errorf("sync is not supported for source kind %q", source.Kind)
 	}
+}
+
+func (s *Service) BackfillSectionEntities(ctx context.Context, opts SectionEntityBackfillOptions) (SectionEntityBackfillResult, error) {
+	sourceID := strings.TrimSpace(opts.SourceID)
+	documentID := strings.TrimSpace(opts.DocumentID)
+	if sourceID != "" && documentID != "" {
+		return SectionEntityBackfillResult{}, fmt.Errorf("source_id and document_id cannot both be set")
+	}
+	result := SectionEntityBackfillResult{}
+	if documentID != "" {
+		doc, err := s.store.GetDocument(ctx, documentID)
+		if err != nil {
+			return result, err
+		}
+		source, err := s.store.GetSource(ctx, doc.SourceID)
+		if err != nil {
+			return result, err
+		}
+		result.Sources = 1
+		if err := s.backfillDocumentSectionEntities(ctx, source, doc, &result); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
+
+	sources := make([]storage.Source, 0)
+	if sourceID != "" {
+		source, err := s.store.GetSource(ctx, sourceID)
+		if err != nil {
+			return result, err
+		}
+		sources = append(sources, source)
+	} else {
+		listed, err := s.store.ListSources(ctx)
+		if err != nil {
+			return result, err
+		}
+		sources = listed
+	}
+	result.Sources = len(sources)
+	for _, source := range sources {
+		for offset := 0; ; offset += 200 {
+			docs, err := s.store.ListSourceDocuments(ctx, source.ID, 200, offset)
+			if err != nil {
+				return result, err
+			}
+			if len(docs) == 0 {
+				break
+			}
+			for _, doc := range docs {
+				if err := s.backfillDocumentSectionEntities(ctx, source, doc, &result); err != nil {
+					return result, err
+				}
+			}
+			if len(docs) < 200 {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) backfillDocumentSectionEntities(ctx context.Context, source storage.Source, doc storage.DocumentSummary, result *SectionEntityBackfillResult) error {
+	sections := make([]storage.SectionInput, 0)
+	for offset := 0; ; offset += 200 {
+		sectionSummaries, err := s.store.ListDocumentSections(ctx, doc.ID, 200, offset)
+		if err != nil {
+			return err
+		}
+		if len(sectionSummaries) == 0 {
+			break
+		}
+		for _, summary := range sectionSummaries {
+			content, err := s.store.GetSection(ctx, summary.ID)
+			if err != nil {
+				return err
+			}
+			sections = append(sections, storage.SectionInput{
+				ID:          summary.ID,
+				DocumentID:  doc.ID,
+				HeadingPath: summary.HeadingPath,
+				Title:       summary.Title,
+				Content:     content.Content,
+				Ordinal:     summary.Ordinal,
+			})
+		}
+		if len(sectionSummaries) < 200 {
+			break
+		}
+	}
+	docInput := storage.DocumentInput{
+		ID:          doc.ID,
+		SourceID:    doc.SourceID,
+		ExternalID:  doc.ExternalID,
+		Title:       doc.Title,
+		URL:         doc.URL,
+		ContentHash: doc.ContentHash,
+	}
+	openAPISource := source.Kind == "openapi"
+	entities := sectionEntityInputsForDocument(docInput, sections, openAPISource)
+	if err := s.store.ReplaceSectionEntities(ctx, doc.ID, entities); err != nil {
+		return err
+	}
+	result.Documents++
+	result.Sections += len(sections)
+	result.Entities += len(entities)
+	if openAPISource {
+		result.OpenAPIDocuments++
+	}
+	for _, entity := range entities {
+		switch entity.Kind {
+		case string(extract.EntityAPIEndpoint):
+			result.APIEndpoints++
+		case string(extract.EntityPathLiteral):
+			result.PathLiterals++
+		case string(extract.EntityOperationCandidate):
+			result.Operations++
+		}
+	}
+	return nil
+}
+
+func sourceIDFromSyncJobPayload(payload string) string {
+	var value struct {
+		SourceID string `json:"source_id"`
+	}
+	if err := json.Unmarshal([]byte(payload), &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value.SourceID)
+}
+
+func isCredentialFailure(kind string, err error) bool {
+	switch kind {
+	case "confluence", "webdocs", "sftp":
+	default:
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"auth",
+		"unauthorized",
+		"forbidden",
+		"http 401",
+		"http 403",
+		"credential",
+		"sso",
+		"oidc",
+		"zero trust",
+		"login page",
+		"non-json response",
+		"redirected to",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) syncLocal(ctx context.Context, source storage.Source) (Result, error) {
@@ -118,6 +365,7 @@ type indexedHTMLDocument struct {
 	scanned  htmldocs.Document
 	doc      storage.DocumentInput
 	sections []storage.SectionInput
+	graph    bool
 }
 
 type htmlSectionRef struct {
@@ -149,18 +397,41 @@ func (s *Service) syncHTML(ctx context.Context, source storage.Source) (Result, 
 	return s.syncHTMLLikeDocs(ctx, source, docURLPrefix(source.ConfigJSON, root), docs)
 }
 
-func (s *Service) syncWebDocs(ctx context.Context, source storage.Source) (Result, error) {
-	docs, err := webdocs.Load(ctx, source.DSN, source.ConfigJSON)
+func (s *Service) syncWebDocs(ctx context.Context, source storage.Source, jobID string) (Result, error) {
+	docs, err := webdocs.LoadWithProgress(ctx, source.DSN, source.ConfigJSON, func(progress webdocs.Progress) {
+		_ = s.updateJobProgress(ctx, jobID, map[string]any{
+			"phase":   progress.Phase,
+			"url":     progress.URL,
+			"visited": progress.Visited,
+			"queued":  progress.Queued,
+			"depth":   progress.Depth,
+		})
+	})
 	if err != nil {
 		return Result{}, err
 	}
 	return s.syncHTMLLikeDocs(ctx, source, "", docs)
 }
 
+func (s *Service) updateJobProgress(ctx context.Context, jobID string, progress map[string]any) error {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil
+	}
+	data, err := json.Marshal(progress)
+	if err != nil {
+		return err
+	}
+	return s.store.UpdateJobProgress(ctx, jobID, string(data))
+}
+
 func (s *Service) syncHTMLLikeDocs(ctx context.Context, source storage.Source, root string, docs []htmldocs.Document) (Result, error) {
 	indexed := make([]indexedHTMLDocument, 0, len(docs))
 	keepDocumentIDs := make([]string, 0, len(docs))
 	for _, scanned := range docs {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
 		docID := ids.Stable("doc", source.ID, scanned.Path)
 		keepDocumentIDs = append(keepDocumentIDs, docID)
 		doc := storage.DocumentInput{
@@ -186,19 +457,37 @@ func (s *Service) syncHTMLLikeDocs(ctx context.Context, source storage.Source, r
 				Ordinal:     scannedSection.Ordinal,
 			})
 		}
-		if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+		doc.ContentHash = indexedDocumentHash(doc.ContentHash, sections)
+		plan, err := s.planDocumentSync(ctx, source, doc)
+		if err != nil {
 			return Result{}, err
 		}
-		if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
-			return Result{}, err
+		if plan.replace {
+			if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+			if err := s.syncSectionEntities(ctx, doc, sections, false); err != nil {
+				return Result{}, err
+			}
 		}
-		indexed = append(indexed, indexedHTMLDocument{scanned: scanned, doc: doc, sections: sections})
+		if plan.profile {
+			if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+		}
+		indexed = append(indexed, indexedHTMLDocument{scanned: scanned, doc: doc, sections: sections, graph: plan.graph})
 	}
 	if err := s.store.DeleteDocumentsNotInSource(ctx, source.ID, keepDocumentIDs); err != nil {
 		return Result{}, err
 	}
 
 	for _, item := range indexed {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		if !item.graph {
+			continue
+		}
 		if err := s.syncDocumentGraph(ctx, source, item.doc, item.sections, false); err != nil {
 			return Result{}, err
 		}
@@ -212,7 +501,11 @@ func (s *Service) syncHTMLLikeDocs(ctx context.Context, source storage.Source, r
 }
 
 func (s *Service) syncConfluence(ctx context.Context, source storage.Source) (Result, error) {
-	docs, err := confluence.Load(ctx, source.DSN, source.ConfigJSON)
+	configJSON, err := s.resolveConfluenceConfig(ctx, source)
+	if err != nil {
+		return Result{}, err
+	}
+	docs, err := confluence.Load(ctx, source.DSN, configJSON)
 	if err != nil {
 		return Result{}, err
 	}
@@ -220,6 +513,9 @@ func (s *Service) syncConfluence(ctx context.Context, source storage.Source) (Re
 	indexed := make([]indexedDocument, 0, len(docs))
 	keepDocumentIDs := make([]string, 0, len(docs))
 	for _, scanned := range docs {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
 		externalID, webURL := splitConfluenceDocumentPath(scanned.Path)
 		docID := ids.Stable("doc", source.ID, externalID)
 		keepDocumentIDs = append(keepDocumentIDs, docID)
@@ -243,24 +539,71 @@ func (s *Service) syncConfluence(ctx context.Context, source storage.Source) (Re
 				Ordinal:     scannedSection.Ordinal,
 			})
 		}
-		if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+		doc.ContentHash = indexedDocumentHash(doc.ContentHash, sections)
+		plan, err := s.planDocumentSync(ctx, source, doc)
+		if err != nil {
 			return Result{}, err
 		}
-		if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
-			return Result{}, err
+		if plan.replace {
+			if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+			if err := s.syncSectionEntities(ctx, doc, sections, false); err != nil {
+				return Result{}, err
+			}
 		}
-		indexed = append(indexed, indexedDocument{doc: doc, sections: sections})
+		if plan.profile {
+			if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+		}
+		indexed = append(indexed, indexedDocument{doc: doc, sections: sections, graph: plan.graph})
 	}
 	if err := s.store.DeleteDocumentsNotInSource(ctx, source.ID, keepDocumentIDs); err != nil {
 		return Result{}, err
 	}
 	for _, item := range indexed {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		if !item.graph {
+			continue
+		}
 		if err := s.syncDocumentGraph(ctx, source, item.doc, item.sections, false); err != nil {
 			return Result{}, err
 		}
 	}
 
 	return Result{SourceID: source.ID, Documents: len(docs)}, nil
+}
+
+func (s *Service) resolveConfluenceConfig(ctx context.Context, source storage.Source) (string, error) {
+	config := map[string]any{}
+	raw := strings.TrimSpace(source.ConfigJSON)
+	if raw == "" {
+		raw = "{}"
+	}
+	if err := json.Unmarshal([]byte(raw), &config); err != nil {
+		return "", fmt.Errorf("parse confluence source config_json: %w", err)
+	}
+	credentialID, _ := config["cookie_credential_id"].(string)
+	credentialID = strings.TrimSpace(credentialID)
+	if credentialID == "" {
+		return raw, nil
+	}
+	credential, err := s.store.GetConfluenceCookieCredential(ctx, credentialID)
+	if err != nil {
+		return "", fmt.Errorf("confluence cookie credential %q not found", credentialID)
+	}
+	if strings.TrimSpace(credential.Cookie) == "" {
+		return "", fmt.Errorf("confluence cookie credential %q has no cookie", credentialID)
+	}
+	config["cookie"] = strings.TrimSpace(credential.Cookie)
+	data, err := json.Marshal(config)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func (s *Service) syncMarkdownDocs(ctx context.Context, source storage.Source, root string, urlPrefix string) (Result, error) {
@@ -272,6 +615,9 @@ func (s *Service) syncMarkdownDocs(ctx context.Context, source storage.Source, r
 	indexed := make([]indexedDocument, 0, len(docs))
 	keepDocumentIDs := make([]string, 0, len(docs))
 	for _, scanned := range docs {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
 		docID := ids.Stable("doc", source.ID, scanned.Path)
 		keepDocumentIDs = append(keepDocumentIDs, docID)
 		doc := storage.DocumentInput{
@@ -294,19 +640,37 @@ func (s *Service) syncMarkdownDocs(ctx context.Context, source storage.Source, r
 				Ordinal:     scannedSection.Ordinal,
 			})
 		}
-		if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+		doc.ContentHash = indexedDocumentHash(doc.ContentHash, sections)
+		plan, err := s.planDocumentSync(ctx, source, doc)
+		if err != nil {
 			return Result{}, err
 		}
-		if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
-			return Result{}, err
+		if plan.replace {
+			if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+			if err := s.syncSectionEntities(ctx, doc, sections, false); err != nil {
+				return Result{}, err
+			}
 		}
-		indexed = append(indexed, indexedDocument{doc: doc, sections: sections})
+		if plan.profile {
+			if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
+				return Result{}, err
+			}
+		}
+		indexed = append(indexed, indexedDocument{doc: doc, sections: sections, graph: plan.graph})
 	}
 	if err := s.store.DeleteDocumentsNotInSource(ctx, source.ID, keepDocumentIDs); err != nil {
 		return Result{}, err
 	}
 
 	for _, item := range indexed {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		if !item.graph {
+			continue
+		}
 		if err := s.syncDocumentGraph(ctx, source, item.doc, item.sections, false); err != nil {
 			return Result{}, err
 		}
@@ -346,19 +710,78 @@ func (s *Service) syncOpenAPI(ctx context.Context, source storage.Source) (Resul
 			Ordinal:     scannedSection.Ordinal,
 		})
 	}
-	if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+	doc.ContentHash = indexedDocumentHash(doc.ContentHash, sections)
+	plan, err := s.planDocumentSync(ctx, source, doc)
+	if err != nil {
 		return Result{}, err
 	}
-	if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
-		return Result{}, err
+	if plan.replace {
+		if err := s.store.ReplaceDocument(ctx, doc, sections); err != nil {
+			return Result{}, err
+		}
+		if err := s.syncSectionEntities(ctx, doc, sections, true); err != nil {
+			return Result{}, err
+		}
+	}
+	if plan.profile {
+		if err := s.syncDocumentProfile(ctx, doc, sections); err != nil {
+			return Result{}, err
+		}
 	}
 	if err := s.store.DeleteDocumentsNotInSource(ctx, source.ID, []string{doc.ID}); err != nil {
 		return Result{}, err
 	}
-	if err := s.syncDocumentGraph(ctx, source, doc, sections, true); err != nil {
-		return Result{}, err
+	if plan.graph {
+		if err := s.syncDocumentGraph(ctx, source, doc, sections, true); err != nil {
+			return Result{}, err
+		}
 	}
 	return Result{SourceID: source.ID, Documents: 1}, nil
+}
+
+func (s *Service) planDocumentSync(ctx context.Context, source storage.Source, doc storage.DocumentInput) (documentSyncPlan, error) {
+	full := documentSyncPlan{replace: true, profile: true, graph: true}
+	existing, err := s.store.GetDocumentBySourceExternalID(ctx, doc.SourceID, doc.ExternalID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return full, nil
+	}
+	if err != nil {
+		return documentSyncPlan{}, err
+	}
+	if existing.ContentHash != doc.ContentHash {
+		return full, nil
+	}
+
+	profileCurrent := false
+	existingProfile, err := s.store.GetDocumentProfile(ctx, doc.ID)
+	if err == nil && existingProfile.GeneratedFromHash == doc.ContentHash {
+		profileCurrent = true
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return documentSyncPlan{}, err
+	}
+
+	return documentSyncPlan{
+		replace: false,
+		profile: !profileCurrent,
+		graph:   true,
+	}, nil
+}
+
+func indexedDocumentHash(sourceHash string, sections []storage.SectionInput) string {
+	sum := sha256.New()
+	sum.Write([]byte(strings.TrimSpace(sourceHash)))
+	sum.Write([]byte{0})
+	for _, section := range sections {
+		sum.Write([]byte(fmt.Sprint(section.Ordinal)))
+		sum.Write([]byte{0})
+		sum.Write([]byte(section.Title))
+		sum.Write([]byte{0})
+		sum.Write([]byte(section.HeadingPath))
+		sum.Write([]byte{0})
+		sum.Write([]byte(section.ContentHash))
+		sum.Write([]byte{0})
+	}
+	return hex.EncodeToString(sum.Sum(nil))
 }
 
 func (s *Service) syncDocumentProfile(ctx context.Context, doc storage.DocumentInput, sections []storage.SectionInput) error {
@@ -366,7 +789,11 @@ func (s *Service) syncDocumentProfile(ctx context.Context, doc storage.DocumentI
 	if err == nil && existing.GeneratedFromHash == doc.ContentHash {
 		return nil
 	}
-	profileJSON, err := profile.BuildJSON(doc, sections)
+	entities, err := s.store.ListDocumentEntities(ctx, doc.ID)
+	if err != nil {
+		return err
+	}
+	profileJSON, err := profile.BuildJSONWithAPIRefs(doc, sections, apiRefsFromSectionEntities(entities))
 	if err != nil {
 		return err
 	}
@@ -378,7 +805,129 @@ func (s *Service) syncDocumentProfile(ctx context.Context, doc storage.DocumentI
 	return err
 }
 
+func apiRefsFromSectionEntities(entities []storage.SectionEntity) []string {
+	refs := make([]string, 0, len(entities))
+	for _, entity := range entities {
+		switch entity.Kind {
+		case string(extract.EntityAPIEndpoint):
+			if entity.Method != "" && entity.Path != "" {
+				refs = append(refs, entity.Method+" "+entity.Path)
+			} else if entity.CanonicalText != "" {
+				refs = append(refs, entity.CanonicalText)
+			}
+		case string(extract.EntityPathLiteral):
+			if entity.Path != "" {
+				refs = append(refs, entity.Path)
+			}
+		}
+	}
+	return uniqueStrings(refs)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (s *Service) syncSectionEntities(ctx context.Context, doc storage.DocumentInput, sections []storage.SectionInput, openAPISource bool) error {
+	entities := sectionEntityInputsForDocument(doc, sections, openAPISource)
+	return s.store.ReplaceSectionEntities(ctx, doc.ID, entities)
+}
+
+func sectionEntityInputsForDocument(doc storage.DocumentInput, sections []storage.SectionInput, openAPISource bool) []storage.SectionEntityInput {
+	entities := make([]storage.SectionEntityInput, 0)
+	for _, section := range sections {
+		candidates := extract.ExtractSection(extract.SectionInput{
+			DocumentID:  doc.ID,
+			SectionID:   section.ID,
+			Title:       section.Title,
+			HeadingPath: section.HeadingPath,
+			Content:     section.Content,
+		})
+		if openAPISource {
+			if ref, ok := apiRefFromOpenAPISection(section); ok {
+				candidates = append(candidates, extract.FromOpenAPIEndpoint(extract.OpenAPIEndpointInput{
+					DocumentID: doc.ID,
+					SectionID:  section.ID,
+					Method:     ref.Method,
+					Path:       ref.Path,
+					Operation:  openAPIOperationFromSection(section),
+				}))
+			}
+		}
+		for _, candidate := range candidates {
+			entities = append(entities, sectionEntityInputFromCandidate(candidate))
+		}
+	}
+	return entities
+}
+
+func sectionEntityInputFromCandidate(candidate extract.EntityCandidate) storage.SectionEntityInput {
+	return storage.SectionEntityInput{
+		SectionID:     candidate.SectionID,
+		Kind:          string(candidate.Kind),
+		RawText:       candidate.Raw,
+		CanonicalText: candidate.Canonical,
+		Method:        candidate.Method,
+		Path:          candidate.Path,
+		Operation:     candidate.Operation,
+		Source:        string(candidate.Source),
+		Confidence:    candidate.Confidence,
+		Evidence:      candidate.Evidence,
+		SpanStart:     candidate.SpanStart,
+		SpanEnd:       candidate.SpanEnd,
+		Notes:         candidate.Notes,
+	}
+}
+
+func openAPIOperationFromSection(section storage.SectionInput) string {
+	for _, line := range strings.Split(section.Content, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "operationId") {
+			continue
+		}
+		return strings.TrimSpace(value)
+	}
+	title := strings.TrimSpace(section.Title)
+	if title == "" {
+		return ""
+	}
+	fields := strings.Fields(title)
+	if len(fields) == 0 {
+		return ""
+	}
+	last := fields[len(fields)-1]
+	if strings.HasPrefix(last, "/") || isHTTPMethodToken(last) {
+		return ""
+	}
+	return last
+}
+
+func isHTTPMethodToken(value string) bool {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Service) syncDocumentGraph(ctx context.Context, source storage.Source, doc storage.DocumentInput, sections []storage.SectionInput, openAPISource bool) error {
+	entities, err := s.store.ListDocumentEntities(ctx, doc.ID)
+	if err != nil {
+		return err
+	}
+	entityRefsBySection := apiRefsFromSectionEntitiesBySection(entities)
 	productNode, hasProduct := sourceHintNode("Product", "prd", source.ID, source.ProductHint)
 	moduleNode, hasModule := sourceHintNode("Module", "mod", source.ID, source.ModuleHint)
 	if hasProduct {
@@ -426,6 +975,9 @@ func (s *Service) syncDocumentGraph(ctx context.Context, source storage.Source, 
 	}
 
 	for _, section := range sections {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		sectionNode := storage.NodeInput{
 			ID:            sectionNodeID(section.ID),
 			Kind:          "DocSection",
@@ -449,7 +1001,10 @@ func (s *Service) syncDocumentGraph(ctx context.Context, source storage.Source, 
 			return err
 		}
 
-		refs := apiRefsFromSection(section)
+		refs := entityRefsBySection[section.ID]
+		if len(refs) == 0 {
+			refs = apiRefsFromSection(section)
+		}
 		if openAPISource {
 			if ref, ok := apiRefFromOpenAPISection(section); ok {
 				refs = append(refs, ref)
@@ -488,24 +1043,57 @@ func (s *Service) syncDocumentGraph(ctx context.Context, source storage.Source, 
 	return nil
 }
 
+func apiRefsFromSectionEntitiesBySection(entities []storage.SectionEntity) map[string][]apiRef {
+	refsBySection := make(map[string][]apiRef)
+	for _, entity := range entities {
+		if entity.Kind != string(extract.EntityAPIEndpoint) {
+			continue
+		}
+		ref := apiRefFromSectionEntity(entity)
+		if ref.Method == "" || ref.Path == "" || entity.SectionID == "" {
+			continue
+		}
+		refsBySection[entity.SectionID] = append(refsBySection[entity.SectionID], ref)
+	}
+	for sectionID, refs := range refsBySection {
+		refsBySection[sectionID] = uniqueAPIRefs(refs)
+	}
+	return refsBySection
+}
+
+func apiRefFromSectionEntity(entity storage.SectionEntity) apiRef {
+	return apiRef{
+		Method: strings.ToUpper(strings.TrimSpace(entity.Method)),
+		Path:   strings.TrimSpace(entity.Path),
+	}
+}
+
 func (s *Service) syncHTMLLinks(ctx context.Context, indexed []indexedHTMLDocument) ([]storage.BrokenLink, error) {
 	targets := map[string]htmlSectionRef{}
 	for _, item := range indexed {
 		docPath := filepath.ToSlash(item.scanned.Path)
+		headingAnchors := map[string]int{}
 		for i, scannedSection := range item.scanned.Sections {
 			if i >= len(item.sections) {
 				continue
 			}
 			section := item.sections[i]
+			ref := htmlSectionRef{section: section, docPath: docPath}
 			if scannedSection.Anchor != "" {
-				targets[htmlTargetKey(docPath, scannedSection.Anchor)] = htmlSectionRef{section: section, docPath: docPath}
+				targets[htmlTargetKey(docPath, scannedSection.Anchor)] = ref
+			}
+			for _, anchor := range htmlHeadingAnchorCandidates(scannedSection.Title, headingAnchors) {
+				key := htmlTargetKey(docPath, anchor)
+				if _, exists := targets[key]; !exists {
+					targets[key] = ref
+				}
 			}
 			if i == 0 {
-				targets[htmlTargetKey(docPath, "")] = htmlSectionRef{section: section, docPath: docPath}
+				targets[htmlTargetKey(docPath, "")] = ref
 				for _, anchor := range item.scanned.Anchors {
 					key := htmlTargetKey(docPath, anchor)
 					if _, exists := targets[key]; !exists {
-						targets[key] = htmlSectionRef{section: section, docPath: docPath}
+						targets[key] = ref
 					}
 				}
 			}
@@ -514,6 +1102,9 @@ func (s *Service) syncHTMLLinks(ctx context.Context, indexed []indexedHTMLDocume
 
 	broken := make([]storage.BrokenLink, 0)
 	for _, item := range indexed {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sourceDocPath := filepath.ToSlash(item.scanned.Path)
 		for i, scannedSection := range item.scanned.Sections {
 			if i >= len(item.sections) {
@@ -623,9 +1214,8 @@ func resolveHTMLHref(sourceDocPath string, href string) string {
 
 func resolveHTMLHrefCandidates(sourceDocPath string, href string) []string {
 	href = strings.TrimSpace(href)
-	href = strings.SplitN(href, "?", 2)[0]
 	parts := strings.SplitN(href, "#", 2)
-	targetPath := strings.TrimSpace(parts[0])
+	targetPath := strings.TrimSpace(strings.SplitN(parts[0], "?", 2)[0])
 	anchor := ""
 	if len(parts) == 2 {
 		anchor = strings.TrimSpace(parts[1])
@@ -674,6 +1264,14 @@ func htmlPathCandidates(path string) []string {
 		path = "index.html"
 	}
 	candidates := []string{path}
+	if base := strings.ToLower(filepath.Base(path)); base == ".html" || base == ".htm" {
+		dir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+		if dir == "." || dir == "" {
+			candidates = append(candidates, "index.html")
+		} else {
+			candidates = append(candidates, filepath.ToSlash(filepath.Join(dir, "index.html")))
+		}
+	}
 	if strings.HasSuffix(path, "/") || strings.HasSuffix(path, "/.") {
 		candidates = append(candidates, strings.TrimRight(path, "/.")+"/index.html")
 	}
@@ -698,7 +1296,53 @@ func htmlPathCandidates(path string) []string {
 }
 
 func htmlTargetKey(docPath string, anchor string) string {
-	return filepath.ToSlash(docPath) + "#" + strings.TrimPrefix(strings.TrimSpace(anchor), "#")
+	docPath = filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(docPath))))
+	if docPath == "." || docPath == "" {
+		docPath = "index.html"
+	}
+	return docPath + "#" + normalizeHTMLAnchor(anchor)
+}
+
+func normalizeHTMLAnchor(anchor string) string {
+	anchor = strings.TrimPrefix(strings.TrimSpace(anchor), "#")
+	if anchor == "" {
+		return ""
+	}
+	if decoded, err := url.PathUnescape(anchor); err == nil {
+		return strings.TrimSpace(decoded)
+	}
+	return anchor
+}
+
+func htmlHeadingAnchorCandidates(title string, counts map[string]int) []string {
+	slug := htmlHeadingSlug(title)
+	if slug == "" {
+		return nil
+	}
+	count := counts[slug]
+	counts[slug] = count + 1
+	if count == 0 {
+		return []string{slug}
+	}
+	return []string{fmt.Sprintf("%s-%d", slug, count)}
+}
+
+func htmlHeadingSlug(title string) string {
+	var b strings.Builder
+	lastDash := true
+	for _, r := range strings.TrimSpace(title) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(unicode.ToLower(r))
+			lastDash = false
+		case unicode.IsSpace(r) || r == '-' || r == '_':
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func uniqueBrokenLinks(links []storage.BrokenLink) []storage.BrokenLink {

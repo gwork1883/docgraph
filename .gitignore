@@ -9,3 +9,5 @@ bin/
 .codex
 .agents
 .claude/
+*.gz
+*.yaml

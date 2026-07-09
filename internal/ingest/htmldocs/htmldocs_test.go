@@ -48,6 +48,45 @@ func TestParseExtractsHTMLTextAndInternalLinks(t *testing.T) {
 	}
 }
 
+func TestParseKeepsTableUnderCurrentHeading(t *testing.T) {
+	doc := Parse("guides/baking.html", []byte(`<!doctype html>
+<html>
+  <head><title>Baking Temperature Guide</title></head>
+  <body>
+    <h2>5. General Tips</h2>
+    <h3 id="oven-temps">Oven Temperatures</h3>
+    <p><strong>Preheat the oven before placing items inside.</strong></p>
+    <table>
+      <thead>
+        <tr><th>Mode</th><th>Conventional</th><th>Fan-assisted</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Bread</td><td>220 °C</td><td>200 °C</td></tr>
+        <tr><td>Cookies</td><td>190 °C</td><td>170 °C</td></tr>
+      </tbody>
+    </table>
+  </body>
+</html>`))
+
+	if len(doc.Sections) != 2 {
+		t.Fatalf("Sections len = %d, want 2: %+v", len(doc.Sections), doc.Sections)
+	}
+	section := doc.Sections[1]
+	if section.Title != "Oven Temperatures" || section.Anchor != "oven-temps" {
+		t.Fatalf("section heading = %+v, want oven-temps heading", section)
+	}
+	for _, want := range []string{
+		"Preheat the oven before placing items inside.",
+		"Mode | Conventional | Fan-assisted",
+		"Bread | 220 °C | 200 °C",
+		"Cookies | 190 °C | 170 °C",
+	} {
+		if !contains(section.Content, want) {
+			t.Fatalf("section content = %q, want %q", section.Content, want)
+		}
+	}
+}
+
 func TestScanLoadsOnlyHTMLFiles(t *testing.T) {
 	root := t.TempDir()
 	writeHTMLTestFile(t, filepath.Join(root, "index.html"), `<h1>Home</h1><p>htmlscantoken</p>`)

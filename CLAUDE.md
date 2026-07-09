@@ -60,7 +60,7 @@ config — leaf package, no internal imports
 
 - **`internal/server/server.go`** — Go 1.22+ `http.ServeMux` with method-based routing. Token auth via `X-DocGraph-Token`/`X-ProductGraph-Token`/`Authorization: Bearer` with `subtle.ConstantTimeCompare`. Embedded Web UI via `go:embed`.
 
-- **`internal/mcp/server.go`** — JSON-RPC 2.0 over stdio. 6 tools: `doc_search`, `doc_context`, `doc_get_node`, `doc_get_section`, `doc_related`, `doc_impact`. Backward-compatible aliases (`product_search` → `doc_search`). Search tools accept budgeted parameters (max_searches, max_results, max_sections_per_document, profile_detail, max_chars_per_result). `doc_get_section` retrieves full section content by ID without truncation.
+- **`internal/mcp/server.go`** — JSON-RPC 2.0 over stdio. Advertised tools: `doc_search`, `doc_get_node`, `doc_get_section`, `doc_related`, `doc_impact`; legacy `doc_context` and `product_*` aliases remain callable for compatibility. Search tools accept budgeted parameters (max_searches, max_results, max_sections_per_document, profile_detail, max_chars_per_result). `doc_get_section` retrieves full section content by ID without truncation.
 
 ### Configuration
 

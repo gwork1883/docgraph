@@ -3,12 +3,15 @@ package webdocs
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/docgraph/docgraph/internal/ingest/htmldocs"
+	"github.com/go-rod/rod/lib/launcher"
 )
 
 func TestLoadCrawlsSeedAndDescendantLinks(t *testing.T) {
@@ -244,8 +247,158 @@ func TestParseConfigIsSPA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseConfig error: %v", err)
 	}
-	if cfg2.IsSPA {
-		t.Errorf("IsSPA = %v, want false (default)", cfg2.IsSPA)
+	if cfg2.IsSPA || cfg2.CrawlMode != "auto" {
+		t.Errorf("config = %+v, want auto crawl mode without forced SPA", cfg2)
+	}
+}
+
+func TestParseConfigCrawlMode(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{`{}`, "auto"},
+		{`{"crawl_mode":"auto"}`, "auto"},
+		{`{"crawl_mode":"static"}`, "static"},
+		{`{"crawl_mode":"browser"}`, "browser"},
+		{`{"crawl_mode":"in_page"}`, "in_page"},
+		{`{"crawl_mode":"spa"}`, "browser"},
+		{`{"crawl_mode":"off"}`, "static"},
+		{`{"crawl_mode":"invalid"}`, "auto"},
+	}
+	for _, tt := range tests {
+		cfg, err := parseConfig(tt.raw)
+		if err != nil {
+			t.Fatalf("parseConfig(%s) error: %v", tt.raw, err)
+		}
+		if cfg.CrawlMode != tt.want {
+			t.Fatalf("parseConfig(%s).CrawlMode = %q, want %q", tt.raw, cfg.CrawlMode, tt.want)
+		}
+	}
+}
+
+func TestVirtualDocPath(t *testing.T) {
+	tests := []struct {
+		base  string
+		title string
+		key   string
+		want  string
+	}{
+		{"index.html", "Topic One", "nav-1", "index/topic-one.html"},
+		{"guide/index.html", "Reference Entry", "nav-2", "guide/reference-entry.html"},
+		{"docs/page.html", "", "entry-alpha", "docs/page/entry-alpha.html"},
+	}
+	for _, tt := range tests {
+		if got := virtualDocPath(tt.base, tt.title, tt.key); got != tt.want {
+			t.Fatalf("virtualDocPath(%q, %q, %q) = %q, want %q", tt.base, tt.title, tt.key, got, tt.want)
+		}
+	}
+}
+
+func TestInPageTraversalQueueKeepsExploringAfterExpansion(t *testing.T) {
+	queue := newInPageTraversalQueue()
+	if added := queue.enqueue([]inPageCandidate{{Key: "group-a", Text: "Group A"}}); added != 1 {
+		t.Fatalf("initial enqueue added %d candidates, want 1", added)
+	}
+	parent, ok := queue.next()
+	if !ok || parent.Key != "group-a" {
+		t.Fatalf("next = %+v, %v; want group-a", parent, ok)
+	}
+
+	// A parent menu click often changes only the visible navigation tree.
+	added := queue.enqueue([]inPageCandidate{
+		{Key: "group-a", Text: "Group A"},
+		{Key: "topic-alpha", Text: "Topic Alpha"},
+		{Key: "topic-beta", Text: "Topic Beta"},
+	})
+	if added != 2 {
+		t.Fatalf("expanded enqueue added %d candidates, want only the two new children", added)
+	}
+	queue.recordProgress(added > 0)
+	if !queue.canContinue(0, 8) {
+		t.Fatalf("queue stopped after expansion-only click")
+	}
+	child, ok := queue.next()
+	if !ok || child.Key != "topic-alpha" {
+		t.Fatalf("child next = %+v, %v; want topic-alpha", child, ok)
+	}
+}
+
+func TestLoadSplitsInPageMenuDocuments(t *testing.T) {
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("Chrome, Chromium, or Edge not available")
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local test listener not available: %v", err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/docs":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, `<!doctype html>
+<html>
+  <head><title>In Page Docs</title></head>
+  <body>
+    <div id="app"></div>
+    <noscript>JavaScript enabled is required.</noscript>
+    <script src="/app.js"></script>
+  </body>
+</html>`)
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = io.WriteString(w, `
+const docs = {
+  alpha: ['Topic Alpha', 'Topic alpha neutralalpha content with enough words for indexing and in page discovery.'],
+  beta: ['Topic Beta', 'Topic beta neutralbeta content with enough words for indexing and in page discovery.'],
+  gamma: ['Topic Gamma', 'Topic gamma neutralgamma content with enough words for indexing and in page discovery.'],
+  delta: ['Topic Delta', 'Topic delta neutraldelta content with enough words for indexing and in page discovery.']
+};
+let active = '';
+const open = { start: false, advanced: false };
+function toggle(group) {
+  open[group] = !open[group];
+  render();
+}
+function selectDoc(key) {
+  active = key;
+  render();
+}
+function render() {
+  const current = docs[active] || ['Overview', 'Choose a topic.'];
+  document.getElementById('app').innerHTML =
+    '<div class="docs-sidebar" role="tree">' +
+      '<div class="el-submenu">' +
+        '<button class="el-submenu__title" aria-expanded="' + open.start + '" onclick="toggle(\'start\')">Start Group</button>' +
+        (open.start ? '<div role="group"><button class="el-menu-item" onclick="selectDoc(\'alpha\')">Topic Alpha</button><button class="el-menu-item" onclick="selectDoc(\'beta\')">Topic Beta</button></div>' : '') +
+      '</div>' +
+      '<div class="el-submenu">' +
+        '<button class="el-submenu__title" aria-expanded="' + open.advanced + '" onclick="toggle(\'advanced\')">Advanced Group</button>' +
+        (open.advanced ? '<div role="group"><button class="el-menu-item" onclick="selectDoc(\'gamma\')">Topic Gamma</button><button class="el-menu-item" onclick="selectDoc(\'delta\')">Topic Delta</button></div>' : '') +
+      '</div>' +
+    '</div><main class="docs-content"><h1>' + current[0] + '</h1><p>' + current[1] + '</p></main>';
+}
+render();
+`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	docs, err := Load(context.Background(), server.URL+"/docs", `{"crawl_mode":"in_page","max_pages":"8"}`)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(docs) < 4 {
+		t.Fatalf("Load returned %d docs, want in-page menu documents: %+v", len(docs), docs)
+	}
+	for _, want := range []string{"neutralalpha", "neutralbeta", "neutralgamma", "neutraldelta"} {
+		if !sectionsContain(docs, want) {
+			t.Fatalf("docs = %+v, want all nested in-page menu content including %s", docs, want)
+		}
 	}
 }
 

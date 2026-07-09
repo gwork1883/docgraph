@@ -25,7 +25,7 @@ Search 页面提供面向文档 section 和 profile 的本地检索。
 - 单个 Go 可执行文件，内置 Web UI。
 - 本地 SQLite + FTS5，不依赖外部数据库。
 - 支持 local、git、static、html、sftp、confluence、openapi、webdocs 等来源。
-- 支持 `doc_search`、`doc_context`、`doc_get_node`、`doc_get_section`、`doc_related`、`doc_impact` MCP 工具。
+- 支持 `doc_search`、`doc_get_node`、`doc_get_section`、`doc_related`、`doc_impact` MCP 工具；旧版 `doc_context` 调用仍兼容，但不再主动暴露。
 - 支持中文检索辅助 profile、本地知识图谱节点/边、同步任务历史和反馈标注。
 - 支持 token 模式保护 Web/API/MCP 入口。
 

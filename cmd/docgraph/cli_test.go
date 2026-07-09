@@ -73,6 +73,16 @@ GET /member/benefits returns available member benefits.
 	if result.Documents != 1 {
 		t.Fatalf("sync Documents = %d, want 1", result.Documents)
 	}
+	if result.EntityDiagnostics.APIEndpoints == 0 {
+		t.Fatalf("sync entity diagnostics = %+v, want API endpoint count", result.EntityDiagnostics)
+	}
+
+	backfillOut := runDocGraph(t, "maintenance", "section-entities-backfill", "--data", dataDir, "--source-id", source.ID)
+	var backfill syncsvc.SectionEntityBackfillResult
+	decodeJSON(t, backfillOut, &backfill)
+	if backfill.Documents != 1 || backfill.Entities == 0 || backfill.APIEndpoints == 0 {
+		t.Fatalf("backfill result = %+v, want restored technical entities", backfill)
+	}
 
 	searchOut := runDocGraph(t, "search", "--data", dataDir, "member", "benefits")
 	var searchResult struct {

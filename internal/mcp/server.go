@@ -8,18 +8,47 @@ import (
 	"io"
 	"strings"
 
+	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 // Handler processes individual MCP JSON-RPC messages, independent of transport.
 type Handler struct {
-	query *query.Service
-	store storage.Store
+	query                     *query.Service
+	store                     storage.Store
+	embedder                  embedding.Embedder
+	embeddingGeneratorVersion string
+	vectorSearchWeight        float64
 }
 
 func NewHandler(queryService *query.Service, store storage.Store) *Handler {
-	return &Handler{query: queryService, store: store}
+	return NewHandlerWithEmbedding(queryService, store, embedding.NewNoOpEmbedder(), embedding.DefaultGeneratorVersion)
+}
+
+func NewHandlerWithEmbedding(queryService *query.Service, store storage.Store, embedder embedding.Embedder, generatorVersion string) *Handler {
+	return NewHandlerWithEmbeddingAndSearchWeight(queryService, store, embedder, generatorVersion, 0.4)
+}
+
+func NewHandlerWithEmbeddingAndSearchWeight(queryService *query.Service, store storage.Store, embedder embedding.Embedder, generatorVersion string, vectorSearchWeight float64) *Handler {
+	if embedder == nil {
+		embedder = embedding.NewNoOpEmbedder()
+	}
+	if strings.TrimSpace(generatorVersion) == "" {
+		generatorVersion = embedding.DefaultGeneratorVersion
+	}
+	return &Handler{query: queryService, store: store, embedder: embedder, embeddingGeneratorVersion: generatorVersion, vectorSearchWeight: normalizeVectorSearchWeight(vectorSearchWeight)}
+}
+
+func normalizeVectorSearchWeight(weight float64) float64 {
+	if weight <= 0 {
+		return 0.4
+	}
+	if weight > 1 {
+		return 1
+	}
+	return weight
 }
 
 // Handle dispatches a single JSON-RPC request and returns the response.
@@ -40,6 +69,33 @@ func NewServer(queryService *query.Service, in io.Reader, out io.Writer) *Server
 
 func NewServerWithStore(queryService *query.Service, store storage.Store, in io.Reader, out io.Writer) *Server {
 	return &Server{handler: NewHandler(queryService, store), in: in, out: out}
+}
+
+func NewServerWithStoreAndEmbedding(queryService *query.Service, store storage.Store, embedder embedding.Embedder, generatorVersion string, vectorSearchWeight float64, in io.Reader, out io.Writer) *Server {
+	return NewServerWithStoreAndEmbeddingAndPlan(queryService, store, embedder, generatorVersion, vectorSearchWeight, "auto", "auto", in, out)
+}
+
+func NewServerWithStoreAndEmbeddingAndPlan(queryService *query.Service, store storage.Store, embedder embedding.Embedder, generatorVersion string, vectorSearchWeight float64, tokenizer string, chunkStrategy string, in io.Reader, out io.Writer) *Server {
+	if runtimeSetter, ok := store.(vectorstore.SearchRuntimeSetter); ok && embedder != nil && strings.TrimSpace(embedder.Model()) != "" {
+		tokenizer = strings.TrimSpace(tokenizer)
+		if tokenizer == "" {
+			tokenizer = "auto"
+		}
+		chunkStrategy = strings.TrimSpace(chunkStrategy)
+		if chunkStrategy == "" {
+			chunkStrategy = "auto"
+		}
+		runtimeSetter.SetVectorSearchRuntime(vectorstore.SearchRuntime{
+			Embedder:         embedder,
+			SearchWeight:     normalizeVectorSearchWeight(vectorSearchWeight),
+			VectorCandidates: 60,
+			MinSimilarity:    0,
+			GeneratorVersion: generatorVersion,
+			Tokenizer:        tokenizer,
+			ChunkStrategy:    chunkStrategy,
+		})
+	}
+	return &Server{handler: NewHandlerWithEmbeddingAndSearchWeight(queryService, store, embedder, generatorVersion, vectorSearchWeight), in: in, out: out}
 }
 
 type Request struct {
@@ -64,6 +120,13 @@ type ResponseError struct {
 const (
 	protocolVersion2024 = "2024-11-05"
 	protocolVersion2025 = "2025-11-25"
+)
+
+const (
+	docGraphInstructions = "DocGraph is a local documentation knowledge server. Start with doc_search detail='summary' to discover relevant sections, then call doc_get_section for selected section IDs. Preserve the user's language and exact terms in search intents and queries; do not translate non-English issues into English-only queries. For troubleshooting, narrow the issue intent and evidence chain before searching, and treat keyword-only matches as peripheral unless they directly support the chain. Prompt template: doc_answer."
+
+	troubleshootingSearchPromptName = "doc_answer"
+	troubleshootingSearchPromptDesc = "Use DocGraph's local documentation knowledge base to answer a question or build a troubleshooting path from indexed docs."
 )
 
 var supportedProtocolVersions = map[string]bool{
@@ -119,8 +182,10 @@ func handle(ctx context.Context, h *Handler, req Request) Response {
 		resp.Result = map[string]any{
 			"protocolVersion": negotiateProtocolVersion(req.Params),
 			"capabilities": map[string]any{
-				"tools": map[string]any{},
+				"tools":   map[string]any{},
+				"prompts": map[string]any{},
 			},
+			"instructions": docGraphInstructions,
 			"serverInfo": map[string]any{
 				"name":    "docgraph",
 				"version": "dev",
@@ -130,6 +195,15 @@ func handle(ctx context.Context, h *Handler, req Request) Response {
 		resp.Result = map[string]any{"tools": tools()}
 	case "tools/call":
 		result, err := callTool(ctx, h, req.Params)
+		if err != nil {
+			resp.Error = &ResponseError{Code: -32602, Message: err.Error()}
+			return resp
+		}
+		resp.Result = result
+	case "prompts/list":
+		resp.Result = map[string]any{"prompts": prompts()}
+	case "prompts/get":
+		result, err := getPrompt(req.Params)
 		if err != nil {
 			resp.Error = &ResponseError{Code: -32602, Message: err.Error()}
 			return resp
@@ -162,6 +236,11 @@ type toolCallParams struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+type promptGetParams struct {
+	Name      string         `json:"name"`
+	Arguments map[string]any `json:"arguments"`
+}
+
 func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, error) {
 	var call toolCallParams
 	if err := json.Unmarshal(params, &call); err != nil {
@@ -182,6 +261,8 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 			Detail                 string   `json:"detail"`
 			UseRelationExpansion   *bool    `json:"use_relation_expansion"`
 			RelationTypes          []string `json:"relation_types"`
+			ExactTerms             []string `json:"exact_terms"`
+			SemanticIntents        []string `json:"semantic_intents"`
 		}
 		if err := json.Unmarshal(call.Arguments, &args); err != nil {
 			return nil, fmt.Errorf("invalid doc_search arguments: %w", err)
@@ -199,16 +280,20 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 			useRelationExpansion = *args.UseRelationExpansion
 		}
 		opts := storage.SearchOptions{
-			Query:                  args.Query,
-			Limit:                  clampBudget(maxResults, 8, 30),
-			MaxSearches:            clampBudget(args.MaxSearches, 5, 5),
-			MaxSectionsPerDocument: clampBudget(args.MaxSectionsPerDocument, 2, 5),
-			ProfileDetail:          strings.TrimSpace(args.ProfileDetail),
-			MaxCharsPerResult:      clampBudget(args.MaxCharsPerResult, 1000, 4000),
-			Detail:                 detail,
-			UseRelationExpansion:   useRelationExpansion,
-			RelationDepth:          1,
-			RelationTypes:          args.RelationTypes,
+			Query:                     args.Query,
+			Limit:                     clampBudget(maxResults, 8, 30),
+			MaxSearches:               clampBudget(args.MaxSearches, 5, 5),
+			MaxSectionsPerDocument:    clampBudget(args.MaxSectionsPerDocument, 2, 5),
+			ProfileDetail:             strings.TrimSpace(args.ProfileDetail),
+			MaxCharsPerResult:         clampBudget(args.MaxCharsPerResult, 1000, 4000),
+			Detail:                    detail,
+			UseRelationExpansion:      useRelationExpansion,
+			RelationDepth:             1,
+			RelationTypes:             args.RelationTypes,
+			OriginalQuery:             args.Query,
+			ExactTerms:                args.ExactTerms,
+			SemanticIntents:           args.SemanticIntents,
+			EmbeddingGeneratorVersion: h.embeddingGeneratorVersion,
 		}
 		// In summary mode, profile_detail and max_chars_per_result are irrelevant
 		if detail == "summary" {
@@ -420,6 +505,30 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 	}
 }
 
+func (h *Handler) queryEmbedding(ctx context.Context, queryText string, intents []string, enabled bool) ([]float32, string, error) {
+	if !enabled || h.embedder == nil || strings.TrimSpace(h.embedder.Model()) == "" {
+		return nil, "", nil
+	}
+	texts := []string{strings.TrimSpace(queryText)}
+	texts = append(texts, intents...)
+	text := strings.Join(nonEmptyStrings(texts), "\n")
+	if text == "" {
+		return nil, "", nil
+	}
+	vectors, err := h.embedder.Embed(ctx, []string{text})
+	if err != nil {
+		return nil, "", err
+	}
+	if len(vectors) == 0 {
+		return nil, "", nil
+	}
+	return vectors[0], h.embedder.Model(), nil
+}
+
+func (h *Handler) canUseVectorCandidates() bool {
+	return h.embedder != nil && strings.TrimSpace(h.embedder.Model()) != ""
+}
+
 func toolResult(value any) any {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -442,6 +551,17 @@ func clampBudget(value int, fallback int, hardLimit int) int {
 	return value
 }
 
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 func canonicalToolName(name string) string {
 	switch name {
 	case "product_search":
@@ -459,35 +579,92 @@ func canonicalToolName(name string) string {
 	}
 }
 
+func prompts() []map[string]any {
+	return []map[string]any{
+		{
+			"name":        troubleshootingSearchPromptName,
+			"description": troubleshootingSearchPromptDesc,
+			"arguments": []map[string]any{
+				{
+					"name":        "issue",
+					"description": "The troubleshooting issue or symptom to investigate in local documentation.",
+					"required":    true,
+				},
+			},
+		},
+	}
+}
+
+func getPrompt(params json.RawMessage) (any, error) {
+	var req promptGetParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, fmt.Errorf("invalid prompt params: %w", err)
+	}
+	switch strings.TrimSpace(req.Name) {
+	case troubleshootingSearchPromptName:
+		issue := strings.TrimSpace(fmt.Sprint(req.Arguments["issue"]))
+		if issue == "" || issue == "<nil>" {
+			return nil, fmt.Errorf("argument issue is required")
+		}
+		return map[string]any{
+			"description": troubleshootingSearchPromptDesc,
+			"messages": []map[string]any{
+				{
+					"role": "user",
+					"content": map[string]any{
+						"type": "text",
+						"text": troubleshootingSearchPromptText(issue),
+					},
+				},
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown prompt %q", req.Name)
+	}
+}
+
+func troubleshootingSearchPromptText(issue string) string {
+	return "Use DocGraph's local documentation knowledge base to answer this question: " + issue + "\n\n" +
+		"1. Rewrite the question as a concise answer intent in the user's original language.\n" +
+		"2. Preserve exact user-provided terms in search queries; for Chinese questions, keep Chinese terms as the primary query language and do not translate them into English-only queries.\n" +
+		"3. Identify the evidence chain that must be explained.\n" +
+		"4. Search with exact user-provided terms first, then add maintainer-facing terminology only as supplemental aliases.\n" +
+		"5. Start with doc_search detail='summary' to scan matching sections and next-read signals.\n" +
+		"6. Fetch selected sections with doc_get_section before relying on detailed claims.\n" +
+		"7. Build the answer from evidence directly tied to the chain.\n" +
+		"8. Downgrade keyword-only matches to peripheral notes unless they directly support the chain."
+}
+
 func tools() []map[string]any {
 	return []map[string]any{
 		{
 			"name": "doc_search",
-			"description": "Search the DocGraph knowledge base for indexed documentation. " +
-				"By default returns lightweight summaries (section IDs, titles, heading paths, snippets) to help you quickly identify relevant sections. " +
-				"Use detail='content' to include full text content, or call doc_get_section on specific section_ids for targeted deep reading.\n\n" +
-				"Recommended workflow: 1) Call doc_search with default detail='summary' to scan results, " +
-				"2) Identify the most relevant section_ids, " +
-				"3) Call doc_get_section for those section_ids to get complete content.\n\n" +
-				"This two-step approach keeps your context focused and reduces information overload.",
+			"description": "Search indexed local documentation with hybrid retrieval over Chinese terms, technical symbols, identifier subterms, Unicode FTS, trigram matching, profile fallback, substring fallback, and maintained terminology dictionaries. When vector search is enabled, results also include semantic vector candidates fused via intent-adaptive RRF. " +
+				"Default detail='summary' returns section IDs, titles, heading paths, snippets, suggested_reads.explicit_references, and hit metadata (plus hybrid diagnostics when vector search is enabled); use detail='content' for one-shot full text or call doc_get_section for selected section IDs. " +
+				"Preserve product names, business terms, config keys, schema fields, enum values, API names, paths, and code symbols verbatim; add clear aliases or module names only when they clarify intent. " +
+				"For troubleshooting, search with a concise issue intent plus exact user-provided terms; prefer evidence directly tied to the issue chain over keyword-only matches.",
+			"annotations": map[string]any{
+				"readOnlyHint":  true,
+				"openWorldHint": false,
+			},
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"query": map[string]any{
 						"type":        "string",
-						"description": "Search query. Use natural language or keywords to find relevant documentation. Examples: 'authentication flow', 'how to configure SFTP source', 'REST API error handling'",
+						"description": "Search query. Use natural language, keywords, or a mix. The backend keeps the query text and also expands it with GSE Chinese terms, technical symbols, identifier subterms, trigram/profile/substring fallbacks, and future terminology dictionaries. Preserve exact product names, business terms, config keys, schema fields, enum values, API names, file paths, and code identifiers verbatim; add aliases or related terms only when they clarify the user's intent. For troubleshooting, prefer a concise issue intent and maintainer-facing terms over raw prompt noise. Examples: 'access control schema operation group configuration', 'authentication flow', 'how to configure SFTP source', 'REST API error handling'",
 					},
 					"limit": map[string]any{
 						"type":        "integer",
 						"minimum":     1,
-						"maximum":     200,
-						"description": "Deprecated — use max_results instead. Maximum number of results.",
+						"maximum":     30,
+						"description": "Deprecated alias for max_results. Clamped to the same maximum as max_results.",
 					},
 					"max_searches": map[string]any{
 						"type":        "integer",
 						"minimum":     1,
 						"maximum":     5,
-						"description": "Maximum number of internal search strategies to attempt (phrase match, token match, etc.). Higher values improve recall. Default 3.",
+						"description": "Maximum number of internal search strategies to attempt, in order, from token/Unicode FTS and trigram search through profile and substring fallbacks. Higher values improve recall and may broaden results. Default 5.",
 					},
 					"max_results": map[string]any{
 						"type":        "integer",
@@ -521,6 +698,16 @@ func tools() []map[string]any {
 						"type":        "boolean",
 						"description": "Whether to use approved knowledge relations for one-hop retrieval expansion and result explanations. Default true.",
 					},
+					"exact_terms": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Must-keep exact terms such as API paths, config keys, error codes, symbols, or identifiers. They continue through exact/lexical search even when semantic intents are supplied.",
+					},
+					"semantic_intents": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Optional semantic intent expansions for recall planning. They do not replace query or exact_terms. When vector search is enabled, providing intents biases retrieval toward semantic matching over exact-text lookup.",
+					},
 					"relation_types": map[string]any{
 						"type":        "array",
 						"items":       map[string]any{"type": "string", "enum": []string{"related_to", "schema_reference", "deprecated_by", "should_ignore"}},
@@ -531,47 +718,10 @@ func tools() []map[string]any {
 			},
 		},
 		{
-			"name": "doc_context",
-			"description": "Build a focused, evidence-backed context pack from indexed documentation for a specific task or question. " +
-				"Returns up to max_sections matching document sections with full text content, document titles, URLs, and heading paths.\n\n" +
-				"Use this tool when:\n" +
-				"- You need comprehensive documentation context to answer a complex question about a product or system\n" +
-				"- You want to understand a product's capabilities, architecture, or behavior in depth\n" +
-				"- You need to gather evidence from multiple documents to support a conclusion\n\n" +
-				"This is the primary tool for getting full document content. The returned content is the complete indexed text " +
-				"from the documentation — you do NOT need to fetch the document_url separately. " +
-				"If you only need quick keyword matches, use doc_search instead.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"task": map[string]any{
-						"type":        "string",
-						"description": "Natural language description of what you need documentation context for. Example: 'Explain the authentication architecture of Product X', 'How does data sync work for Git sources?'",
-					},
-					"query": map[string]any{
-						"type":        "string",
-						"description": "Search query to find relevant documentation. Used if task is not provided, or as a supplement to task for more targeted retrieval.",
-					},
-					"max_sections": map[string]any{
-						"type":        "integer",
-						"minimum":     1,
-						"maximum":     20,
-						"description": "Maximum number of documentation sections to include in the context pack. Default 8.",
-					},
-					"max_chars": map[string]any{
-						"type":        "integer",
-						"minimum":     1000,
-						"maximum":     20000,
-						"description": "Total character budget for all section content combined. Increase this (up to 20000) for comprehensive context. Default 12000.",
-					},
-				},
-			},
-		},
-		{
 			"name": "doc_get_node",
 			"description": "Fetch a knowledge graph node by its ID. " +
 				"Returns the node's kind (product, module, document, section, api, term), name, canonical name, confidence, and metadata. " +
-				"Does NOT return document content — use doc_search, doc_context, or doc_get_section for content.\n\n" +
+				"Does NOT return document content — use doc_search or doc_get_section for content.\n\n" +
 				"Use this tool when:\n" +
 				"- You already have a node ID from a previous search or graph traversal and want its metadata\n" +
 				"- You need to identify what kind of entity a node represents before exploring its relationships",
@@ -666,18 +816,19 @@ func tools() []map[string]any {
 		{
 			"name": "doc_get_section",
 			"description": "Retrieve the full text content of a specific documentation section by its section_id. " +
-				"Returns the complete section content with document title, heading path, and source URL.\n\n" +
+				"Returns the complete section content with document title, heading path, source URL, and explicit author-written references. " +
+				"It does not automatically read referenced target sections.\n\n" +
 				"Use this tool when:\n" +
 				"- You have a section_id from a previous doc_search (summary mode) result and need the full content\n" +
 				"- The content from a search result was truncated and you want to see the complete section\n\n" +
-				"This is the second step of the recommended search workflow: doc_search → identify relevant section_ids → doc_get_section.\n" +
+				"This is the second step of the recommended search workflow: doc_search → suggested reads / explicit references → doc_get_section.\n" +
 				"This returns the original indexed text — you do NOT need to fetch the document_url.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"id": map[string]any{
 						"type":        "string",
-						"description": "Section ID from a previous doc_search or doc_context result",
+						"description": "Section ID from a previous doc_search result or suggested read",
 					},
 				},
 				"required": []string{"id"},

@@ -21,6 +21,7 @@ import (
 
 	"github.com/docgraph/docgraph/internal/domain"
 	"github.com/docgraph/docgraph/internal/ingest/confluence"
+	"github.com/docgraph/docgraph/internal/ingest/htmldocs"
 	"github.com/docgraph/docgraph/internal/ingest/webdocs"
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage/sqlite"
@@ -169,6 +170,110 @@ GET /member/benefits returns available member benefits.
 	}
 	if !searchHitsContain(hits, "GET /member/benefits") {
 		t.Fatalf("SearchSections hits = %#v, want API content", hits)
+	}
+}
+
+func TestSyncSourceWritesSectionEntitiesForLocalMarkdown(t *testing.T) {
+	ctx := context.Background()
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "entities.md"), `# Entity API
+
+## Filter
+
+interface | /entity/v1/entities:filter-filter-count
+method | POST
+
+## Storage
+
+/storage/任意片段/meta
+/EntityV1/BatchGetEntityMeta
+`)
+
+	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	if _, err := store.CreateSource(ctx, domain.Source{
+		ID:   "src_local_entities",
+		Kind: "local",
+		Name: "Entity Docs",
+		DSN:  "file://" + docsDir,
+	}); err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if _, err := NewService(store).SyncSource(ctx, "src_local_entities"); err != nil {
+		t.Fatalf("SyncSource returned error: %v", err)
+	}
+
+	artifacts, err := store.ListSourceArtifacts(ctx, "src_local_entities", 10, 0)
+	if err != nil {
+		t.Fatalf("ListSourceArtifacts returned error: %v", err)
+	}
+	if len(artifacts.Documents) != 1 {
+		t.Fatalf("documents = %+v, want one document", artifacts.Documents)
+	}
+	entities, err := store.ListDocumentEntities(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities returned error: %v", err)
+	}
+	if !sectionEntitiesContain(entities, "api_endpoint", "POST", "/entity/v1/entities:filter-filter-count", "", "table", 0.85) {
+		t.Fatalf("entities = %+v, want table-derived POST endpoint", entities)
+	}
+	if !sectionEntitiesContain(entities, "path_literal", "", "/storage/任意片段/meta", "", "text", 0.40) {
+		t.Fatalf("entities = %+v, want path-only storage literal", entities)
+	}
+	if !sectionEntitiesContain(entities, "path_literal", "", "/EntityV1/BatchGetEntityMeta", "", "text", 0.40) {
+		t.Fatalf("entities = %+v, want CamelCase path literal", entities)
+	}
+	if sectionEntitiesContain(entities, "api_endpoint", "GET", "/storage/任意片段/meta", "", "", 0) {
+		t.Fatalf("entities = %+v, did not want default GET endpoint for path-only evidence", entities)
+	}
+
+	profile, err := store.GetDocumentProfile(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("GetDocumentProfile returned error: %v", err)
+	}
+	var generated struct {
+		APIRefs []string `json:"api_refs"`
+	}
+	if err := json.Unmarshal([]byte(profile.RetrievalProfileJSON), &generated); err != nil {
+		t.Fatalf("unmarshal retrieval profile: %v", err)
+	}
+	if !stringValuesContain(generated.APIRefs, "/EntityV1/BatchGetEntityMeta") {
+		t.Fatalf("profile API refs = %+v, want stored CamelCase path ref", generated.APIRefs)
+	}
+
+	if err := store.ReplaceSectionEntities(ctx, artifacts.Documents[0].ID, nil); err != nil {
+		t.Fatalf("clear ReplaceSectionEntities returned error: %v", err)
+	}
+	cleared, err := store.ListDocumentEntities(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities after clear returned error: %v", err)
+	}
+	if len(cleared) != 0 {
+		t.Fatalf("cleared entities = %+v, want none", cleared)
+	}
+	backfill, err := NewService(store).BackfillSectionEntities(ctx, SectionEntityBackfillOptions{SourceID: "src_local_entities"})
+	if err != nil {
+		t.Fatalf("BackfillSectionEntities returned error: %v", err)
+	}
+	if backfill.Documents != 1 || backfill.Entities == 0 || backfill.APIEndpoints == 0 || backfill.PathLiterals == 0 {
+		t.Fatalf("backfill result = %+v, want restored endpoint and path entities", backfill)
+	}
+	restored, err := store.ListDocumentEntities(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities after backfill returned error: %v", err)
+	}
+	if !sectionEntitiesContain(restored, "api_endpoint", "POST", "/entity/v1/entities:filter-filter-count", "", "table", 0.85) {
+		t.Fatalf("restored entities = %+v, want table-derived POST endpoint", restored)
 	}
 }
 
@@ -651,6 +756,89 @@ where edges.kind = 'contains'
 `)
 }
 
+func TestSyncSourceGraphUsesStoredSectionEntities(t *testing.T) {
+	ctx := context.Background()
+	docsDir := t.TempDir()
+	writeFile(t, filepath.Join(docsDir, "entities.md"), `# Entity API
+
+## Filter
+
+interface | /entity/v1/entities:filter-filter-count
+method | POST
+
+## Storage
+
+/storage/任意片段/meta
+`)
+
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := sqlite.Open(ctx, "sqlite://"+dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	_, err = store.CreateSource(ctx, domain.Source{
+		ID:   "src_entity_graph",
+		Kind: "local",
+		Name: "Entity Docs",
+		DSN:  "file://" + docsDir,
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	service := NewService(store)
+	for i := 0; i < 2; i++ {
+		if _, err := service.SyncSource(ctx, "src_entity_graph"); err != nil {
+			t.Fatalf("SyncSource run %d returned error: %v", i+1, err)
+		}
+	}
+
+	graphDB := openGraphDB(t, dbPath)
+	assertGraphCount(t, ctx, graphDB, 1, `
+select count(*)
+from nodes
+where kind = 'API'
+  and name = 'POST /entity/v1/entities:filter-filter-count'
+`)
+	assertGraphCount(t, ctx, graphDB, 1, `
+select count(*)
+from edges
+join nodes src on src.id = edges.src_id
+join nodes dst on dst.id = edges.dst_id
+where edges.kind = 'mentions'
+  and src.kind = 'DocSection'
+  and src.name = 'Filter'
+  and dst.kind = 'API'
+  and dst.name = 'POST /entity/v1/entities:filter-filter-count'
+  and edges.evidence_section_id is not null
+`)
+	assertGraphCount(t, ctx, graphDB, 0, `
+select count(*)
+from nodes
+where kind = 'API'
+  and name like '%/storage/任意片段/meta'
+`)
+	assertGraphCount(t, ctx, graphDB, 0, `
+select count(*)
+from edges
+join nodes src on src.id = edges.src_id
+join nodes dst on dst.id = edges.dst_id
+where edges.kind = 'exposes_api'
+  and src.kind = 'Document'
+  and dst.kind = 'API'
+  and dst.name = 'POST /entity/v1/entities:filter-filter-count'
+`)
+}
+
 func TestSyncSourceIndexesOpenAPIIntoSQLite(t *testing.T) {
 	ctx := context.Background()
 	specPath := filepath.Join(t.TempDir(), "membership.openapi.json")
@@ -731,6 +919,68 @@ func TestSyncSourceIndexesOpenAPIIntoSQLite(t *testing.T) {
 	}
 }
 
+func TestSyncSourceWritesSectionEntitiesForOpenAPI(t *testing.T) {
+	ctx := context.Background()
+	specPath := filepath.Join(t.TempDir(), "entity.openapi.json")
+	writeFile(t, specPath, `{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Entity API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/entity/v1/entities": {
+      "get": {
+        "operationId": "ListEntities",
+        "summary": "List entities"
+      }
+    }
+  }
+}`)
+
+	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	if _, err := store.CreateSource(ctx, domain.Source{
+		ID:   "src_openapi_entities",
+		Kind: "openapi",
+		Name: "Entity API",
+		DSN:  "file://" + specPath,
+	}); err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if _, err := NewService(store).SyncSource(ctx, "src_openapi_entities"); err != nil {
+		t.Fatalf("SyncSource returned error: %v", err)
+	}
+
+	artifacts, err := store.ListSourceArtifacts(ctx, "src_openapi_entities", 10, 0)
+	if err != nil {
+		t.Fatalf("ListSourceArtifacts returned error: %v", err)
+	}
+	if len(artifacts.Documents) != 1 {
+		t.Fatalf("documents = %+v, want one document", artifacts.Documents)
+	}
+	entities, err := store.ListDocumentEntities(ctx, artifacts.Documents[0].ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities returned error: %v", err)
+	}
+	if !sectionEntitiesContain(entities, "api_endpoint", "GET", "/entity/v1/entities", "ListEntities", "openapi", 1.0) {
+		t.Fatalf("entities = %+v, want authoritative OpenAPI endpoint", entities)
+	}
+	if !sectionEntitiesContain(entities, "operation_candidate", "", "", "ListEntities", "text", 0.55) {
+		t.Fatalf("entities = %+v, want operation candidate from operationId", entities)
+	}
+}
+
 func TestSyncSourceCreatesOpenAPIGraphAPIAndEvidenceEdges(t *testing.T) {
 	ctx := context.Background()
 	specPath := filepath.Join(t.TempDir(), "membership.openapi.json")
@@ -790,6 +1040,12 @@ select count(*)
 from nodes
 where kind = 'API'
   and (name = 'GET /member/benefits' or canonical_name in ('GET /member/benefits', 'get /member/benefits'))
+`)
+	assertGraphCount(t, ctx, graphDB, 0, `
+select count(*)
+from nodes
+where kind = 'API'
+  and name = 'getMemberBenefits'
 `)
 	assertGraphCount(t, ctx, graphDB, 1, `
 select count(*)
@@ -1157,6 +1413,77 @@ where edges.kind = 'links_to'
 	}
 	assertSearchEmpty(t, ctx, store, "htmlsyncquotatoken")
 	assertSearchContains(t, ctx, store, "htmlsyncapitoken", "Member HTML Docs")
+}
+
+func TestSyncHTMLReplacesWhenParsedSectionsChangeDespiteSameSourceHash(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := sqlite.Open(ctx, "sqlite://"+dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	source, err := store.CreateSource(ctx, domain.Source{
+		ID:   "src_same_raw_hash",
+		Kind: "html",
+		Name: "HTML Docs",
+		DSN:  "unused",
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	service := NewService(store)
+	first := htmldocs.Document{
+		Path:  "index.html",
+		Title: "Parser Sensitive",
+		Hash:  "same-source-hash",
+		Sections: []htmldocs.Section{{
+			Title:       "Overview",
+			HeadingPath: []string{"Overview"},
+			Content:     "old parsed text oldparsedtoken GET /entity/v1/old",
+			Hash:        "old-section-hash",
+			Ordinal:     0,
+		}},
+	}
+	if _, err := service.syncHTMLLikeDocs(ctx, source, "", []htmldocs.Document{first}); err != nil {
+		t.Fatalf("first syncHTMLLikeDocs returned error: %v", err)
+	}
+
+	second := first
+	second.Sections = []htmldocs.Section{{
+		Title:       "Overview",
+		HeadingPath: []string{"Overview"},
+		Content:     "new parsed text newparsedtoken GET /entity/v1/new",
+		Hash:        "new-section-hash",
+		Ordinal:     0,
+	}}
+	if _, err := service.syncHTMLLikeDocs(ctx, source, "", []htmldocs.Document{second}); err != nil {
+		t.Fatalf("second syncHTMLLikeDocs returned error: %v", err)
+	}
+	assertSearchContains(t, ctx, store, "newparsedtoken", "Parser Sensitive")
+	assertSearchEmpty(t, ctx, store, "oldparsedtoken")
+	oldEntities, err := store.SearchEntities(ctx, "/entity/v1/old", 10)
+	if err != nil {
+		t.Fatalf("SearchEntities old path returned error: %v", err)
+	}
+	if len(oldEntities) != 0 {
+		t.Fatalf("old entities = %+v, want replaced entity rows removed", oldEntities)
+	}
+	newEntities, err := store.SearchEntities(ctx, "/entity/v1/new", 10)
+	if err != nil {
+		t.Fatalf("SearchEntities new path returned error: %v", err)
+	}
+	if !sectionEntitiesContain(newEntities, "api_endpoint", "GET", "/entity/v1/new", "", "text", 0.95) {
+		t.Fatalf("new entities = %+v, want replacement endpoint", newEntities)
+	}
 }
 
 func TestSyncSourceResolvesDocumentCenterRelativeAnchors(t *testing.T) {
@@ -1682,6 +2009,40 @@ func searchHitsContain(hits []domain.SearchHit, text string) bool {
 		if strings.Contains(hit.Content, text) {
 			return true
 		}
+	}
+	return false
+}
+
+func stringValuesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sectionEntitiesContain(entities []domain.SectionEntity, kind string, method string, path string, operation string, source string, minConfidence float64) bool {
+	for _, entity := range entities {
+		if kind != "" && entity.Kind != kind {
+			continue
+		}
+		if method != "" && entity.Method != method {
+			continue
+		}
+		if path != "" && entity.Path != path {
+			continue
+		}
+		if operation != "" && entity.Operation != operation {
+			continue
+		}
+		if source != "" && entity.Source != source {
+			continue
+		}
+		if minConfidence > 0 && entity.Confidence < minConfidence {
+			continue
+		}
+		return true
 	}
 	return false
 }

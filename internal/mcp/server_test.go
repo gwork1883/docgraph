@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/docgraph/docgraph/internal/domain"
+	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage"
 )
@@ -22,9 +24,11 @@ func TestInitialize(t *testing.T) {
 	var result struct {
 		ProtocolVersion string `json:"protocolVersion"`
 		Capabilities    struct {
-			Tools map[string]any `json:"tools"`
+			Tools   map[string]any `json:"tools"`
+			Prompts map[string]any `json:"prompts"`
 		} `json:"capabilities"`
-		ServerInfo struct {
+		Instructions string `json:"instructions"`
+		ServerInfo   struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
 		} `json:"serverInfo"`
@@ -35,6 +39,17 @@ func TestInitialize(t *testing.T) {
 	}
 	if result.Capabilities.Tools == nil {
 		t.Fatalf("capabilities.tools is nil, want object")
+	}
+	if result.Capabilities.Prompts == nil {
+		t.Fatalf("capabilities.prompts is nil, want object")
+	}
+	if len(result.Capabilities.Prompts) != 0 {
+		t.Fatalf("capabilities.prompts = %+v, want empty object", result.Capabilities.Prompts)
+	}
+	for _, want := range []string{"local documentation knowledge server", "doc_search detail='summary'", "user's language", "exact terms", "English-only queries", "evidence chain", "keyword-only matches", "doc_answer"} {
+		if !strings.Contains(result.Instructions, want) {
+			t.Fatalf("initialize instructions missing %q: %s", want, result.Instructions)
+		}
 	}
 	if result.ServerInfo.Name != "docgraph" || result.ServerInfo.Version == "" {
 		t.Fatalf("serverInfo = %+v, want docgraph with version", result.ServerInfo)
@@ -50,6 +65,7 @@ func TestToolsList(t *testing.T) {
 		Tools []struct {
 			Name        string         `json:"name"`
 			Description string         `json:"description"`
+			Annotations map[string]any `json:"annotations"`
 			InputSchema map[string]any `json:"inputSchema"`
 		} `json:"tools"`
 	}
@@ -64,11 +80,155 @@ func TestToolsList(t *testing.T) {
 		if tool.InputSchema["type"] != "object" {
 			t.Fatalf("tool %q inputSchema.type = %v, want object", tool.Name, tool.InputSchema["type"])
 		}
+		if tool.Name == "doc_search" {
+			for _, want := range []string{
+				"hybrid retrieval",
+				"Chinese terms",
+				"technical symbols",
+				"trigram matching",
+				"profile fallback",
+				"substring fallback",
+				"detail='summary'",
+				"suggested_reads.explicit_references",
+				"hit metadata",
+				"detail='content'",
+				"doc_get_section",
+				"Preserve product names",
+				"business terms",
+				"module names",
+				"concise issue intent",
+				"issue chain",
+				"keyword-only matches",
+			} {
+				if !strings.Contains(tool.Description, want) {
+					t.Fatalf("doc_search description missing %q: %s", want, tool.Description)
+				}
+			}
+			if tool.Annotations["readOnlyHint"] != true {
+				t.Fatalf("doc_search readOnlyHint = %v, want true", tool.Annotations["readOnlyHint"])
+			}
+			if tool.Annotations["openWorldHint"] != false {
+				t.Fatalf("doc_search openWorldHint = %v, want false", tool.Annotations["openWorldHint"])
+			}
+			properties, ok := tool.InputSchema["properties"].(map[string]any)
+			if !ok {
+				t.Fatalf("doc_search properties = %#v, want object", tool.InputSchema["properties"])
+			}
+			required, ok := tool.InputSchema["required"].([]any)
+			if !ok || !jsonArrayContains(required, "query") {
+				t.Fatalf("doc_search required = %#v, want query", tool.InputSchema["required"])
+			}
+			querySchema, ok := properties["query"].(map[string]any)
+			if !ok {
+				t.Fatalf("doc_search query schema = %#v, want object", properties["query"])
+			}
+			queryDescription, _ := querySchema["description"].(string)
+			for _, want := range []string{"Preserve exact product names", "business terms", "GSE Chinese terms", "future terminology dictionaries", "maintainer-facing terms", "raw prompt noise"} {
+				if !strings.Contains(queryDescription, want) {
+					t.Fatalf("doc_search query description missing %q: %s", want, queryDescription)
+				}
+			}
+			limitSchema, ok := properties["limit"].(map[string]any)
+			if !ok {
+				t.Fatalf("doc_search limit schema = %#v, want object", properties["limit"])
+			}
+			if limitSchema["maximum"] != float64(30) {
+				t.Fatalf("doc_search limit maximum = %v, want 30", limitSchema["maximum"])
+			}
+			limitDescription, _ := limitSchema["description"].(string)
+			for _, want := range []string{"Deprecated alias", "Clamped"} {
+				if !strings.Contains(limitDescription, want) {
+					t.Fatalf("doc_search limit description missing %q: %s", want, limitDescription)
+				}
+			}
+			for _, name := range []string{"exact_terms", "semantic_intents"} {
+				if _, ok := properties[name].(map[string]any); !ok {
+					t.Fatalf("doc_search properties missing %q: %#v", name, properties)
+				}
+			}
+			for _, name := range []string{"use_vector_search", "vector_weight", "chunk_size", "batch_size"} {
+				if _, ok := properties[name]; ok {
+					t.Fatalf("doc_search exposes internal vector parameter %q: %#v", name, properties)
+				}
+			}
+		}
 	}
-	for _, name := range []string{"doc_search", "doc_context", "doc_get_node", "doc_related", "doc_impact"} {
+	for _, name := range []string{"doc_search", "doc_get_section", "doc_get_node", "doc_related", "doc_impact"} {
 		if !gotNames[name] {
 			t.Fatalf("tools/list missing %q in %+v", name, result.Tools)
 		}
+	}
+	if gotNames["doc_context"] {
+		t.Fatalf("tools/list includes disabled doc_context in %+v", result.Tools)
+	}
+}
+
+func TestPromptsListAndGet(t *testing.T) {
+	responses := runTestServer(t, newTestQueryService(t),
+		`{"jsonrpc":"2.0","id":"prompts","method":"prompts/list"}`,
+		`{"jsonrpc":"2.0","id":"prompt","method":"prompts/get","params":{"name":"doc_answer","arguments":{"issue":"imported license changes are not reflected in access control page"}}}`,
+	)
+	listResp := requireResponse(t, responses, 0, `"prompts"`)
+	requireNoRPCError(t, listResp)
+	var listResult struct {
+		Prompts []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Arguments   []struct {
+				Name     string `json:"name"`
+				Required bool   `json:"required"`
+			} `json:"arguments"`
+		} `json:"prompts"`
+	}
+	unmarshalResult(t, listResp, &listResult)
+	if len(listResult.Prompts) != 1 || listResult.Prompts[0].Name != "doc_answer" {
+		t.Fatalf("prompts/list = %+v, want doc_answer", listResult.Prompts)
+	}
+	if listResult.Prompts[0].Description == "" {
+		t.Fatalf("doc_answer description is empty")
+	}
+	if len(listResult.Prompts[0].Arguments) != 1 || listResult.Prompts[0].Arguments[0].Name != "issue" || !listResult.Prompts[0].Arguments[0].Required {
+		t.Fatalf("doc_answer arguments = %+v, want required issue", listResult.Prompts[0].Arguments)
+	}
+
+	getResp := requireResponse(t, responses, 1, `"prompt"`)
+	requireNoRPCError(t, getResp)
+	var getResult struct {
+		Description string `json:"description"`
+		Messages    []struct {
+			Role    string `json:"role"`
+			Content struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	unmarshalResult(t, getResp, &getResult)
+	if getResult.Description == "" || len(getResult.Messages) != 1 {
+		t.Fatalf("prompts/get result = %+v, want description and one message", getResult)
+	}
+	message := getResult.Messages[0]
+	if message.Role != "user" || message.Content.Type != "text" {
+		t.Fatalf("prompt message = %+v, want user text message", message)
+	}
+	for _, want := range []string{"DocGraph's local documentation knowledge base", "user's original language", "Chinese questions", "Chinese terms as the primary query language", "English-only queries", "supplemental aliases", "evidence chain", "doc_search detail='summary'", "doc_get_section", "keyword-only matches"} {
+		if !strings.Contains(message.Content.Text, want) {
+			t.Fatalf("prompt text missing %q: %s", want, message.Content.Text)
+		}
+	}
+}
+
+func TestPromptsGetUnknownPrompt(t *testing.T) {
+	responses := runTestServer(t, newTestQueryService(t), `{"jsonrpc":"2.0","id":"unknown-prompt","method":"prompts/get","params":{"name":"unknown","arguments":{"issue":"missing docs"}}}`)
+	resp := requireResponse(t, responses, 0, `"unknown-prompt"`)
+	if resp.Error == nil {
+		t.Fatalf("unknown prompt error is nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Fatalf("unknown prompt error code = %d, want -32602", resp.Error.Code)
+	}
+	if !strings.Contains(resp.Error.Message, `unknown prompt "unknown"`) {
+		t.Fatalf("unknown prompt error message = %q", resp.Error.Message)
 	}
 }
 
@@ -109,6 +269,26 @@ func TestProductSearchToolCall(t *testing.T) {
 	}
 }
 
+func TestDocSearchFallsBackWhenEmbeddingFails(t *testing.T) {
+	store := newTestStore(t)
+	queryService := query.NewService(store)
+	responses := runTestServerWithEmbedding(t, queryService, store, mcpFailingEmbedder{}, `{"jsonrpc":"2.0","id":"fallback","method":"tools/call","params":{"name":"doc_search","arguments":{"query":"member benefits","limit":5}}}`)
+	resp := requireResponse(t, responses, 0, `"fallback"`)
+	requireNoRPCError(t, resp)
+
+	var payload struct {
+		Attempts []storage.SearchAttempt `json:"attempts"`
+		Hits     []storage.SearchHit     `json:"hits"`
+	}
+	unmarshalToolText(t, resp, &payload)
+	if len(payload.Hits) == 0 || payload.Hits[0].DocumentID != "doc-member" {
+		t.Fatalf("doc_search hits = %+v, want lexical fallback hit", payload.Hits)
+	}
+	if !hasMCPAttemptError(payload.Attempts, "vector", "embedding_failed") {
+		t.Fatalf("doc_search attempts = %+v, want vector embedding_failed attempt", payload.Attempts)
+	}
+}
+
 func TestLegacyProductSearchToolAlias(t *testing.T) {
 	responses := runTestServer(t, newTestQueryService(t), `{"jsonrpc":"2.0","id":"legacy","method":"tools/call","params":{"name":"product_search","arguments":{"query":"member benefits","limit":5}}}`)
 	resp := requireResponse(t, responses, 0, `"legacy"`)
@@ -120,6 +300,42 @@ func TestLegacyProductSearchToolAlias(t *testing.T) {
 	unmarshalToolText(t, resp, &payload)
 	if len(payload.Hits) == 0 {
 		t.Fatalf("legacy product_search returned no hits")
+	}
+}
+
+func TestDocSearchToolReturnsExplicitReferenceSummary(t *testing.T) {
+	store := newTestStore(t)
+	seedMCPExplicitReferenceDocument(t, store)
+	responses := runTestServerWithStore(t, query.NewService(store), store, `{"jsonrpc":"2.0","id":"refs","method":"tools/call","params":{"name":"doc_search","arguments":{"query":"configuring operations","max_results":5,"max_sections_per_document":5}}}`)
+	resp := requireResponse(t, responses, 0, `"refs"`)
+	requireNoRPCError(t, resp)
+
+	var payload struct {
+		Hits           []storage.SearchHit `json:"hits"`
+		SuggestedReads struct {
+			ExplicitReferences  []domain.ExplicitReference `json:"explicit_references"`
+			ImplicitSymbolLinks []domain.SuggestedRead     `json:"implicit_symbol_links"`
+			CuratedRelations    []domain.SuggestedRead     `json:"curated_relations"`
+			StructuralNeighbors []domain.SuggestedRead     `json:"structural_neighbors"`
+		} `json:"suggested_reads"`
+	}
+	unmarshalToolText(t, resp, &payload)
+	hit := findMCPSearchHit(payload.Hits, "section-explicit-source")
+	if hit == nil {
+		t.Fatalf("doc_search hits = %+v, want explicit source hit", payload.Hits)
+	}
+	if !hit.HasExplicitReferences || hit.ExplicitReferenceCount != 1 {
+		t.Fatalf("explicit source hit = %+v, want reference summary metadata", *hit)
+	}
+	if len(payload.SuggestedReads.ExplicitReferences) == 0 {
+		t.Fatalf("suggested_reads = %+v, want explicit reference suggestions", payload.SuggestedReads)
+	}
+	ref := payload.SuggestedReads.ExplicitReferences[0]
+	if ref.SourceSectionID != "section-explicit-source" || ref.TargetSectionID != "section-explicit-propagation" || !ref.Resolved {
+		t.Fatalf("explicit reference suggestion = %+v, want resolved propagation target", ref)
+	}
+	if payload.SuggestedReads.ImplicitSymbolLinks == nil || payload.SuggestedReads.CuratedRelations == nil || payload.SuggestedReads.StructuralNeighbors == nil {
+		t.Fatalf("suggested_reads = %+v, want separate non-explicit fields", payload.SuggestedReads)
 	}
 }
 
@@ -219,28 +435,18 @@ func TestProductSearchToolClampsInvalidBudgetsAndBoundsFullProfile(t *testing.T)
 	}
 }
 
-func TestProductContextToolCall(t *testing.T) {
+func TestProductContextToolCallCompatibility(t *testing.T) {
 	responses := runTestServer(t, newTestQueryService(t), `{"jsonrpc":"2.0","id":"ctx","method":"tools/call","params":{"name":"doc_context","arguments":{"task":"Summarize member benefits","max_sections":3,"max_chars":500}}}`)
 	resp := requireResponse(t, responses, 0, `"ctx"`)
 	requireNoRPCError(t, resp)
 
-	var payload query.ContextPack
-	unmarshalToolText(t, resp, &payload)
-	if payload.Task != "Summarize member benefits" || payload.Query != "Summarize member benefits" {
-		t.Fatalf("context task/query = %q/%q, want task-derived query", payload.Task, payload.Query)
+	var pack query.ContextPack
+	unmarshalToolText(t, resp, &pack)
+	if pack.Query != "Summarize member benefits" {
+		t.Fatalf("doc_context query = %q, want task fallback", pack.Query)
 	}
-	if len(payload.Sections) == 0 {
+	if len(pack.Sections) == 0 {
 		t.Fatalf("doc_context returned no sections")
-	}
-	section := payload.Sections[0]
-	if section.DocumentTitle != "Member Benefits" {
-		t.Fatalf("first context document title = %q, want Member Benefits", section.DocumentTitle)
-	}
-	if section.Evidence == "" || !strings.Contains(section.Evidence, "Member Benefits") {
-		t.Fatalf("first context evidence = %q, want source evidence", section.Evidence)
-	}
-	if !strings.Contains(strings.ToLower(section.Content), "member benefits") {
-		t.Fatalf("first context content = %q, want member benefits content", section.Content)
 	}
 }
 
@@ -403,6 +609,45 @@ func runTestServerWithStore(t *testing.T, queryService *query.Service, store sto
 	return responses
 }
 
+func runTestServerWithEmbedding(t *testing.T, queryService *query.Service, store storage.Store, embedder embedding.Embedder, messages ...string) []rpcResponse {
+	t.Helper()
+
+	input := bytes.NewBufferString(strings.Join(messages, "\n") + "\n")
+	var output bytes.Buffer
+	server := NewServerWithStoreAndEmbedding(queryService, store, embedder, "test-generator", 0.4, input, &output)
+	if err := server.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	var responses []rpcResponse
+	scanner := bufio.NewScanner(&output)
+	for scanner.Scan() {
+		var resp rpcResponse
+		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response line %q: %v", scanner.Text(), err)
+		}
+		responses = append(responses, resp)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan responses: %v", err)
+	}
+	return responses
+}
+
+type mcpFailingEmbedder struct{}
+
+func (mcpFailingEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	return nil, fmt.Errorf("embedding unavailable")
+}
+
+func (mcpFailingEmbedder) Model() string {
+	return "test-embedding"
+}
+
+func (mcpFailingEmbedder) Dimensions() int {
+	return 2
+}
+
 func newTestQueryService(t *testing.T) *query.Service {
 	t.Helper()
 	return query.NewService(newTestStore(t))
@@ -533,6 +778,68 @@ func newTestStore(t *testing.T) storage.Store {
 		t.Fatalf("replace document: %v", err)
 	}
 	return store
+}
+
+func seedMCPExplicitReferenceDocument(t *testing.T, store storage.Store) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-explicit",
+		SourceID:    "source-docs",
+		ExternalID:  "schema.md",
+		Title:       "Schema",
+		URL:         "file:///docs/schema.md",
+		Version:     "v1",
+		ContentHash: "hash-doc-explicit",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-explicit-source",
+			DocumentID:  "doc-explicit",
+			HeadingPath: "Schema > Operation",
+			Title:       "Operation",
+			Content:     "When configuring operations, detailed rules see §5 Propagation propagation rules.",
+			ContentHash: "hash-section-explicit-source",
+			Ordinal:     0,
+		},
+		{
+			ID:          "section-explicit-propagation",
+			DocumentID:  "doc-explicit",
+			HeadingPath: "Schema > 5 Propagation propagation rules",
+			Title:       "5 Propagation propagation rules",
+			Content:     "Propagation propagation rules apply to existing roles.",
+			ContentHash: "hash-section-explicit-propagation",
+			Ordinal:     1,
+		},
+	}); err != nil {
+		t.Fatalf("replace explicit reference document: %v", err)
+	}
+}
+
+func findMCPSearchHit(hits []storage.SearchHit, sectionID string) *storage.SearchHit {
+	for i := range hits {
+		if hits[i].SectionID == sectionID {
+			return &hits[i]
+		}
+	}
+	return nil
+}
+
+func jsonArrayContains(values []any, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMCPAttemptError(attempts []storage.SearchAttempt, kind string, contains string) bool {
+	for _, attempt := range attempts {
+		if attempt.Kind == kind && strings.Contains(attempt.Error, contains) {
+			return true
+		}
+	}
+	return false
 }
 
 func requireResponse(t *testing.T, responses []rpcResponse, index int, wantID string) rpcResponse {

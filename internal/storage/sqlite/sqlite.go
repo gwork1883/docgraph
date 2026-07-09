@@ -18,15 +18,20 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/docgraph/docgraph/internal/domain"
+	"github.com/docgraph/docgraph/internal/embeddingchunk"
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/searchtoken"
 	"github.com/docgraph/docgraph/internal/storage/sqlschema"
+	"github.com/docgraph/docgraph/internal/technical/extract"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 type Store struct {
-	db     *sql.DB
-	reader *sql.DB
-	dsn    string
+	db            *sql.DB
+	reader        *sql.DB
+	dsn           string
+	vectorBackend vectorstore.Store
+	vectorRuntime vectorstore.SearchRuntime
 }
 
 const (
@@ -71,6 +76,15 @@ func open(ctx context.Context, dsn string, create bool) (*Store, error) {
 }
 
 func (s *Store) Close() error {
+	if s.vectorBackend != nil {
+		if err := s.vectorBackend.Close(); err != nil {
+			if s.reader != nil {
+				_ = s.reader.Close()
+			}
+			_ = s.db.Close()
+			return err
+		}
+	}
 	if s.reader == nil {
 		return s.db.Close()
 	}
@@ -79,6 +93,14 @@ func (s *Store) Close() error {
 		return err
 	}
 	return s.db.Close()
+}
+
+func (s *Store) SetVectorBackend(backend vectorstore.Store) {
+	s.vectorBackend = backend
+}
+
+func (s *Store) SetVectorSearchRuntime(runtime vectorstore.SearchRuntime) {
+	s.vectorRuntime = runtime
 }
 
 func openSQLiteHandle(ctx context.Context, path string, maxOpenConns int, role string) (*sql.DB, error) {
@@ -826,6 +848,10 @@ func (s *Store) ListSourceArtifacts(ctx context.Context, sourceID string, limit,
 	if err != nil {
 		return domain.SourceArtifacts{}, err
 	}
+	sectionEntities, err := s.ListSourceSectionEntities(ctx, sourceID, limit, offset)
+	if err != nil {
+		return domain.SourceArtifacts{}, err
+	}
 	nodes, err := s.ListSourceNodes(ctx, sourceID, limit, offset)
 	if err != nil {
 		return domain.SourceArtifacts{}, err
@@ -834,13 +860,19 @@ func (s *Store) ListSourceArtifacts(ctx context.Context, sourceID string, limit,
 	if err != nil {
 		return domain.SourceArtifacts{}, err
 	}
+	entityDiagnostics, err := s.sourceEntityDiagnostics(ctx, sourceID, 20)
+	if err != nil {
+		return domain.SourceArtifacts{}, err
+	}
 	return domain.SourceArtifacts{
-		SourceID:  sourceID,
-		Counts:    counts,
-		Documents: docs,
-		Sections:  sections,
-		Nodes:     nodes,
-		Edges:     edges,
+		SourceID:          sourceID,
+		Counts:            counts,
+		EntityDiagnostics: entityDiagnostics,
+		Documents:         docs,
+		Sections:          sections,
+		SectionEntities:   sectionEntities,
+		Nodes:             nodes,
+		Edges:             edges,
 	}, nil
 }
 
@@ -880,7 +912,276 @@ where src.metadata_json like ?
 `, sourceIDLike(sourceID), sourceIDLike(sourceID), sourceID).Scan(&counts.Edges); err != nil {
 		return counts, err
 	}
+	if err := s.readDB().QueryRowContext(ctx, `
+select count(*)
+from section_entities se
+join documents d on d.id = se.document_id
+where d.source_id = ?
+`, sourceID).Scan(&counts.SectionEntities); err != nil {
+		return counts, err
+	}
 	return counts, nil
+}
+
+func (s *Store) GetSourceHealth(ctx context.Context, sourceID string) (domain.SourceHealth, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return domain.SourceHealth{}, fmt.Errorf("source id is required")
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return domain.SourceHealth{}, err
+	}
+	counts, err := s.GetSourceArtifactCounts(ctx, sourceID)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	entityDiagnostics, err := s.sourceEntityDiagnostics(ctx, sourceID, 20)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	zeroDocs, err := s.listZeroSectionDocuments(ctx, sourceID, 50)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	lowSections, err := s.listLowContentSections(ctx, sourceID, 50)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	staleFeedback, err := s.listSourceDocumentFeedback(ctx, sourceID, "document_stale", 100)
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	jobs, err := s.ListJobs(ctx, domain.JobListOptions{SourceID: sourceID, Kind: "sync_source", Limit: 1})
+	if err != nil {
+		return domain.SourceHealth{}, err
+	}
+	var latestJob domain.Job
+	var brokenLinks []domain.BrokenLink
+	if len(jobs) > 0 {
+		latestJob = jobs[0]
+		brokenLinks = brokenLinksFromJob(latestJob)
+	}
+	warnings := sourceHealthWarnings(counts, entityDiagnostics, latestJob, brokenLinks, zeroDocs, lowSections, staleFeedback)
+	return domain.SourceHealth{
+		SourceID:             sourceID,
+		Counts:               counts,
+		EntityDiagnostics:    entityDiagnostics,
+		LatestJob:            latestJob,
+		BrokenLinks:          brokenLinks,
+		ZeroSectionDocuments: zeroDocs,
+		LowContentSections:   lowSections,
+		StaleFeedback:        staleFeedback,
+		Warnings:             warnings,
+	}, nil
+}
+
+func (s *Store) listZeroSectionDocuments(ctx context.Context, sourceID string, limit int) ([]domain.DocumentSummary, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select documents.id, documents.source_id, documents.external_id, documents.title, documents.url,
+       documents.content_hash, documents.indexed_at, count(sections.id)
+from documents
+left join sections on sections.document_id = documents.id
+where documents.source_id = ?
+group by documents.id
+having count(sections.id) = 0
+order by documents.indexed_at desc, documents.title asc
+limit ?
+`, sourceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var docs []domain.DocumentSummary
+	for rows.Next() {
+		var doc domain.DocumentSummary
+		if err := rows.Scan(&doc.ID, &doc.SourceID, &doc.ExternalID, &doc.Title, &doc.URL, &doc.ContentHash, &doc.IndexedAt, &doc.SectionCount); err != nil {
+			return nil, err
+		}
+		doc.NodeID = stableDocumentNodeID(doc.ID)
+		docs = append(docs, doc)
+	}
+	return docs, rows.Err()
+}
+
+func (s *Store) listLowContentSections(ctx context.Context, sourceID string, limit int) ([]domain.SectionSummary, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
+       substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 220),
+       sections.content_hash, sections.ordinal
+from sections
+join documents on documents.id = sections.document_id
+where documents.source_id = ?
+  and length(trim(sections.content)) < 80
+order by length(trim(sections.content)) asc, documents.title asc, sections.ordinal asc
+limit ?
+`, sourceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sections []domain.SectionSummary
+	for rows.Next() {
+		var section domain.SectionSummary
+		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.ContentHash, &section.Ordinal); err != nil {
+			return nil, err
+		}
+		section.NodeID = stableSectionNodeID(section.ID)
+		sections = append(sections, section)
+	}
+	return sections, rows.Err()
+}
+
+func (s *Store) listSourceDocumentFeedback(ctx context.Context, sourceID string, feedbackKind string, limit int) ([]domain.FeedbackEvent, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select fe.id, fe.target_kind, fe.target_id, fe.feedback_kind, fe.payload_json, fe.actor, fe.created_at
+from feedback_events fe
+join documents d on d.id = fe.target_id
+where fe.target_kind = 'document'
+  and d.source_id = ?
+  and (? = '' or fe.feedback_kind = ?)
+order by fe.rowid desc
+limit ?
+`, sourceID, feedbackKind, feedbackKind, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := make([]domain.FeedbackEvent, 0)
+	for rows.Next() {
+		var event domain.FeedbackEvent
+		if err := rows.Scan(&event.ID, &event.TargetKind, &event.TargetID, &event.FeedbackKind, &event.PayloadJSON, &event.Actor, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func brokenLinksFromJob(job domain.Job) []domain.BrokenLink {
+	raw := strings.TrimSpace(job.ResultJSON)
+	if raw == "" || raw == "{}" {
+		raw = strings.TrimSpace(job.PayloadJSON)
+	}
+	var payload domain.ResultPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil
+	}
+	return payload.BrokenLinks
+}
+
+func sourceHealthWarnings(counts domain.SourceArtifactCounts, entityDiagnostics domain.EntityDiagnostics, latestJob domain.Job, brokenLinks []domain.BrokenLink, zeroDocs []domain.DocumentSummary, lowSections []domain.SectionSummary, staleFeedback []domain.FeedbackEvent) []domain.SourceHealthWarning {
+	warnings := make([]domain.SourceHealthWarning, 0)
+	if latestJob.ID == "" {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "no_sync_job", Severity: "warn", Message: "Source has no sync job history."})
+	} else if latestJob.Status == "failed" {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "latest_sync_failed", Severity: "error", Message: latestJob.LastError, Count: 1})
+	}
+	if counts.Documents == 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "no_documents", Severity: "error", Message: "No documents are indexed for this source."})
+	}
+	if counts.Sections > 0 && counts.SectionEntities == 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "no_section_entities", Severity: "info", Message: "No technical entities have been extracted for this source.", Count: int(counts.Sections)})
+	}
+	if len(brokenLinks) > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "broken_links", Severity: "warn", Message: "Latest sync reported broken links.", Count: len(brokenLinks)})
+	}
+	if len(zeroDocs) > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "zero_section_documents", Severity: "warn", Message: "Some documents have no parsed sections.", Count: len(zeroDocs)})
+	}
+	if len(lowSections) > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "low_content_sections", Severity: "warn", Message: "Some parsed sections contain very little text.", Count: len(lowSections)})
+	}
+	if len(staleFeedback) > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "stale_documents", Severity: "info", Message: "Some documents are manually marked stale.", Count: len(staleFeedback)})
+	}
+	if entityDiagnostics.DocumentsPathOnly > 0 {
+		warnings = append(warnings, domain.SourceHealthWarning{Kind: "path_literals_without_api", Severity: "warn", Message: "Some documents contain path literals but no API endpoints.", Count: entityDiagnostics.DocumentsPathOnly})
+	}
+	return warnings
+}
+
+func (s *Store) sourceEntityDiagnostics(ctx context.Context, sourceID string, limit int) (domain.EntityDiagnostics, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	var diagnostics domain.EntityDiagnostics
+	err := s.readDB().QueryRowContext(ctx, `
+select
+  count(*),
+  coalesce(sum(case when kind = 'api_endpoint' then 1 else 0 end), 0),
+  coalesce(sum(case when kind = 'path_literal' then 1 else 0 end), 0),
+  coalesce(sum(case when kind = 'operation_candidate' then 1 else 0 end), 0),
+  count(distinct document_id),
+  count(distinct case when kind = 'api_endpoint' then document_id end),
+  count(distinct section_id)
+from section_entities
+where document_id in (select id from documents where source_id = ?)
+`, sourceID).Scan(&diagnostics.Total, &diagnostics.APIEndpoints, &diagnostics.PathLiterals, &diagnostics.Operations, &diagnostics.DocumentsWithAny, &diagnostics.DocumentsWithAPI, &diagnostics.SectionsWithAny)
+	if err != nil {
+		return domain.EntityDiagnostics{}, err
+	}
+	err = s.readDB().QueryRowContext(ctx, `
+select count(*)
+from (
+  select document_id
+  from section_entities
+  where document_id in (select id from documents where source_id = ?)
+  group by document_id
+  having sum(case when kind = 'path_literal' then 1 else 0 end) > 0
+     and sum(case when kind = 'api_endpoint' then 1 else 0 end) = 0
+)
+`, sourceID).Scan(&diagnostics.DocumentsPathOnly)
+	if err != nil {
+		return domain.EntityDiagnostics{}, err
+	}
+	docs, err := s.listPathOnlyEntityDocuments(ctx, sourceID, limit)
+	if err != nil {
+		return domain.EntityDiagnostics{}, err
+	}
+	diagnostics.TopPathOnlyDocs = docs
+	return diagnostics, nil
+}
+
+func (s *Store) listPathOnlyEntityDocuments(ctx context.Context, sourceID string, limit int) ([]domain.DocumentSummary, error) {
+	rows, err := s.readDB().QueryContext(ctx, `
+select d.id, d.source_id, d.external_id, d.title, d.url,
+       d.content_hash, d.indexed_at, count(distinct sections.id) as section_count
+from documents d
+join section_entities se on se.document_id = d.id
+left join sections on sections.document_id = d.id
+where d.source_id = ?
+group by d.id
+having sum(case when se.kind = 'path_literal' then 1 else 0 end) > 0
+   and sum(case when se.kind = 'api_endpoint' then 1 else 0 end) = 0
+order by sum(case when se.kind = 'path_literal' then 1 else 0 end) desc, d.indexed_at desc, d.title asc
+limit ?
+`, sourceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	docs := make([]domain.DocumentSummary, 0)
+	for rows.Next() {
+		var doc domain.DocumentSummary
+		if err := rows.Scan(&doc.ID, &doc.SourceID, &doc.ExternalID, &doc.Title, &doc.URL, &doc.ContentHash, &doc.IndexedAt, &doc.SectionCount); err != nil {
+			return nil, err
+		}
+		doc.NodeID = stableDocumentNodeID(doc.ID)
+		docs = append(docs, doc)
+	}
+	return docs, rows.Err()
 }
 
 func (s *Store) ListSourceDocuments(ctx context.Context, sourceID string, limit, offset int) ([]domain.DocumentSummary, error) {
@@ -918,6 +1219,27 @@ limit ? offset ?
 	return docs, rows.Err()
 }
 
+func (s *Store) GetDocument(ctx context.Context, id string) (domain.DocumentSummary, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return domain.DocumentSummary{}, fmt.Errorf("document id is required")
+	}
+	var doc domain.DocumentSummary
+	err := s.readDB().QueryRowContext(ctx, `
+select documents.id, documents.source_id, documents.external_id, documents.title, documents.url,
+       documents.content_hash, documents.indexed_at, count(sections.id)
+from documents
+left join sections on sections.document_id = documents.id
+where documents.id = ?
+group by documents.id
+`, id).Scan(&doc.ID, &doc.SourceID, &doc.ExternalID, &doc.Title, &doc.URL, &doc.ContentHash, &doc.IndexedAt, &doc.SectionCount)
+	if err != nil {
+		return domain.DocumentSummary{}, err
+	}
+	doc.NodeID = stableDocumentNodeID(doc.ID)
+	return doc, nil
+}
+
 func (s *Store) GetDocumentBySourceExternalID(ctx context.Context, sourceID string, externalID string) (domain.DocumentSummary, error) {
 	sourceID = strings.TrimSpace(sourceID)
 	externalID = strings.TrimSpace(externalID)
@@ -944,6 +1266,47 @@ group by documents.id
 	return doc, nil
 }
 
+func (s *Store) ListDocumentSections(ctx context.Context, documentID string, limit, offset int) ([]domain.SectionSummary, error) {
+	documentID = strings.TrimSpace(documentID)
+	if documentID == "" {
+		return nil, fmt.Errorf("document id is required")
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		return nil, fmt.Errorf("offset must be non-negative")
+	}
+	if _, err := s.GetDocument(ctx, documentID); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
+       substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 800),
+       sections.content_hash, sections.ordinal
+from sections
+join documents on documents.id = sections.document_id
+where sections.document_id = ?
+order by sections.ordinal asc
+limit ? offset ?
+`, documentID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sections []domain.SectionSummary
+	for rows.Next() {
+		var section domain.SectionSummary
+		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.ContentHash, &section.Ordinal); err != nil {
+			return nil, err
+		}
+		section.NodeID = stableSectionNodeID(section.ID)
+		sections = append(sections, section)
+	}
+	return sections, rows.Err()
+}
+
 func (s *Store) ListSourceSections(ctx context.Context, sourceID string, limit, offset int) ([]domain.SectionSummary, error) {
 	sourceID, limit, offset, err := normalizeSourceArtifactPage(sourceID, limit, offset)
 	if err != nil {
@@ -955,7 +1318,7 @@ func (s *Store) ListSourceSections(ctx context.Context, sourceID string, limit, 
 	rows, err := s.readDB().QueryContext(ctx, `
 select sections.id, sections.document_id, documents.title, sections.title, sections.heading_path,
        substr(replace(replace(sections.content, char(10), ' '), char(13), ' '), 1, 220),
-       sections.ordinal
+       sections.content_hash, sections.ordinal
 from sections
 join documents on documents.id = sections.document_id
 where documents.source_id = ?
@@ -970,7 +1333,7 @@ limit ? offset ?
 	var sections []domain.SectionSummary
 	for rows.Next() {
 		var section domain.SectionSummary
-		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.Ordinal); err != nil {
+		if err := rows.Scan(&section.ID, &section.DocumentID, &section.DocumentTitle, &section.Title, &section.HeadingPath, &section.ContentSnippet, &section.ContentHash, &section.Ordinal); err != nil {
 			return nil, err
 		}
 		section.NodeID = stableSectionNodeID(section.ID)
@@ -1083,17 +1446,17 @@ on conflict(id) do update set
   indexed_at = current_timestamp
 `, doc.ID, doc.SourceID, doc.ExternalID, doc.Title, doc.URL, doc.Version, doc.ContentHash)
 	if err != nil {
-		return err
+		return fmt.Errorf("upsert document %s: %w", doc.ID, err)
 	}
 
 	if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens where document_id = ?`, doc.ID); err != nil {
-		return err
+		return fmt.Errorf("delete fts_section_tokens for document %s: %w", doc.ID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens_trigram where document_id = ?`, doc.ID); err != nil {
-		return err
+		return fmt.Errorf("delete fts_section_tokens_trigram for document %s: %w", doc.ID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `delete from sections where document_id = ?`, doc.ID); err != nil {
-		return err
+		return fmt.Errorf("delete sections for document %s: %w", doc.ID, err)
 	}
 
 	for _, section := range sections {
@@ -1102,7 +1465,7 @@ insert into sections (id, document_id, heading_path, title, content, content_has
 values (?, ?, ?, ?, ?, ?, ?)
 `, section.ID, doc.ID, section.HeadingPath, section.Title, section.Content, section.ContentHash, section.Ordinal)
 		if err != nil {
-			return err
+			return fmt.Errorf("insert section %s for document %s: %w", section.ID, doc.ID, err)
 		}
 		titleTokens, headingTokens, symbolTokens, contentTokens := buildSectionIndexTexts(doc.Title, section.Title, section.HeadingPath, section.Content)
 		_, err = tx.ExecContext(ctx, `
@@ -1110,18 +1473,21 @@ insert into fts_section_tokens (title_tokens, section_heading_tokens, symbol_tok
 values (?, ?, ?, ?, ?, ?)
 `, titleTokens, headingTokens, symbolTokens, contentTokens, section.ID, doc.ID)
 		if err != nil {
-			return err
+			return fmt.Errorf("insert fts_section_tokens for section %s: %w", section.ID, err)
 		}
 		_, err = tx.ExecContext(ctx, `
 insert into fts_section_tokens_trigram (title_tokens, section_heading_tokens, symbol_tokens, content_tokens, section_id, document_id)
 values (?, ?, ?, ?, ?, ?)
 `, titleTokens, headingTokens, symbolTokens, contentTokens, section.ID, doc.ID)
 		if err != nil {
-			return err
+			return fmt.Errorf("insert fts_section_tokens_trigram for section %s: %w", section.ID, err)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit replace document %s: %w", doc.ID, err)
+	}
+	return nil
 }
 
 func (s *Store) DeleteDocumentsNotInSource(ctx context.Context, sourceID string, keepDocumentIDs []string) error {
@@ -1146,22 +1512,25 @@ func (s *Store) DeleteDocumentsNotInSource(ctx context.Context, sourceID string,
 
 	for _, docID := range staleIDs {
 		if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens where document_id = ?`, docID); err != nil {
-			return err
+			return fmt.Errorf("delete stale fts_section_tokens for document %s: %w", docID, err)
 		}
 		if _, err := tx.ExecContext(ctx, `delete from fts_section_tokens_trigram where document_id = ?`, docID); err != nil {
-			return err
+			return fmt.Errorf("delete stale fts_section_tokens_trigram for document %s: %w", docID, err)
 		}
 		if _, err := tx.ExecContext(ctx, `delete from fts_nodes where node_id in (select id from nodes where metadata_json like ?)`, documentIDLike(docID)); err != nil {
-			return err
+			return fmt.Errorf("delete stale fts_nodes for document %s: %w", docID, err)
 		}
 		if _, err := tx.ExecContext(ctx, `delete from nodes where metadata_json like ?`, documentIDLike(docID)); err != nil {
-			return err
+			return fmt.Errorf("delete stale nodes for document %s: %w", docID, err)
 		}
 		if _, err := tx.ExecContext(ctx, `delete from documents where id = ?`, docID); err != nil {
-			return err
+			return fmt.Errorf("delete stale document %s: %w", docID, err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete stale documents for source %s: %w", sourceID, err)
+	}
+	return nil
 }
 
 func (s *Store) staleDocumentIDs(ctx context.Context, sourceID string, keepDocumentIDs []string) ([]string, error) {
@@ -1197,10 +1566,20 @@ func (s *Store) GetDocumentProfile(ctx context.Context, documentID string) (doma
 	if documentID == "" {
 		return domain.DocumentProfile{}, fmt.Errorf("document id is required")
 	}
-	if err := s.ensureDocumentProfile(ctx, documentID); err != nil {
+	if err := s.ensureDocumentExists(ctx, documentID); err != nil {
 		return domain.DocumentProfile{}, err
 	}
-	return s.getDocumentProfile(ctx, documentID)
+	profile, err := s.getDocumentProfile(ctx, documentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.DocumentProfile{
+			DocumentID:           documentID,
+			RetrievalProfileJSON: "{}",
+		}, nil
+	}
+	if err != nil {
+		return domain.DocumentProfile{}, err
+	}
+	return profile, nil
 }
 
 func (s *Store) UpdateDocumentProfileDesc(ctx context.Context, input domain.DocumentProfileInput) (domain.DocumentProfile, error) {
@@ -1282,6 +1661,358 @@ where document_id = ?
 		return domain.DocumentProfile{}, err
 	}
 	return profile, nil
+}
+
+type sectionEntityEvidence struct {
+	Occurrences []sectionEntityOccurrence `json:"occurrences,omitempty"`
+	Notes       []string                  `json:"notes,omitempty"`
+}
+
+type sectionEntityOccurrence struct {
+	Raw       string `json:"raw,omitempty"`
+	Source    string `json:"source,omitempty"`
+	SpanStart int    `json:"span_start,omitempty"`
+	SpanEnd   int    `json:"span_end,omitempty"`
+	Evidence  string `json:"evidence,omitempty"`
+}
+
+func (s *Store) ReplaceSectionEntities(ctx context.Context, documentID string, entities []domain.SectionEntityInput) error {
+	documentID = strings.TrimSpace(documentID)
+	if documentID == "" {
+		return fmt.Errorf("document id is required")
+	}
+	if err := s.ensureDocumentExists(ctx, documentID); err != nil {
+		return err
+	}
+	sectionIDs, err := s.documentSectionIDSet(ctx, documentID)
+	if err != nil {
+		return err
+	}
+	aggregated, err := aggregateSectionEntityInputs(documentID, sectionIDs, entities)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `delete from section_entities where document_id = ?`, documentID); err != nil {
+		return fmt.Errorf("delete section entities for document %s: %w", documentID, err)
+	}
+	for _, entity := range aggregated {
+		_, err := tx.ExecContext(ctx, `
+insert into section_entities (
+  id, section_id, document_id, kind, raw_text, canonical_text,
+  method, path, operation, source, confidence, evidence_json
+) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, entity.ID, entity.SectionID, entity.DocumentID, entity.Kind, entity.RawText, entity.CanonicalText, entity.Method, entity.Path, entity.Operation, entity.Source, entity.Confidence, entity.EvidenceJSON)
+		if err != nil {
+			return fmt.Errorf("insert section entity %s: %w", entity.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit replace section entities for document %s: %w", documentID, err)
+	}
+	return nil
+}
+
+func (s *Store) ListDocumentEntities(ctx context.Context, documentID string) ([]domain.SectionEntity, error) {
+	documentID = strings.TrimSpace(documentID)
+	if documentID == "" {
+		return nil, fmt.Errorf("document id is required")
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, section_id, document_id, kind, raw_text, canonical_text,
+       method, path, operation, source, confidence, evidence_json, created_at
+from section_entities
+where document_id = ?
+order by (
+  select sections.ordinal from sections where sections.id = section_entities.section_id
+) asc, kind asc, method asc, canonical_text asc, id asc
+`, documentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSectionEntities(rows)
+}
+
+func (s *Store) ListSourceSectionEntities(ctx context.Context, sourceID string, limit, offset int) ([]domain.SectionEntity, error) {
+	sourceID, limit, offset, err := normalizeSourceArtifactPage(sourceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.GetSource(ctx, sourceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select se.id, se.section_id, se.document_id, se.kind, se.raw_text, se.canonical_text,
+       se.method, se.path, se.operation, se.source, se.confidence, se.evidence_json, se.created_at
+from section_entities se
+join documents d on d.id = se.document_id
+left join sections s on s.id = se.section_id
+where d.source_id = ?
+order by d.indexed_at desc, d.title asc, coalesce(s.ordinal, 0) asc, se.kind asc, se.method asc, se.canonical_text asc, se.id asc
+limit ? offset ?
+`, sourceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSectionEntities(rows)
+}
+
+func (s *Store) SearchEntities(ctx context.Context, query string, limit int) ([]domain.SectionEntity, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	seen := map[string]bool{}
+	results := make([]domain.SectionEntity, 0, limit)
+	add := func(entities []domain.SectionEntity) {
+		for _, entity := range entities {
+			if len(results) >= limit {
+				return
+			}
+			if seen[entity.ID] {
+				continue
+			}
+			seen[entity.ID] = true
+			results = append(results, entity)
+		}
+	}
+
+	for _, term := range entitySearchTerms(extract.ExtractSection(extract.SectionInput{Content: query})) {
+		entities, err := s.searchEntitiesExact(ctx, term, limit-len(results))
+		if err != nil {
+			return nil, err
+		}
+		add(entities)
+		if len(results) >= limit {
+			return results, nil
+		}
+	}
+
+	entities, err := s.searchEntitiesLike(ctx, query, limit-len(results))
+	if err != nil {
+		return nil, err
+	}
+	add(entities)
+	return results, nil
+}
+
+func (s *Store) searchEntitiesExact(ctx context.Context, term string, limit int) ([]domain.SectionEntity, error) {
+	term = strings.ToLower(strings.TrimSpace(term))
+	if term == "" || limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, section_id, document_id, kind, raw_text, canonical_text,
+       method, path, operation, source, confidence, evidence_json, created_at
+from section_entities
+where lower(canonical_text) = ?
+   or lower(path) = ?
+   or lower(method || ' ' || path) = ?
+   or lower(operation) = ?
+order by confidence desc, kind asc, canonical_text asc, id asc
+limit ?
+`, term, term, term, term, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSectionEntities(rows)
+}
+
+func (s *Store) searchEntitiesLike(ctx context.Context, query string, limit int) ([]domain.SectionEntity, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	pattern := "%" + escapeLike(strings.ToLower(query)) + "%"
+	rows, err := s.readDB().QueryContext(ctx, `
+select id, section_id, document_id, kind, raw_text, canonical_text,
+       method, path, operation, source, confidence, evidence_json, created_at
+from section_entities
+where lower(canonical_text) like ? escape '\'
+   or lower(raw_text) like ? escape '\'
+   or lower(path) like ? escape '\'
+   or lower(operation) like ? escape '\'
+order by confidence desc, kind asc, canonical_text asc, id asc
+limit ?
+`, pattern, pattern, pattern, pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSectionEntities(rows)
+}
+
+func scanSectionEntities(rows *sql.Rows) ([]domain.SectionEntity, error) {
+	entities := make([]domain.SectionEntity, 0)
+	for rows.Next() {
+		var entity domain.SectionEntity
+		if err := rows.Scan(
+			&entity.ID,
+			&entity.SectionID,
+			&entity.DocumentID,
+			&entity.Kind,
+			&entity.RawText,
+			&entity.CanonicalText,
+			&entity.Method,
+			&entity.Path,
+			&entity.Operation,
+			&entity.Source,
+			&entity.Confidence,
+			&entity.EvidenceJSON,
+			&entity.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		entities = append(entities, entity)
+	}
+	return entities, rows.Err()
+}
+
+func (s *Store) documentSectionIDSet(ctx context.Context, documentID string) (map[string]bool, error) {
+	rows, err := s.readDB().QueryContext(ctx, `select id from sections where document_id = ?`, documentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sectionIDs := map[string]bool{}
+	for rows.Next() {
+		var sectionID string
+		if err := rows.Scan(&sectionID); err != nil {
+			return nil, err
+		}
+		sectionIDs[sectionID] = true
+	}
+	return sectionIDs, rows.Err()
+}
+
+func aggregateSectionEntityInputs(documentID string, sectionIDs map[string]bool, inputs []domain.SectionEntityInput) ([]domain.SectionEntity, error) {
+	type aggregate struct {
+		entity    domain.SectionEntity
+		evidence  sectionEntityEvidence
+		notesSeen map[string]bool
+	}
+	byID := map[string]*aggregate{}
+	for _, input := range inputs {
+		normalized, err := normalizeSectionEntityInput(documentID, sectionIDs, input)
+		if err != nil {
+			return nil, err
+		}
+		if normalized.Kind == "" {
+			continue
+		}
+		id := ids.Stable("entity", normalized.SectionID, normalized.Kind, normalized.Method, normalized.CanonicalText)
+		item := byID[id]
+		if item == nil {
+			normalized.ID = id
+			normalized.EvidenceJSON = "{}"
+			item = &aggregate{
+				entity:    normalized,
+				notesSeen: map[string]bool{},
+			}
+			byID[id] = item
+		}
+		if normalized.Confidence > item.entity.Confidence {
+			item.entity.Confidence = normalized.Confidence
+			if normalized.RawText != "" {
+				item.entity.RawText = normalized.RawText
+			}
+			if normalized.Source != "" {
+				item.entity.Source = normalized.Source
+			}
+		}
+		if item.entity.RawText == "" && normalized.RawText != "" {
+			item.entity.RawText = normalized.RawText
+		}
+		if item.entity.Source == "" && normalized.Source != "" {
+			item.entity.Source = normalized.Source
+		}
+		if item.entity.Operation == "" && normalized.Operation != "" {
+			item.entity.Operation = normalized.Operation
+		}
+		item.evidence.Occurrences = append(item.evidence.Occurrences, sectionEntityOccurrence{
+			Raw:       normalized.RawText,
+			Source:    normalized.Source,
+			SpanStart: input.SpanStart,
+			SpanEnd:   input.SpanEnd,
+			Evidence:  strings.TrimSpace(input.Evidence),
+		})
+		for _, note := range input.Notes {
+			note = strings.TrimSpace(note)
+			if note == "" || item.notesSeen[note] {
+				continue
+			}
+			item.notesSeen[note] = true
+			item.evidence.Notes = append(item.evidence.Notes, note)
+		}
+	}
+
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	result := make([]domain.SectionEntity, 0, len(ids))
+	for _, id := range ids {
+		item := byID[id]
+		data, err := json.Marshal(item.evidence)
+		if err != nil {
+			return nil, err
+		}
+		item.entity.EvidenceJSON = string(data)
+		result = append(result, item.entity)
+	}
+	return result, nil
+}
+
+func normalizeSectionEntityInput(documentID string, sectionIDs map[string]bool, input domain.SectionEntityInput) (domain.SectionEntity, error) {
+	sectionID := strings.TrimSpace(input.SectionID)
+	if sectionID == "" {
+		return domain.SectionEntity{}, fmt.Errorf("section id is required")
+	}
+	if !sectionIDs[sectionID] {
+		return domain.SectionEntity{}, fmt.Errorf("section %s does not belong to document %s", sectionID, documentID)
+	}
+	kind := strings.TrimSpace(input.Kind)
+	canonical := strings.TrimSpace(input.CanonicalText)
+	method := strings.ToUpper(strings.TrimSpace(input.Method))
+	path := strings.TrimSpace(input.Path)
+	operation := strings.TrimSpace(input.Operation)
+	if canonical == "" {
+		switch {
+		case method != "" && path != "":
+			canonical = method + " " + path
+		case path != "":
+			canonical = path
+		default:
+			canonical = operation
+		}
+	}
+	if kind == "" || canonical == "" {
+		return domain.SectionEntity{}, nil
+	}
+	return domain.SectionEntity{
+		SectionID:     sectionID,
+		DocumentID:    documentID,
+		Kind:          kind,
+		RawText:       strings.TrimSpace(input.RawText),
+		CanonicalText: canonical,
+		Method:        method,
+		Path:          path,
+		Operation:     operation,
+		Source:        strings.TrimSpace(input.Source),
+		Confidence:    input.Confidence,
+	}, nil
 }
 
 func (s *Store) CreateKnowledgeRelationProposal(ctx context.Context, input domain.KnowledgeRelationProposalInput) (domain.KnowledgeRelationProposal, error) {
@@ -1850,6 +2581,7 @@ set status = 'completed',
     last_error = '',
     updated_at = current_timestamp
 where id = ?
+  and status not in ('canceled', 'canceling')
 `, resultJSON, id)
 	if err != nil {
 		return err
@@ -1870,7 +2602,88 @@ set status = 'failed',
     last_error = ?,
     updated_at = current_timestamp
 where id = ?
+  and status not in ('canceled', 'canceling')
 `, strings.TrimSpace(errText), id)
+	if err != nil {
+		return err
+	}
+	return requireRowsAffected(result)
+}
+
+func (s *Store) CancelJob(ctx context.Context, id string, reason string) (domain.Job, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return domain.Job{}, fmt.Errorf("job id is required")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "canceled by user"
+	}
+	job, err := s.GetJob(ctx, id)
+	if err != nil {
+		return domain.Job{}, err
+	}
+	switch job.Status {
+	case "queued":
+		result, err := s.db.ExecContext(ctx, `
+update jobs
+set status = 'canceled',
+    worker_id = '',
+    locked_until = null,
+    last_error = ?,
+    updated_at = current_timestamp
+where id = ?
+  and status = 'queued'
+`, reason, id)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		if err := requireRowsAffected(result); err != nil {
+			return domain.Job{}, err
+		}
+		return s.GetJob(ctx, id)
+	case "running":
+		result, err := s.db.ExecContext(ctx, `
+update jobs
+set status = 'canceling',
+    last_error = ?,
+    updated_at = current_timestamp
+where id = ?
+  and status = 'running'
+`, reason, id)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		if err := requireRowsAffected(result); err != nil {
+			return domain.Job{}, err
+		}
+		return s.GetJob(ctx, id)
+	case "canceling", "canceled":
+		return job, nil
+	default:
+		return job, domain.ErrJobNotCancelable
+	}
+}
+
+func (s *Store) MarkJobCanceled(ctx context.Context, id string, reason string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("job id is required")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "canceled"
+	}
+	result, err := s.db.ExecContext(ctx, `
+update jobs
+set status = 'canceled',
+    worker_id = '',
+    locked_until = null,
+    last_error = ?,
+    updated_at = current_timestamp
+where id = ?
+  and status in ('running', 'canceling')
+`, reason, id)
 	if err != nil {
 		return err
 	}
@@ -1952,6 +2765,57 @@ func jobWhere(opts domain.JobListOptions) (string, []any) {
 	return strings.Join(clauses, " and "), args
 }
 
+func (s *Store) CreateEmbeddingEnsureJobIfIdle(ctx context.Context, sourceID string) (domain.Job, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Job{}, err
+	}
+	defer tx.Rollback()
+
+	var running string
+	args := []any{}
+	scopeClause := "1 = 1"
+	if sourceID != "" {
+		scopeClause = "(source_id = '' or source_id = ?)"
+		args = append(args, sourceID)
+	}
+	query := `
+select id
+from jobs
+where kind = 'maintenance_embedding_ensure'
+  and status in ('queued', 'running', 'canceling')
+  and ` + scopeClause + `
+order by rowid desc
+limit 1
+`
+	err = tx.QueryRowContext(ctx, query, args...).Scan(&running)
+	if err == nil {
+		return domain.Job{}, domain.ErrSyncInProgress
+	}
+	if err != sql.ErrNoRows {
+		return domain.Job{}, err
+	}
+
+	jobID := ids.Random("job", 12)
+	targetKind := "embedding"
+	payload := `{"mode":"ensure"}`
+	if sourceID != "" {
+		targetKind = "source"
+		payload = fmt.Sprintf(`{"source_id":%q,"mode":"ensure"}`, sourceID)
+	}
+	if _, err := tx.ExecContext(ctx, `
+insert into jobs (id, kind, status, source_id, target_kind, target_id, payload_json, progress_json, result_json)
+values (?, 'maintenance_embedding_ensure', 'queued', ?, ?, ?, ?, '{}', '{}')
+`, jobID, sourceID, targetKind, sourceID, payload); err != nil {
+		return domain.Job{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Job{}, err
+	}
+	return s.GetJob(ctx, jobID)
+}
+
 func (s *Store) CreateSyncJob(ctx context.Context, sourceID string) (domain.SyncJob, error) {
 	sourceID = strings.TrimSpace(sourceID)
 	if sourceID == "" {
@@ -1985,7 +2849,7 @@ func (s *Store) CreateSyncJobIfIdle(ctx context.Context, sourceID string) (domai
 select id
 from jobs
 where kind = 'sync_source'
-  and status in ('queued', 'running')
+  and status in ('queued', 'running', 'canceling')
   and (source_id = ? or payload_json like ?)
 order by rowid desc
 limit 1
@@ -2036,9 +2900,10 @@ set status = 'completed',
     last_error = '',
     updated_at = current_timestamp
 where id = ?
+  and status not in ('canceled', 'canceling')
 `, sourceID, payload, payload, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("complete sync job %s: %w", id, err)
 	}
 	return requireRowsAffected(result)
 }
@@ -2078,6 +2943,13 @@ func (s *Store) DeleteSyncJob(ctx context.Context, sourceID string, jobID string
 	}
 	if jobID == "" {
 		return fmt.Errorf("job id is required")
+	}
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if job.Status == "queued" || job.Status == "running" || job.Status == "canceling" {
+		return domain.ErrJobNotCancelable
 	}
 	result, err := s.db.ExecContext(ctx, `
 delete from jobs
@@ -2152,13 +3024,15 @@ func scanJobs(rows *sql.Rows) ([]domain.Job, error) {
 
 func syncJobPayload(sourceID string, result domain.ResultPayload) string {
 	data, err := json.Marshal(struct {
-		SourceID    string              `json:"source_id"`
-		Documents   int                 `json:"documents"`
-		BrokenLinks []domain.BrokenLink `json:"broken_links,omitempty"`
+		SourceID          string                   `json:"source_id"`
+		Documents         int                      `json:"documents"`
+		EntityDiagnostics domain.EntityDiagnostics `json:"entity_diagnostics,omitempty"`
+		BrokenLinks       []domain.BrokenLink      `json:"broken_links,omitempty"`
 	}{
-		SourceID:    sourceID,
-		Documents:   result.Documents,
-		BrokenLinks: result.BrokenLinks,
+		SourceID:          sourceID,
+		Documents:         result.Documents,
+		EntityDiagnostics: result.EntityDiagnostics,
+		BrokenLinks:       result.BrokenLinks,
 	})
 	if err != nil {
 		return "{}"
@@ -2268,18 +3142,21 @@ on conflict(id) do update set
   confidence = excluded.confidence,
   updated_at = current_timestamp
 `, node.ID, node.Kind, node.Name, node.CanonicalName, node.MetadataJSON, node.Confidence); err != nil {
-		return err
+		return fmt.Errorf("upsert node %s: %w", node.ID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `delete from fts_nodes where node_id = ?`, node.ID); err != nil {
-		return err
+		return fmt.Errorf("delete fts node %s: %w", node.ID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 insert into fts_nodes (kind, name, canonical_name, metadata_json, node_id)
 values (?, ?, ?, ?, ?)
 `, node.Kind, node.Name, node.CanonicalName, node.MetadataJSON, node.ID); err != nil {
-		return err
+		return fmt.Errorf("insert fts node %s: %w", node.ID, err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit upsert node %s: %w", node.ID, err)
+	}
+	return nil
 }
 
 func (s *Store) UpsertEdge(ctx context.Context, edge domain.EdgeInput) error {
@@ -2323,7 +3200,10 @@ on conflict(id) do update set
   metadata_json = excluded.metadata_json,
   updated_at = current_timestamp
 `, edge.ID, edge.SrcID, edge.DstID, edge.Kind, edge.Confidence, edge.Provenance, edge.EvidenceSectionID, edge.SourceRevision, edge.MetadataJSON)
-	return err
+	if err != nil {
+		return fmt.Errorf("upsert edge %s src=%s dst=%s evidence_section=%s: %w", edge.ID, edge.SrcID, edge.DstID, edge.EvidenceSectionID, err)
+	}
+	return nil
 }
 
 func (s *Store) SearchNodes(ctx context.Context, query string, limit int) ([]domain.Node, error) {
@@ -2432,7 +3312,221 @@ where s.id = ?
 	if err != nil {
 		return domain.SectionContent{}, err
 	}
+	if err := s.attachExplicitReferences(ctx, &sc); err != nil {
+		return domain.SectionContent{}, err
+	}
 	return sc, nil
+}
+
+func (s *Store) UpsertSectionEmbedding(ctx context.Context, input domain.SectionEmbeddingInput) error {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.UpsertSectionEmbedding(ctx, input)
+	}
+	return fmt.Errorf("vector search is disabled")
+}
+
+func (s *Store) GetSectionEmbedding(ctx context.Context, sectionID string, model string) (domain.VectorSearchHit, []float32, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.GetSectionEmbedding(ctx, sectionID, model)
+	}
+	return domain.VectorSearchHit{}, nil, sql.ErrNoRows
+}
+
+func (s *Store) DeleteSectionEmbeddings(ctx context.Context, sectionID string) error {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.DeleteSectionEmbeddings(ctx, sectionID)
+	}
+	return nil
+}
+
+func (s *Store) SearchSectionsByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]domain.VectorSearchHit, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.SearchSectionsByVector(ctx, embedding, model, limit, minSimilarity, plan)
+	}
+	return nil, nil
+}
+
+func (s *Store) ListSectionEmbeddingHashes(ctx context.Context, model string, limit, offset int) ([]domain.SectionEmbeddingHash, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.ListSectionEmbeddingHashes(ctx, model, limit, offset)
+	}
+	return nil, nil
+}
+
+func (s *Store) UpsertEmbeddingChunk(ctx context.Context, input domain.EmbeddingChunkInput) error {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.UpsertEmbeddingChunk(ctx, input)
+	}
+	return fmt.Errorf("vector search is disabled")
+}
+
+func (s *Store) GetEmbeddingChunk(ctx context.Context, chunkID string, model string) (domain.VectorSearchHit, []float32, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.GetEmbeddingChunk(ctx, chunkID, model)
+	}
+	return domain.VectorSearchHit{}, nil, sql.ErrNoRows
+}
+
+func (s *Store) DeleteEmbeddingChunksBySection(ctx context.Context, sectionID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) error {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.DeleteEmbeddingChunksBySection(ctx, sectionID, model, generatorVersion, tokenizer, chunkStrategy)
+	}
+	return nil
+}
+
+func (s *Store) SearchChunksByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]domain.VectorSearchHit, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.SearchChunksByVector(ctx, embedding, model, limit, minSimilarity, plan)
+	}
+	return nil, nil
+}
+
+func (s *Store) ListEmbeddingChunkHashes(ctx context.Context, model string, limit, offset int) ([]domain.EmbeddingChunkHash, error) {
+	if s.vectorBackend != nil {
+		return s.vectorBackend.ListEmbeddingChunkHashes(ctx, model, limit, offset)
+	}
+	return nil, nil
+}
+
+func (s *Store) GetSourceEmbeddingStatus(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string, chunkTargetTokens int) (domain.EmbeddingStatus, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	model = strings.TrimSpace(model)
+	generatorVersion = strings.TrimSpace(generatorVersion)
+	tokenizer = strings.TrimSpace(tokenizer)
+	chunkStrategy = strings.TrimSpace(chunkStrategy)
+	if sourceID == "" {
+		return domain.EmbeddingStatus{}, fmt.Errorf("source id is required")
+	}
+	status := domain.EmbeddingStatus{SourceID: sourceID, Model: model, GeneratorVersion: generatorVersion}
+	err := s.readDB().QueryRowContext(ctx, `
+select count(*)
+from sections
+join documents on documents.id = sections.document_id
+where documents.source_id = ?
+`, sourceID).Scan(&status.TotalSections)
+	if err != nil {
+		return domain.EmbeddingStatus{}, err
+	}
+	if model == "" || s.vectorBackend == nil {
+		status.Enabled = false
+		status.Status = "disabled"
+		if model == "" {
+			status.Reason = "embedding_not_configured"
+		} else {
+			status.Reason = "vector_db_not_configured"
+		}
+		status.PendingSections = status.TotalSections
+		return status, nil
+	}
+	status.Enabled = true
+	if tokenizer == "" {
+		tokenizer = "auto"
+	}
+	if chunkStrategy == "" {
+		chunkStrategy = "auto"
+	}
+	resolvedTokenizer := embeddingchunk.NewTextMeasurer(tokenizer, model).Name()
+	status.Tokenizer = resolvedTokenizer
+	status.ChunkStrategy = chunkStrategy
+
+	coverage, err := s.vectorBackend.GetEmbeddingCoverage(ctx, sourceID, model, generatorVersion, resolvedTokenizer, chunkStrategy)
+	if err != nil {
+		return domain.EmbeddingStatus{}, fmt.Errorf("query embedding coverage: %w", err)
+	}
+	status.EmbeddedSections = coverage.EmbeddedSections
+	status.EmbeddedChunks = coverage.EmbeddedChunks
+	status.TotalChunks = coverage.EmbeddedChunks // best known count; pending chunks unknown until they're built
+	status.PendingSections = status.TotalSections - status.EmbeddedSections
+	if status.PendingSections < 0 {
+		status.PendingSections = 0
+	}
+	if status.PendingSections > 0 {
+		status.Status = "indexing"
+	} else {
+		status.Status = "ready"
+	}
+	return status, nil
+}
+
+func (s *Store) GetSectionForEmbedding(ctx context.Context, sectionID string) (domain.EmbeddingSection, error) {
+	sectionID = strings.TrimSpace(sectionID)
+	if sectionID == "" {
+		return domain.EmbeddingSection{}, fmt.Errorf("section id is required")
+	}
+	var section domain.EmbeddingSection
+	err := s.readDB().QueryRowContext(ctx, `
+select sections.id, sections.document_id, documents.source_id, sources.name, sources.product_hint, sources.module_hint,
+       documents.title, sections.heading_path, sections.title, sections.content, sections.content_hash
+from sections
+join documents on documents.id = sections.document_id
+join sources on sources.id = documents.source_id
+where sections.id = ?
+`, sectionID).Scan(&section.SectionID, &section.DocumentID, &section.SourceID, &section.SourceName, &section.ProductHint, &section.ModuleHint, &section.DocumentTitle, &section.HeadingPath, &section.Title, &section.Content, &section.ContentHash)
+	if err != nil {
+		return domain.EmbeddingSection{}, err
+	}
+	return section, nil
+}
+
+func (s *Store) ListSectionsForEmbedding(ctx context.Context, sourceID string, limit, offset int) ([]domain.EmbeddingSection, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	where := ""
+	args := []any{}
+	if sourceID != "" {
+		where = "where sources.id = ?"
+		args = append(args, sourceID)
+	}
+	args = append(args, limit, offset)
+	rows, err := s.readDB().QueryContext(ctx, `
+select sections.id, sections.document_id, documents.source_id, sources.name, sources.product_hint, sources.module_hint,
+       documents.title, sections.heading_path, sections.title, sections.content, sections.content_hash
+from sections
+join documents on documents.id = sections.document_id
+join sources on sources.id = documents.source_id
+`+where+`
+order by documents.title asc, sections.ordinal asc, sections.id asc
+limit ? offset ?
+`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sections := make([]domain.EmbeddingSection, 0)
+	for rows.Next() {
+		var section domain.EmbeddingSection
+		if err := rows.Scan(&section.SectionID, &section.DocumentID, &section.SourceID, &section.SourceName, &section.ProductHint, &section.ModuleHint, &section.DocumentTitle, &section.HeadingPath, &section.Title, &section.Content, &section.ContentHash); err != nil {
+			return nil, err
+		}
+		sections = append(sections, section)
+	}
+	return sections, rows.Err()
+}
+
+func (s *Store) CountSectionsForEmbedding(ctx context.Context, sourceID string) (int, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	where := ""
+	args := []any{}
+	if sourceID != "" {
+		where = "where sources.id = ?"
+		args = append(args, sourceID)
+	}
+	var count int
+	err := s.readDB().QueryRowContext(ctx, `
+select count(*)
+from sections
+join documents on documents.id = sections.document_id
+join sources on sources.id = documents.source_id
+`+where, args...).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (s *Store) RelatedNodes(ctx context.Context, id string, opts domain.RelatedOptions) ([]domain.RelatedNode, error) {
@@ -2924,6 +4018,10 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 	if opts.Query == "" {
 		return domain.SearchResult{Query: opts.Query}, nil
 	}
+	opts.OriginalQuery = strings.TrimSpace(opts.OriginalQuery)
+	if opts.OriginalQuery == "" {
+		opts.OriginalQuery = opts.Query
+	}
 	if opts.Limit <= 0 || opts.Limit > 200 {
 		opts.Limit = 20
 	}
@@ -2955,11 +4053,19 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 		opts.RelationDepth = 1
 	}
 
+	// ===== Phase 1: Intent routing =====
+	weights := s.vectorRuntime.IntentRouteWeights
+	intent := RouteIntent(opts.OriginalQuery, opts.SemanticIntents, weights)
+	if !s.canUseVectorSearch() {
+		intent.WVector = 0
+	}
+
+	// ===== Phase 2: Text lane retrieval (existing cascade logic) =====
 	collector := newSearchCollector(opts)
 	attempts := make([]domain.SearchAttempt, 0, opts.MaxSearches)
 
-	runAttempt := func(kind string, query string, terms []string, fn func() ([]domain.SearchHit, error)) error {
-		if len(attempts) >= opts.MaxSearches {
+	runAttempt := func(kind string, query string, terms []string, required bool, fn func() ([]domain.SearchHit, error)) error {
+		if !required && len(attempts) >= opts.MaxSearches {
 			return nil
 		}
 		hits, err := fn()
@@ -2972,25 +4078,67 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 	}
 
 	queryTerms := classifyQueryTerms(opts.Query)
+	queryEntities := extractQueryEntities(opts.Query)
+	entityExactTerms := entitySearchTerms(queryEntities)
+	if len(entityExactTerms) > 0 {
+		entityQuery := matchQueryFromTerms(entityExactTerms, 16)
+		if err := runAttempt("entity_exact", entityQuery, entityExactTerms, false, func() ([]domain.SearchHit, error) {
+			return s.searchSectionsEntity(ctx, entityQuery, opts.Limit*3, opts, entityMatchExact)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+		if err := runAttempt("entity_normalized", entityQuery, entityExactTerms, false, func() ([]domain.SearchHit, error) {
+			return s.searchSectionsEntity(ctx, entityQuery, opts.Limit*3, opts, entityMatchNormalized)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+	}
 	unicodeTerms := strongQueryTermTexts(queryTerms)
 	tokenQuery := matchQueryFromTerms(unicodeTerms, 16)
-	if err := runAttempt("unicode61", tokenQuery, unicodeTerms, func() ([]domain.SearchHit, error) {
+	if err := runAttempt("unicode61", tokenQuery, unicodeTerms, false, func() ([]domain.SearchHit, error) {
 		return s.searchSectionsTokenFTS(ctx, tokenQuery, opts.Limit*3, opts)
 	}); err != nil {
 		return domain.SearchResult{}, err
 	}
 
 	trigramQuery := trigramFTSQuery(opts.Query)
-	if err := runAttempt("trigram", trigramQuery, nil, func() ([]domain.SearchHit, error) {
+	if err := runAttempt("trigram", trigramQuery, nil, false, func() ([]domain.SearchHit, error) {
 		return s.searchSectionsTokenTrigram(ctx, opts.Query, opts.Limit*3, opts)
 	}); err != nil {
 		return domain.SearchResult{}, err
 	}
 
+	if !strings.EqualFold(opts.OriginalQuery, opts.Query) {
+		originalTerms := strongQueryTermTexts(classifyQueryTerms(opts.OriginalQuery))
+		originalTokenQuery := matchQueryFromTerms(originalTerms, 16)
+		if err := runAttempt("original_unicode61", originalTokenQuery, originalTerms, true, func() ([]domain.SearchHit, error) {
+			originalOpts := opts
+			originalOpts.Query = opts.OriginalQuery
+			return s.searchSectionsTokenFTS(ctx, originalTokenQuery, opts.Limit*3, originalOpts)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+		if err := runAttempt("original_trigram", trigramFTSQuery(opts.OriginalQuery), nil, true, func() ([]domain.SearchHit, error) {
+			originalOpts := opts
+			originalOpts.Query = opts.OriginalQuery
+			return s.searchSectionsTokenTrigram(ctx, opts.OriginalQuery, opts.Limit*3, originalOpts)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+	}
+	exactTerms := uniqueStrings(nonEmptyStrings(opts.ExactTerms))
+	if len(exactTerms) > 0 {
+		if err := runAttempt("exact_terms", "", exactTerms, true, func() ([]domain.SearchHit, error) {
+			return s.searchSectionsLike(ctx, exactTerms, opts.Limit*3, opts)
+		}); err != nil {
+			return domain.SearchResult{}, err
+		}
+	}
+
 	if len(collector.hits) == 0 {
 		profileTerms := profileSearchTerms(opts.Query)
 		if len(profileTerms) > 0 {
-			if err := runAttempt("profile_fallback", "", profileTerms, func() ([]domain.SearchHit, error) {
+			if err := runAttempt("profile_fallback", "", profileTerms, false, func() ([]domain.SearchHit, error) {
 				return s.searchSectionsProfile(ctx, profileTerms, opts.Limit*2, opts)
 			}); err != nil {
 				return domain.SearchResult{}, err
@@ -3000,7 +4148,7 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 	if len(collector.hits) == 0 {
 		terms := substringSearchTerms(opts.Query)
 		if len(terms) > 0 {
-			if err := runAttempt("like_fallback", "", terms, func() ([]domain.SearchHit, error) {
+			if err := runAttempt("like_fallback", "", terms, true, func() ([]domain.SearchHit, error) {
 				return s.searchSectionsLike(ctx, terms, opts.Limit*2, opts)
 			}); err != nil {
 				return domain.SearchResult{}, err
@@ -3008,7 +4156,70 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 		}
 	}
 
-	hits := collector.results()
+	// ===== Phase 2b: Vector lane retrieval =====
+	var vectorHits []domain.SearchHit
+	var vectorAttempt domain.SearchAttempt
+	vectorCandidates := 0
+	if s.canUseVectorSearch() && intent.WVector > 0 {
+		vectorHits, vectorAttempt = s.searchSectionsVector(ctx, opts)
+		vectorCandidates = vectorAttempt.Hits
+		attempts = append(attempts, vectorAttempt)
+	}
+
+	// ===== Phase 3: Two-lane independent ranking =====
+	textResults := collector.results()
+	textRanked := assignRanks(textResults,
+		func(h domain.SearchHit) float64 {
+			if h.ScoreBreakdown != nil {
+				return h.ScoreBreakdown.Total
+			}
+			return h.Rank
+		},
+		func(h domain.SearchHit) []string {
+			if h.QueryMatch != nil {
+				return h.QueryMatch.SearchAttempts
+			}
+			return nil
+		})
+
+	vectorRanked := assignRanks(vectorHits,
+		func(h domain.SearchHit) float64 {
+			if h.ScoreBreakdown != nil {
+				return h.ScoreBreakdown.VectorBoost // raw similarity in RRF mode
+			}
+			return 0
+		},
+		func(_ domain.SearchHit) []string { return []string{"vector"} })
+
+	// ===== Phase 4: Weighted RRF fusion =====
+	rrfK := weights.RRFK
+	if rrfK <= 0 {
+		rrfK = 60
+	}
+	contribs := weightedRRFFusion(textRanked, vectorRanked, intent.WText, intent.WVector, rrfK)
+
+	// ===== Phase 5: Business multiplier calibration =====
+	// Build lookup maps for merging hits
+	textHitsBySection := map[string]*domain.SearchHit{}
+	for i := range textResults {
+		textHitsBySection[textResults[i].SectionID] = &textResults[i]
+	}
+	vectorHitsBySection := map[string]*domain.SearchHit{}
+	for i := range vectorHits {
+		vectorHitsBySection[vectorHits[i].SectionID] = &vectorHits[i]
+	}
+
+	// Set DocumentID on RRFContribution for per-doc cap enforcement
+	for sectionID, contrib := range contribs {
+		hit := mergeHitForSection(sectionID, textHitsBySection, vectorHitsBySection)
+		contrib.DocumentID = hit.DocumentID
+	}
+
+	applyMultiplierCalibration(contribs, textHitsBySection) // canonical/stale multiplier
+
+	// ===== Phase 6: Build final hits =====
+	hits := buildFinalHits(contribs, textHitsBySection, vectorHitsBySection, opts.Limit, opts.MaxSectionsPerDocument)
+
 	if opts.UseRelationExpansion && len(hits) > 0 {
 		var err error
 		hits, err = s.expandSearchHitsWithRelations(ctx, hits, opts)
@@ -3016,12 +4227,332 @@ func (s *Store) SearchSectionsWithOptions(ctx context.Context, opts domain.Searc
 			return domain.SearchResult{}, err
 		}
 	}
-	return domain.SearchResult{
+
+	result := domain.SearchResult{
 		Query:        opts.Query,
 		SearchesUsed: len(attempts),
 		Attempts:     attempts,
 		Hits:         hits,
-	}, nil
+		HybridSearchMeta: &domain.HybridSearchMeta{
+			IntentRoute:         intent.Route,
+			WText:               intent.WText,
+			WVector:             intent.WVector,
+			RRFK:                rrfK,
+			TextCandidates:      len(textRanked),
+			VectorCandidates:    vectorCandidates,
+			VectorMinSimilarity: s.vectorRuntime.MinSimilarity,
+		},
+		SuggestedReads: domain.SuggestedReads{
+			ExplicitReferences:  []domain.ExplicitReference{},
+			ImplicitSymbolLinks: []domain.SuggestedRead{},
+			CuratedRelations:    []domain.SuggestedRead{},
+			StructuralNeighbors: []domain.SuggestedRead{},
+		},
+	}
+	if err := s.enrichSearchResultExplicitReferences(ctx, &result); err != nil {
+		return domain.SearchResult{}, err
+	}
+	return result, nil
+}
+
+type entityMatchMode string
+
+const (
+	entityMatchExact      entityMatchMode = "entity_exact"
+	entityMatchNormalized entityMatchMode = "entity_normalized"
+)
+
+func (s *Store) searchSectionsEntity(ctx context.Context, matchQuery string, limit int, opts domain.SearchOptions, mode entityMatchMode) ([]domain.SearchHit, error) {
+	hits, err := s.searchSectionsStoredEntities(ctx, opts, mode, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) > 0 {
+		return hits, nil
+	}
+	return s.searchSectionsEntityFTS(ctx, matchQuery, limit, opts, mode)
+}
+
+func (s *Store) canUseVectorSearch() bool {
+	return s.vectorRuntime.Embedder != nil && strings.TrimSpace(s.vectorRuntime.Embedder.Model()) != ""
+}
+
+func (s *Store) searchSectionsVector(ctx context.Context, opts domain.SearchOptions) ([]domain.SearchHit, domain.SearchAttempt) {
+	attempt := domain.SearchAttempt{Kind: "vector", Query: vectorQueryLabel(opts)}
+	weight := s.vectorRuntime.SearchWeight
+	if weight <= 0 {
+		weight = 0.4
+	}
+	if weight > 1 {
+		weight = 1
+	}
+	limit := s.vectorRuntime.VectorCandidates
+	if limit <= 0 {
+		limit = opts.Limit * 3
+	}
+	if limit <= 0 {
+		limit = 60
+	}
+	text := strings.Join(nonEmptyStrings(append([]string{opts.Query}, opts.SemanticIntents...)), "\n")
+	if strings.TrimSpace(text) == "" {
+		return nil, attempt
+	}
+	vectors, err := s.vectorRuntime.Embedder.Embed(ctx, []string{text})
+	if err != nil {
+		attempt.Error = "embedding_failed: " + truncateForSearchAttempt(err.Error(), 160)
+		return nil, attempt
+	}
+	if len(vectors) == 0 || len(vectors[0]) == 0 {
+		attempt.Error = "embedding_empty"
+		return nil, attempt
+	}
+	model := s.vectorRuntime.Embedder.Model()
+	vectorHits, err := s.SearchChunksByVector(ctx, vectors[0], model, limit, s.vectorRuntime.MinSimilarity, vectorstore.EmbeddingPlanFilter{
+		GeneratorVersion: strings.TrimSpace(s.vectorRuntime.GeneratorVersion),
+		Tokenizer:        embeddingchunk.NewTextMeasurer(s.vectorRuntime.Tokenizer, model).Name(),
+		ChunkStrategy:    strings.TrimSpace(s.vectorRuntime.ChunkStrategy),
+	})
+	if err != nil {
+		attempt.Error = "vector_search_failed: " + truncateForSearchAttempt(err.Error(), 160)
+		return nil, attempt
+	}
+	hits := make([]domain.SearchHit, 0, len(vectorHits))
+	seenSections := map[string]bool{}
+	for _, vectorHit := range vectorHits {
+		if seenSections[vectorHit.SectionID] {
+			continue
+		}
+		hit, ok, err := s.hydrateAndValidateVectorHit(ctx, vectorHit, opts, weight)
+		if err != nil {
+			attempt.Error = "vector_hydrate_failed: " + truncateForSearchAttempt(err.Error(), 160)
+			return hits, attempt
+		}
+		if !ok {
+			continue
+		}
+		seenSections[vectorHit.SectionID] = true
+		hits = append(hits, hit)
+	}
+	sortSearchHits(hits)
+	attempt.Hits = len(hits)
+	return hits, attempt
+}
+
+func (s *Store) hydrateAndValidateVectorHit(ctx context.Context, vectorHit domain.VectorSearchHit, opts domain.SearchOptions, weight float64) (domain.SearchHit, bool, error) {
+	var hit domain.SearchHit
+	var profileJSON string
+	err := s.readDB().QueryRowContext(ctx, `
+select sections.id, sections.document_id, documents.source_id, documents.title, documents.url,
+       sections.content_hash,
+       coalesce(document_profiles."desc", ''),
+       coalesce(document_profiles.retrieval_profile_json, '{}'),
+       exists (
+         select 1 from feedback_events fe
+         where fe.target_kind = 'document'
+           and fe.target_id = documents.id
+           and fe.feedback_kind = 'document_canonical'
+       ) as canonical,
+       sections.title, sections.heading_path, sections.content
+from sections
+join documents on documents.id = sections.document_id
+join sources on sources.id = documents.source_id
+left join document_profiles on document_profiles.document_id = documents.id
+where sections.id = ?
+  and documents.id = ?
+  and sources.id = ?
+  and not exists (
+    select 1 from feedback_events fe
+    where fe.target_kind = 'document'
+      and fe.target_id = documents.id
+      and fe.feedback_kind = 'document_stale'
+  )
+`, vectorHit.SectionID, vectorHit.DocumentID, vectorHit.SourceID).Scan(&hit.SectionID, &hit.DocumentID, &hit.SourceID, &hit.DocumentTitle, &hit.DocumentURL, &hit.ContentHash, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.SearchHit{}, false, nil
+	}
+	if err != nil {
+		return domain.SearchHit{}, false, err
+	}
+	contentHash := vectorHit.SectionContentHash
+	if contentHash == "" {
+		contentHash = vectorHit.ContentHash
+	}
+	if contentHash != hit.ContentHash {
+		return domain.SearchHit{}, false, nil
+	}
+	terms := searchTerms(opts.OriginalQuery)
+	if len(terms) == 0 {
+		terms = searchTerms(opts.Query)
+	}
+	if strings.TrimSpace(vectorHit.ChunkText) != "" {
+		hit.Snippet = bestSnippet(vectorHit.ChunkText, terms)
+	} else {
+		hit.Snippet = bestSnippet(hit.Content, terms)
+	}
+	enrichSearchHit(&hit, opts, profileJSON, terms, "vector")
+	breakdown := weightedScoreBreakdown(hit, opts.OriginalQuery, terms, 0, "vector")
+	breakdown.VectorBoost = vectorHit.Similarity // RRF mode: store raw similarity for transparency
+	breakdown.MatchedFields = uniqueStrings(append(breakdown.MatchedFields, "vector"))
+	breakdown.StaleEmbeddingPenalty = 0
+	breakdown.Total = scoreBreakdownTotal(breakdown)
+	hit.Rank = breakdown.Total
+	hit.ScoreBreakdown = &breakdown
+	hit.Trace = &domain.SearchHitTrace{
+		SourceID:             vectorHit.SourceID,
+		DocumentID:           vectorHit.DocumentID,
+		SectionID:            vectorHit.SectionID,
+		ChunkID:              vectorHit.ChunkID,
+		ChunkOrdinal:         vectorHit.ChunkOrdinal,
+		ContentHash:          contentHash,
+		EmbeddingModel:       vectorHit.Model,
+		EmbeddingTextHash:    vectorHit.EmbeddingTextHash,
+		ChunkTextHash:        vectorHit.ChunkTextHash,
+		EmbeddingGeneratedAt: vectorHit.GeneratedAt,
+		GeneratorVersion:     vectorHit.GeneratorVersion,
+		Tokenizer:            vectorHit.Tokenizer,
+		ChunkStrategy:        vectorHit.ChunkStrategy,
+		VectorTraceValid:     true,
+	}
+	hit.EvidenceLevel = evidenceLevelForBreakdown(breakdown)
+	if hit.QueryMatch != nil {
+		applyScoreBreakdownToQueryMatch(hit.QueryMatch, breakdown)
+	}
+	return hit, true, nil
+}
+
+func (s *Store) searchSectionsStoredEntities(ctx context.Context, opts domain.SearchOptions, mode entityMatchMode, limit int) ([]domain.SearchHit, error) {
+	queryEntities := extractQueryEntities(opts.Query)
+	if len(queryEntities) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	terms := entitySearchTerms(queryEntities)
+	seen := map[string]bool{}
+	hits := make([]domain.SearchHit, 0)
+	for _, term := range terms {
+		entities, err := s.searchEntitiesExact(ctx, term, limit)
+		if err != nil {
+			return nil, err
+		}
+		for _, entity := range entities {
+			if len(hits) >= limit {
+				return hits, nil
+			}
+			if seen[entity.SectionID] {
+				continue
+			}
+			match := storedEntityMatchForQuery(entity, queryEntities)
+			if mode == entityMatchExact && !match.Exact {
+				continue
+			}
+			if mode == entityMatchNormalized && !match.Normalized {
+				continue
+			}
+			hit, err := s.sectionHitForStoredEntity(ctx, entity, opts, mode, match)
+			if err != nil {
+				return nil, err
+			}
+			seen[entity.SectionID] = true
+			hits = append(hits, hit)
+		}
+	}
+	sortSearchHits(hits)
+	return hits, nil
+}
+
+func (s *Store) sectionHitForStoredEntity(ctx context.Context, entity domain.SectionEntity, opts domain.SearchOptions, mode entityMatchMode, match entityMatchResult) (domain.SearchHit, error) {
+	var hit domain.SearchHit
+	var profileJSON string
+	err := s.readDB().QueryRowContext(ctx, `
+select sections.id, sections.document_id, documents.title, documents.url,
+       coalesce(document_profiles."desc", ''),
+       coalesce(document_profiles.retrieval_profile_json, '{}'),
+       exists (
+         select 1 from feedback_events fe
+         where fe.target_kind = 'document'
+           and fe.target_id = documents.id
+           and fe.feedback_kind = 'document_canonical'
+       ) as canonical,
+       sections.title, sections.heading_path, sections.content
+from sections
+join documents on documents.id = sections.document_id
+left join document_profiles on document_profiles.document_id = documents.id
+where sections.id = ?
+  and not exists (
+    select 1 from feedback_events fe
+    where fe.target_kind = 'document'
+      and fe.target_id = documents.id
+      and fe.feedback_kind = 'document_stale'
+  )
+`, entity.SectionID).Scan(&hit.SectionID, &hit.DocumentID, &hit.DocumentTitle, &hit.DocumentURL, &hit.Desc, &profileJSON, &hit.Canonical, &hit.Title, &hit.HeadingPath, &hit.Content)
+	if err != nil {
+		return domain.SearchHit{}, err
+	}
+	terms := match.Terms
+	if len(terms) == 0 {
+		terms = []string{sectionEntityDisplayTerm(entity)}
+	}
+	hit.Snippet = bestSnippet(hit.Content, terms)
+	enrichSearchHit(&hit, opts, profileJSON, terms, string(mode))
+	breakdown := domain.ScoreBreakdown{
+		MatchedFields: []string{string(mode)},
+		MatchedTerms:  uniqueStrings(terms),
+	}
+	if mode == entityMatchExact {
+		breakdown.ExactMatchBoost = 260
+	} else {
+		breakdown.ExactMatchBoost = 180
+	}
+	if hit.Canonical {
+		breakdown.CanonicalBoost = 30
+	}
+	hit.MatchedEntities = []domain.MatchedEntity{matchedEntityFromStored(entity, string(mode))}
+	breakdown.Total = breakdown.ExactMatchBoost + breakdown.CanonicalBoost
+	hit.Rank = breakdown.Total
+	hit.ScoreBreakdown = &breakdown
+	if hit.QueryMatch != nil {
+		applyScoreBreakdownToQueryMatch(hit.QueryMatch, breakdown)
+	}
+	return hit, nil
+}
+
+func (s *Store) searchSectionsEntityFTS(ctx context.Context, matchQuery string, limit int, opts domain.SearchOptions, mode entityMatchMode) ([]domain.SearchHit, error) {
+	hits, err := s.searchSectionsTokenFTS(ctx, matchQuery, limit, opts)
+	if err != nil {
+		return nil, err
+	}
+	filtered := hits[:0]
+	for _, hit := range hits {
+		match := entityMatchForHit(hit, opts.Query)
+		matched := mode == entityMatchExact && match.Exact
+		matched = matched || mode == entityMatchNormalized && match.Normalized
+		if !matched {
+			continue
+		}
+		hasStoredEntities, err := s.sectionHasStoredEntities(ctx, hit.SectionID)
+		if err != nil {
+			return nil, err
+		}
+		if hasStoredEntities {
+			continue
+		}
+		hit.MatchedEntities = matchedEntitiesWithMode(match.Entities, string(mode))
+		filtered = append(filtered, hit)
+	}
+	return filtered, nil
+}
+
+func (s *Store) sectionHasStoredEntities(ctx context.Context, sectionID string) (bool, error) {
+	var exists bool
+	err := s.readDB().QueryRowContext(ctx, `
+select exists (
+  select 1 from section_entities
+  where section_id = ?
+)
+`, sectionID).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func (s *Store) expandSearchHitsWithRelations(ctx context.Context, hits []domain.SearchHit, opts domain.SearchOptions) ([]domain.SearchHit, error) {
@@ -3288,7 +4819,8 @@ func scanWeightedSearchHits(rows *sql.Rows, opts domain.SearchOptions, field str
 	}
 
 	hits := make([]domain.SearchHit, 0, len(pending))
-	terms := strongQueryTermTexts(classifyQueryTerms(opts.Query))
+	queryTerms := classifyQueryTerms(opts.Query)
+	terms := uniqueStrings(append(entitySearchTerms(extractQueryEntities(opts.Query)), strongQueryTermTexts(queryTerms)...))
 	if len(terms) == 0 {
 		terms = searchTerms(opts.Query)
 	}
@@ -3301,7 +4833,7 @@ func scanWeightedSearchHits(rows *sql.Rows, opts domain.SearchOptions, field str
 		hit.Rank = breakdown.Total
 		hit.ScoreBreakdown = &breakdown
 		if hit.QueryMatch != nil {
-			hit.QueryMatch.ScoreExplanation = weightedScoreExplanation(hit.QueryMatch.MatchedFields, breakdown)
+			applyScoreBreakdownToQueryMatch(hit.QueryMatch, breakdown)
 		}
 		hits = append(hits, hit)
 	}
@@ -3402,7 +4934,7 @@ limit ?
 			hit.Rank = breakdown.Total
 			hit.ScoreBreakdown = &breakdown
 			if hit.QueryMatch != nil {
-				hit.QueryMatch.ScoreExplanation = weightedScoreExplanation(hit.QueryMatch.MatchedFields, breakdown)
+				applyScoreBreakdownToQueryMatch(hit.QueryMatch, breakdown)
 			}
 			hits = append(hits, hit)
 			if len(hits) >= limit {
@@ -3474,6 +5006,13 @@ func (c *searchCollector) add(attempt string, hits []domain.SearchHit) {
 			if hit.QueryMatch != nil {
 				mergeQueryMatch(c.hits[idx].QueryMatch, hit.QueryMatch, attempt)
 			}
+			c.hits[idx].MatchedEntities = mergeMatchedEntities(c.hits[idx].MatchedEntities, hit.MatchedEntities)
+			if c.hits[idx].Trace == nil && hit.Trace != nil {
+				c.hits[idx].Trace = hit.Trace
+			}
+			if hit.EvidenceLevel != "" && (c.hits[idx].EvidenceLevel == "" || c.hits[idx].EvidenceLevel == "weak_vector_only") {
+				c.hits[idx].EvidenceLevel = hit.EvidenceLevel
+			}
 			continue
 		}
 		if hit.QueryMatch != nil {
@@ -3495,6 +5034,9 @@ func (c *searchCollector) results() []domain.SearchHit {
 		if perDoc[hit.DocumentID] >= c.opts.MaxSectionsPerDocument {
 			continue
 		}
+		if hit.EvidenceLevel == "" && hit.ScoreBreakdown != nil {
+			hit.EvidenceLevel = evidenceLevelForBreakdown(*hit.ScoreBreakdown)
+		}
 		perDoc[hit.DocumentID]++
 		result = append(result, hit)
 	}
@@ -3503,10 +5045,10 @@ func (c *searchCollector) results() []domain.SearchHit {
 
 func sortSearchHits(hits []domain.SearchHit) {
 	sort.SliceStable(hits, func(i, j int) bool {
-		if hits[i].Canonical != hits[j].Canonical {
-			return hits[i].Canonical
-		}
 		if hits[i].Rank == hits[j].Rank {
+			if hits[i].Canonical != hits[j].Canonical {
+				return hits[i].Canonical
+			}
 			if hits[i].DocumentTitle == hits[j].DocumentTitle {
 				return hits[i].Title < hits[j].Title
 			}
@@ -3518,28 +5060,26 @@ func sortSearchHits(hits []domain.SearchHit) {
 
 func mergeScoreBreakdowns(left domain.ScoreBreakdown, right domain.ScoreBreakdown) domain.ScoreBreakdown {
 	merged := domain.ScoreBreakdown{
-		UnicodeBM25Boost: left.UnicodeBM25Boost + right.UnicodeBM25Boost,
-		TrigramBM25Boost: left.TrigramBM25Boost + right.TrigramBM25Boost,
-		TitleBoost:       maxFloat(left.TitleBoost, right.TitleBoost),
-		SectionBoost:     maxFloat(left.SectionBoost, right.SectionBoost),
-		SymbolBoost:      maxFloat(left.SymbolBoost, right.SymbolBoost),
-		ExactMatchBoost:  maxFloat(left.ExactMatchBoost, right.ExactMatchBoost),
-		CanonicalBoost:   maxFloat(left.CanonicalBoost, right.CanonicalBoost),
-		CoverageBoost:    maxFloat(left.CoverageBoost, right.CoverageBoost),
-		FallbackBoost:    maxFloat(left.FallbackBoost, right.FallbackBoost),
-		MatchedFields:    uniqueStrings(append(left.MatchedFields, right.MatchedFields...)),
-		MatchedTerms:     uniqueStrings(append(left.MatchedTerms, right.MatchedTerms...)),
-		MatchedSymbols:   uniqueStrings(append(left.MatchedSymbols, right.MatchedSymbols...)),
+		UnicodeBM25Boost:      left.UnicodeBM25Boost + right.UnicodeBM25Boost,
+		TrigramBM25Boost:      left.TrigramBM25Boost + right.TrigramBM25Boost,
+		TitleBoost:            maxFloat(left.TitleBoost, right.TitleBoost),
+		SectionBoost:          maxFloat(left.SectionBoost, right.SectionBoost),
+		SymbolBoost:           maxFloat(left.SymbolBoost, right.SymbolBoost),
+		ExactMatchBoost:       maxFloat(left.ExactMatchBoost, right.ExactMatchBoost),
+		CanonicalBoost:        maxFloat(left.CanonicalBoost, right.CanonicalBoost),
+		CoverageBoost:         maxFloat(left.CoverageBoost, right.CoverageBoost),
+		FallbackBoost:         maxFloat(left.FallbackBoost, right.FallbackBoost),
+		VectorBoost:           maxFloat(left.VectorBoost, right.VectorBoost),
+		VectorOnlyPenalty:     maxFloat(left.VectorOnlyPenalty, right.VectorOnlyPenalty),
+		StaleEmbeddingPenalty: maxFloat(left.StaleEmbeddingPenalty, right.StaleEmbeddingPenalty),
+		MatchedFields:         uniqueStrings(append(left.MatchedFields, right.MatchedFields...)),
+		MatchedTerms:          uniqueStrings(append(left.MatchedTerms, right.MatchedTerms...)),
+		MatchedSymbols:        uniqueStrings(append(left.MatchedSymbols, right.MatchedSymbols...)),
 	}
-	merged.Total = merged.UnicodeBM25Boost +
-		merged.TrigramBM25Boost +
-		merged.TitleBoost +
-		merged.SectionBoost +
-		merged.SymbolBoost +
-		merged.ExactMatchBoost +
-		merged.CanonicalBoost +
-		merged.CoverageBoost +
-		merged.FallbackBoost
+	if hasNonVectorEvidence(merged) {
+		merged.VectorOnlyPenalty = 0
+	}
+	merged.Total = scoreBreakdownTotal(merged)
 	return merged
 }
 
@@ -3972,6 +5512,21 @@ func substringSearchTerms(query string) []string {
 	return uniqueStrings(nonEmptyStrings(terms))
 }
 
+func vectorQueryLabel(opts domain.SearchOptions) string {
+	parts := []string{strings.TrimSpace(opts.OriginalQuery)}
+	parts = append(parts, opts.SemanticIntents...)
+	parts = uniqueStrings(nonEmptyStrings(parts))
+	return strings.Join(parts, " | ")
+}
+
+func truncateForSearchAttempt(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
+}
+
 func profileSearchTerms(query string) []string {
 	terms := searchTerms(query)
 	filtered := make([]string, 0, len(terms))
@@ -4112,14 +5667,32 @@ func weightedScoreBreakdown(hit domain.SearchHit, query string, terms []string, 
 	if len(breakdown.MatchedSymbols) > 0 {
 		breakdown.SymbolBoost = 70
 	}
-	if exactHit(hit, query) {
+	entityMatch := entityMatchForHit(hit, query)
+	if entityMatch.Exact {
+		breakdown.ExactMatchBoost = 260
+		breakdown.MatchedFields = append(breakdown.MatchedFields, string(entityMatchExact))
+		breakdown.MatchedTerms = append(breakdown.MatchedTerms, entityMatch.Terms...)
+	} else if entityMatch.Normalized {
+		breakdown.ExactMatchBoost = 160
+		breakdown.MatchedFields = append(breakdown.MatchedFields, string(entityMatchNormalized))
+		breakdown.MatchedTerms = append(breakdown.MatchedTerms, entityMatch.Terms...)
+	} else if exactPhraseHit(hit, query) {
+		breakdown.ExactMatchBoost = exactPhraseBoost(query)
+		breakdown.MatchedFields = append(breakdown.MatchedFields, "exact_phrase")
+	} else if exactHit(hit, query) {
 		breakdown.ExactMatchBoost = 100
 	}
 	breakdown.CoverageBoost = coverageBoost(hit, terms)
 	if hit.QueryMatch != nil {
-		breakdown.MatchedFields = hit.QueryMatch.MatchedFields
+		breakdown.MatchedFields = uniqueStrings(append(hit.QueryMatch.MatchedFields, breakdown.MatchedFields...))
 	}
-	breakdown.Total = breakdown.UnicodeBM25Boost +
+	breakdown.MatchedTerms = uniqueStrings(breakdown.MatchedTerms)
+	breakdown.Total = scoreBreakdownTotal(breakdown)
+	return breakdown
+}
+
+func scoreBreakdownTotal(breakdown domain.ScoreBreakdown) float64 {
+	return breakdown.UnicodeBM25Boost +
 		breakdown.TrigramBM25Boost +
 		breakdown.TitleBoost +
 		breakdown.SectionBoost +
@@ -4127,8 +5700,42 @@ func weightedScoreBreakdown(hit domain.SearchHit, query string, terms []string, 
 		breakdown.ExactMatchBoost +
 		breakdown.CanonicalBoost +
 		breakdown.CoverageBoost +
-		breakdown.FallbackBoost
-	return breakdown
+		breakdown.FallbackBoost +
+		breakdown.VectorBoost -
+		breakdown.VectorOnlyPenalty -
+		breakdown.StaleEmbeddingPenalty
+}
+
+func vectorOnlyPenalty(breakdown domain.ScoreBreakdown) float64 {
+	if hasNonVectorEvidence(breakdown) {
+		return 0
+	}
+	return 30
+}
+
+func hasNonVectorEvidence(breakdown domain.ScoreBreakdown) bool {
+	return breakdown.UnicodeBM25Boost > 0 ||
+		breakdown.TrigramBM25Boost > 0 ||
+		breakdown.TitleBoost > 0 ||
+		breakdown.SectionBoost > 0 ||
+		breakdown.SymbolBoost > 0 ||
+		breakdown.ExactMatchBoost > 0 ||
+		breakdown.CoverageBoost > 0 ||
+		breakdown.FallbackBoost > 0 ||
+		len(breakdown.MatchedSymbols) > 0
+}
+
+func evidenceLevelForBreakdown(breakdown domain.ScoreBreakdown) string {
+	if breakdown.ExactMatchBoost >= 160 || breakdown.SymbolBoost > 0 {
+		return "strong_exact"
+	}
+	if breakdown.VectorBoost > 0 && hasNonVectorEvidence(breakdown) {
+		return "strong_hybrid"
+	}
+	if breakdown.VectorBoost > 0 {
+		return "weak_vector_only"
+	}
+	return "medium_semantic"
 }
 
 func coverageBoost(hit domain.SearchHit, terms []string) float64 {
@@ -4168,6 +5775,247 @@ func matchedSymbols(hit domain.SearchHit, terms []string) []string {
 	return uniqueStrings(matched)
 }
 
+type entityMatchResult struct {
+	Exact      bool
+	Normalized bool
+	Terms      []string
+	Entities   []domain.MatchedEntity
+}
+
+func extractQueryEntities(query string) []extract.EntityCandidate {
+	return extract.ExtractSection(extract.SectionInput{Content: query})
+}
+
+func extractHitEntities(hit domain.SearchHit) []extract.EntityCandidate {
+	return extract.ExtractSection(extract.SectionInput{
+		DocumentID:  hit.DocumentID,
+		SectionID:   hit.SectionID,
+		Title:       hit.DocumentTitle + "\n" + hit.Title,
+		HeadingPath: hit.HeadingPath,
+		Content:     hit.Content,
+	})
+}
+
+func entitySearchTerms(entities []extract.EntityCandidate) []string {
+	terms := make([]string, 0, len(entities)*2)
+	for _, entity := range entities {
+		switch entity.Kind {
+		case extract.EntityAPIEndpoint:
+			terms = append(terms, entity.Canonical, entity.Path)
+		case extract.EntityPathLiteral:
+			terms = append(terms, entity.Path)
+		case extract.EntityOperationCandidate:
+			terms = append(terms, entity.Operation)
+		}
+	}
+	return uniqueStrings(nonEmptyStrings(terms))
+}
+
+func entityMatchForHit(hit domain.SearchHit, query string) entityMatchResult {
+	queryEntities := extractQueryEntities(query)
+	if len(queryEntities) == 0 {
+		return entityMatchResult{}
+	}
+	queryHasPath := false
+	for _, queryEntity := range queryEntities {
+		if queryEntity.Path != "" {
+			queryHasPath = true
+			break
+		}
+	}
+	hitEntities := extractHitEntities(hit)
+	if len(hitEntities) == 0 {
+		return entityMatchResult{}
+	}
+	hitText := strings.Join([]string{hit.DocumentTitle, hit.Title, hit.HeadingPath, hit.Content}, "\n")
+	result := entityMatchResult{}
+	for _, queryEntity := range queryEntities {
+		for _, hitEntity := range hitEntities {
+			if queryHasPath && queryEntity.Path == "" {
+				continue
+			}
+			if queryEntity.Operation != "" && hitEntity.Operation != "" && strings.EqualFold(queryEntity.Operation, hitEntity.Operation) {
+				if queryEntity.Operation == hitEntity.Operation && strings.Contains(hitText, queryEntity.Operation) {
+					result.Exact = true
+				} else {
+					result.Normalized = true
+				}
+				result.Terms = append(result.Terms, queryEntity.Operation)
+				result.Entities = append(result.Entities, matchedEntityFromCandidate(hitEntity, ""))
+				continue
+			}
+			if queryEntity.Path == "" || hitEntity.Path == "" {
+				continue
+			}
+			methodCompatibleForExact := queryEntity.Method == "" || (hitEntity.Method != "" && queryEntity.Method == hitEntity.Method)
+			if queryEntity.Path == hitEntity.Path && methodCompatibleForExact && hitContainsEntityLiteral(hitText, queryEntity) {
+				result.Exact = true
+				result.Terms = append(result.Terms, entityDisplayTerm(queryEntity))
+				result.Entities = append(result.Entities, matchedEntityFromCandidate(hitEntity, ""))
+				continue
+			}
+			if strings.EqualFold(queryEntity.Path, hitEntity.Path) && methodsCompatibleForNormalized(queryEntity.Method, hitEntity.Method) {
+				result.Normalized = true
+				result.Terms = append(result.Terms, entityDisplayTerm(queryEntity))
+				result.Entities = append(result.Entities, matchedEntityFromCandidate(hitEntity, ""))
+			}
+		}
+	}
+	result.Terms = uniqueStrings(nonEmptyStrings(result.Terms))
+	result.Entities = uniqueMatchedEntities(result.Entities)
+	if result.Exact {
+		result.Normalized = false
+	}
+	return result
+}
+
+func storedEntityMatchForQuery(entity domain.SectionEntity, queryEntities []extract.EntityCandidate) entityMatchResult {
+	result := entityMatchResult{}
+	for _, queryEntity := range queryEntities {
+		if queryEntity.Operation != "" && entity.Operation != "" && strings.EqualFold(queryEntity.Operation, entity.Operation) {
+			if queryEntity.Operation == entity.Operation {
+				result.Exact = true
+			} else {
+				result.Normalized = true
+			}
+			result.Terms = append(result.Terms, queryEntity.Operation)
+			result.Entities = append(result.Entities, matchedEntityFromStored(entity, ""))
+			continue
+		}
+		if queryEntity.Path == "" || entity.Path == "" {
+			continue
+		}
+		if queryEntity.Path == entity.Path && methodsCompatibleForExact(queryEntity.Method, entity.Method) {
+			result.Exact = true
+			result.Terms = append(result.Terms, entityDisplayTerm(queryEntity))
+			result.Entities = append(result.Entities, matchedEntityFromStored(entity, ""))
+			continue
+		}
+		if strings.EqualFold(queryEntity.Path, entity.Path) && methodsCompatibleForNormalized(queryEntity.Method, entity.Method) {
+			result.Normalized = true
+			result.Terms = append(result.Terms, entityDisplayTerm(queryEntity))
+			result.Entities = append(result.Entities, matchedEntityFromStored(entity, ""))
+		}
+	}
+	result.Terms = uniqueStrings(nonEmptyStrings(result.Terms))
+	result.Entities = uniqueMatchedEntities(result.Entities)
+	if result.Exact {
+		result.Normalized = false
+	}
+	return result
+}
+
+func methodsCompatibleForNormalized(queryMethod string, hitMethod string) bool {
+	return queryMethod == "" || hitMethod == "" || queryMethod == hitMethod
+}
+
+func methodsCompatibleForExact(queryMethod string, hitMethod string) bool {
+	return queryMethod == "" || (hitMethod != "" && queryMethod == hitMethod)
+}
+
+func hitContainsEntityLiteral(hitText string, entity extract.EntityCandidate) bool {
+	if entity.Path != "" && strings.Contains(hitText, entity.Path) {
+		return true
+	}
+	if entity.Raw != "" && strings.Contains(hitText, entity.Raw) {
+		return true
+	}
+	return false
+}
+
+func entityDisplayTerm(entity extract.EntityCandidate) string {
+	if entity.Method != "" && entity.Path != "" {
+		return entity.Method + " " + entity.Path
+	}
+	if entity.Path != "" {
+		return entity.Path
+	}
+	return entity.Operation
+}
+
+func sectionEntityDisplayTerm(entity domain.SectionEntity) string {
+	if entity.Method != "" && entity.Path != "" {
+		return entity.Method + " " + entity.Path
+	}
+	if entity.Path != "" {
+		return entity.Path
+	}
+	if entity.Operation != "" {
+		return entity.Operation
+	}
+	return entity.CanonicalText
+}
+
+func matchedEntityFromStored(entity domain.SectionEntity, mode string) domain.MatchedEntity {
+	return domain.MatchedEntity{
+		ID:            entity.ID,
+		SectionID:     entity.SectionID,
+		DocumentID:    entity.DocumentID,
+		Kind:          entity.Kind,
+		CanonicalText: entity.CanonicalText,
+		Method:        entity.Method,
+		Path:          entity.Path,
+		Operation:     entity.Operation,
+		Source:        entity.Source,
+		Confidence:    entity.Confidence,
+		MatchMode:     mode,
+	}
+}
+
+func matchedEntityFromCandidate(candidate extract.EntityCandidate, mode string) domain.MatchedEntity {
+	return domain.MatchedEntity{
+		SectionID:     candidate.SectionID,
+		DocumentID:    candidate.DocumentID,
+		Kind:          string(candidate.Kind),
+		CanonicalText: candidate.Canonical,
+		Method:        candidate.Method,
+		Path:          candidate.Path,
+		Operation:     candidate.Operation,
+		Source:        string(candidate.Source),
+		Confidence:    candidate.Confidence,
+		MatchMode:     mode,
+	}
+}
+
+func matchedEntitiesWithMode(entities []domain.MatchedEntity, mode string) []domain.MatchedEntity {
+	out := make([]domain.MatchedEntity, 0, len(entities))
+	for _, entity := range entities {
+		entity.MatchMode = mode
+		out = append(out, entity)
+	}
+	return uniqueMatchedEntities(out)
+}
+
+func mergeMatchedEntities(existing []domain.MatchedEntity, incoming []domain.MatchedEntity) []domain.MatchedEntity {
+	merged := make([]domain.MatchedEntity, 0, len(existing)+len(incoming))
+	merged = append(merged, existing...)
+	merged = append(merged, incoming...)
+	return uniqueMatchedEntities(merged)
+}
+
+func uniqueMatchedEntities(entities []domain.MatchedEntity) []domain.MatchedEntity {
+	seen := map[string]bool{}
+	out := make([]domain.MatchedEntity, 0, len(entities))
+	for _, entity := range entities {
+		if entity.Kind == "" && entity.CanonicalText == "" && entity.Path == "" && entity.Operation == "" {
+			continue
+		}
+		key := strings.Join([]string{entity.ID, entity.SectionID, entity.Kind, entity.CanonicalText, entity.Method, entity.Path, entity.Operation, entity.MatchMode}, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, entity)
+	}
+	return out
+}
+
+func applyScoreBreakdownToQueryMatch(match *domain.QueryMatch, breakdown domain.ScoreBreakdown) {
+	match.MatchedFields = uniqueStrings(append(match.MatchedFields, breakdown.MatchedFields...))
+	match.MatchedTerms = uniqueStrings(append(match.MatchedTerms, breakdown.MatchedTerms...))
+	match.ScoreExplanation = weightedScoreExplanation(match.MatchedFields, breakdown)
+}
+
 func strongTermHit(fields []string, terms []string) bool {
 	for _, field := range fields {
 		for _, term := range terms {
@@ -4192,6 +6040,96 @@ func exactHit(hit domain.SearchHit, query string) bool {
 		return false
 	}
 	return containsFold(hit.DocumentTitle, query) || containsFold(hit.Title, query) || containsFold(hit.HeadingPath, query) || containsFold(hit.Content, query)
+}
+
+func exactPhraseHit(hit domain.SearchHit, query string) bool {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return false
+	}
+	return containsExactPhraseFold(hit.DocumentTitle, query) || containsExactPhraseFold(hit.Title, query) || containsExactPhraseFold(hit.HeadingPath, query) || containsExactPhraseFold(hit.Content, query)
+}
+
+func exactPhraseBoost(query string) float64 {
+	switch classifyExactPhraseQuery(query) {
+	case phraseQueryLong:
+		return 260
+	case phraseQueryMedium:
+		return 160
+	default:
+		return 80
+	}
+}
+
+type phraseQueryClass int
+
+const (
+	phraseQueryShort phraseQueryClass = iota
+	phraseQueryMedium
+	phraseQueryLong
+)
+
+func classifyExactPhraseQuery(query string) phraseQueryClass {
+	runeLen := phraseQueryLength(query)
+	strongCount := 0
+	for _, term := range classifyQueryTerms(query) {
+		if term.Strength == "strong" {
+			strongCount++
+		}
+	}
+	switch {
+	case runeLen >= 18 || strongCount >= 5:
+		return phraseQueryLong
+	case runeLen >= 7 || strongCount >= 2:
+		return phraseQueryMedium
+	default:
+		return phraseQueryShort
+	}
+}
+
+func phraseQueryLength(query string) int {
+	count := 0
+	for _, r := range query {
+		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func containsExactPhraseFold(value string, query string) bool {
+	valueRunes := []rune(strings.ToLower(value))
+	queryRunes := []rune(strings.ToLower(strings.TrimSpace(query)))
+	if len(queryRunes) == 0 || len(queryRunes) > len(valueRunes) {
+		return false
+	}
+	for i := 0; i+len(queryRunes) <= len(valueRunes); i++ {
+		matched := true
+		for j, r := range queryRunes {
+			if valueRunes[i+j] != r {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		beforeOK := i == 0 || !isExactPhraseContinuation(valueRunes[i-1])
+		afterIdx := i + len(queryRunes)
+		afterOK := afterIdx == len(valueRunes) || !isExactPhraseContinuation(valueRunes[afterIdx])
+		if beforeOK && afterOK {
+			return true
+		}
+	}
+	return false
+}
+
+func isExactPhraseContinuation(r rune) bool {
+	if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		return true
+	}
+	return strings.ContainsRune("_./:{}-", r)
 }
 
 func weightedScoreExplanation(fields []string, breakdown domain.ScoreBreakdown) string {

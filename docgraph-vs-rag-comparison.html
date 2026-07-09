@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DocGraph (MCP+KG) vs RAG 知识库对比分析</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #161922;
+    --surface2: #1e2330;
+    --border: #2a3040;
+    --text: #e4e8f1;
+    --text2: #a0a8b8;
+    --accent: #6c8cff;
+    --accent2: #4ce8a0;
+    --warn: #f0a040;
+    --danger: #e86060;
+    --pro: #4ce8a0;
+    --con: #e86060;
+    --neutral: #a0a8b8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 0;
+  }
+  .hero {
+    background: linear-gradient(135deg, #1a2040 0%, #0f1117 50%, #102018 100%);
+    padding: 60px 40px 40px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero h1 {
+    font-size: 2.2em;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+  .hero .subtitle {
+    font-size: 1.1em;
+    color: var(--text2);
+    max-width: 700px;
+    margin: 0 auto;
+  }
+  .hero .tag-row {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    margin-top: 20px;
+  }
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 0.85em;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text2);
+  }
+  .tag .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .tag .dot.pro { background: var(--pro); }
+  .tag .dot.con { background: var(--con); }
+  .tag .dot.blue { background: var(--accent); }
+  .container {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 40px 30px 80px;
+  }
+  h2 {
+    font-size: 1.6em;
+    color: var(--accent);
+    margin: 40px 0 16px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  h2 .icon { font-size: 1.4em; }
+  h3 {
+    font-size: 1.2em;
+    color: var(--text);
+    margin: 24px 0 12px;
+  }
+  .arch-comparison {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin: 20px 0;
+  }
+  .arch-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+  }
+  .arch-card .label {
+    font-size: 0.85em;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .arch-card .label .badge {
+    background: var(--accent);
+    color: #000;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.75em;
+    font-weight: 700;
+  }
+  .arch-card .label .badge.alt {
+    background: var(--warn);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 0.9em;
+  }
+  th, td {
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    background: var(--surface2);
+    color: var(--text2);
+    font-weight: 600;
+    font-size: 0.85em;
+  }
+  td:first-child { color: var(--text); font-weight: 500; }
+  td:nth-child(2) { color: var(--pro); }
+  td:nth-child(3) { color: var(--con); }
+  .cascade-flow {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin: 20px 0;
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 0.82em;
+    line-height: 1.9;
+    color: var(--text2);
+  }
+  .cascade-flow .step {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 0;
+  }
+  .cascade-flow .arrow {
+    color: var(--accent);
+    font-size: 1.1em;
+  }
+  .cascade-flow .highlight {
+    color: var(--pro);
+    font-weight: 600;
+  }
+  .cascade-flow .note {
+    color: var(--warn);
+    font-style: italic;
+  }
+  .advantage-list, .disadvantage-list {
+    list-style: none;
+    margin: 16px 0;
+  }
+  .advantage-list li, .disadvantage-list li {
+    padding: 16px 20px;
+    margin: 10px 0;
+    border-radius: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+  }
+  .advantage-list li { border-left: 3px solid var(--pro); }
+  .disadvantage-list li { border-left: 3px solid var(--con); }
+  .advantage-list .title, .disadvantage-list .title {
+    font-weight: 600;
+    font-size: 1.05em;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .advantage-list .title .emoji { font-size: 1.2em; }
+  .advantage-list .title { color: var(--pro); }
+  .disadvantage-list .title { color: var(--con); }
+  .advantage-list .desc, .disadvantage-list .desc {
+    color: var(--text2);
+    font-size: 0.92em;
+  }
+  .mcp-flow {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin: 20px 0;
+    font-family: monospace;
+    font-size: 0.85em;
+    line-height: 2;
+  }
+  .mcp-flow .call {
+    color: var(--accent);
+  }
+  .mcp-flow .comment {
+    color: var(--text2);
+    font-style: italic;
+  }
+  .mcp-flow .arrow {
+    color: var(--warn);
+  }
+  .conclusion-box {
+    background: linear-gradient(135deg, var(--surface2), var(--surface));
+    border: 2px solid var(--accent);
+    border-radius: 14px;
+    padding: 28px 30px;
+    margin: 30px 0;
+  }
+  .conclusion-box h3 {
+    color: var(--accent);
+    margin-bottom: 16px;
+    font-size: 1.3em;
+  }
+  .conclusion-box p {
+    color: var(--text);
+    margin: 8px 0;
+  }
+  .conclusion-box .key-point {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin: 12px 0;
+  }
+  .conclusion-box .key-point .num {
+    background: var(--accent);
+    color: #000;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 0.85em;
+    flex-shrink: 0;
+  }
+  .conclusion-box .key-point .text {
+    color: var(--text);
+    font-size: 0.95em;
+  }
+  .footer {
+    text-align: center;
+    color: var(--text2);
+    font-size: 0.8em;
+    padding: 30px;
+    border-top: 1px solid var(--border);
+  }
+  @media (max-width: 700px) {
+    .arch-comparison { grid-template-columns: 1fr; }
+    .hero h1 { font-size: 1.6em; }
+    .container { padding: 20px 16px 60px; }
+    table { font-size: 0.82em; }
+    th, td { padding: 8px 10px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>🧠 DocGraph vs RAG</h1>
+  <div class="subtitle">基于 MCP + 知识图谱的知识库 与 传统 RAG 检索增强生成方案的系统性对比分析</div>
+  <div class="tag-row">
+    <span class="tag"><span class="dot blue"></span>MCP 工具范式</span>
+    <span class="tag"><span class="dot pro"></span>知识图谱推理</span>
+    <span class="tag"><span class="dot con"></span>向量检索补充</span>
+    <span class="tag"><span class="dot blue"></span>混合搜索级联</span>
+  </div>
+</div>
+
+<div class="container">
+
+<!-- 架构对比 -->
+<h2><span class="icon">🏗️</span> 核心架构差异</h2>
+
+<div class="arch-comparison">
+  <div class="arch-card">
+    <div class="label"><span class="badge">DocGraph</span> MCP + 知识图谱</div>
+    <table>
+      <tr><td style="color:var(--text)">检索方式</td><td>图谱遍历 + FTS5 + 向量搜索</td></tr>
+      <tr><td style="color:var(--text)">数据组织</td><td>知识图谱（层级 + API/Term 关系）</td></tr>
+      <tr><td style="color:var(--text)">交互协议</td><td>MCP — 工具调用范式</td></tr>
+      <tr><td style="color:var(--text)">存储</td><td>SQLite(FTS5) + pgvector + 图结构表</td></tr>
+      <tr><td style="color:var(--text)">探索模式</td><td>渐进式多轮探索</td></tr>
+    </table>
+  </div>
+  <div class="arch-card">
+    <div class="label"><span class="badge alt">RAG</span> 检索增强生成</div>
+    <table>
+      <tr><td style="color:var(--text)">检索方式</td><td style="color:var(--con)">向量相似度检索为主</td></tr>
+      <tr><td style="color:var(--text)">数据组织</td><td style="color:var(--con)">平面化文档块/切片</td></tr>
+      <tr><td style="color:var(--text)">交互协议</td><td style="color:var(--con)">REST API / SDK 调用</td></tr>
+      <tr><td style="color:var(--text)">存储</td><td style="color:var(--con)">向量数据库(Pinecone/Weaviate)</td></tr>
+      <tr><td style="color:var(--text)">探索模式</td><td style="color:var(--con)">一次性注入 Prompt</td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- 优势 -->
+<h2><span class="icon">✅</span> DocGraph 的优势</h2>
+
+<ul class="advantage-list">
+  <li>
+    <div class="title"><span class="emoji">🔗</span> 1. 结构化关系感知 — 核心差异化优势</div>
+    <div class="desc">
+      传统 RAG 只能找到"语义相近的文本块"，无法理解文档间的<strong>结构性关系</strong>。DocGraph 知识图谱提供：
+      <br>• <strong>层级关系</strong>：Product → Module → Document → Section，AI 可从具体问题向上追溯到所属模块/产品
+      <br>• <strong>语义关系</strong>：<code>describes</code>（描述术语）、<code>mentions</code>（提及概念）、<code>exposes_api</code>（暴露接口）
+      <br>• <strong>影响链分析</strong>：<code>doc_impact</code> 做 BFS 多跳遍历，可回答"如果这个 API 变了，哪些下游受影响？" — 这是 RAG <em>完全无法做到的</em>
+    </div>
+  </li>
+  <li>
+    <div class="title"><span class="emoji">🎯</span> 2. 多策略搜索级联 — 比纯向量搜索更精准</div>
+    <div class="desc">
+      搜索是<strong>9 层级联策略</strong>而非单一向量匹配，每种策略覆盖不同检索场景：
+    </div>
+  </li>
+</ul>
+
+<div class="cascade-flow">
+  <div class="step"><span class="highlight">entity_exact</span> → API路径/代码符号精确匹配 <span class="note">// RAG 对此几乎无能为力</span></div>
+  <div class="step"><span class="arrow">↓</span> <span class="highlight">entity_normalized</span> → 归一化匹配（大小写/路径）</div>
+  <div class="step"><span class="arrow">↓</span> <span class="highlight">FTS5 Unicode61</span> → BM25 评分全文检索</div>
+  <div class="step"><span class="arrow">↓</span> <span class="highlight">FTS5 Trigram</span> → 子串/符号模糊匹配</div>
+  <div class="step"><span class="arrow">↓</span> <span class="highlight">original_unicode61 / trigram</span> → 原始查询回退</div>
+  <div class="step"><span class="arrow">↓</span> <span class="highlight">exact_terms</span> → 必保留术语 LIKE 搜索</div>
+  <div class="step"><span class="arrow">↓</span> <span class="highlight">profile_fallback</span> → TF-IDF 检索画像 <span class="note">// 中文 n-gram 1-4字滑动窗口</span></div>
+  <div class="step"><span class="arrow">↓</span> <span class="highlight">like_fallback</span> → 最后兜底</div>
+  <div class="step"><span class="arrow">↓</span> <span class="highlight">vector</span> → 向量相似度搜索 <span class="note">// VectorOnlyPenalty=30 惩罚纯向量命中</span></div>
+</div>
+
+<ul class="advantage-list">
+  <li>
+    <div class="title"><span class="emoji">🤖</span> 3. MCP 工具范式 — AI 按需探索而非一次性注入</div>
+    <div class="desc">
+      传统 RAG：一次性把检索结果塞进 prompt → LLM 基于有限上下文回答。
+      <br>DocGraph MCP 让 AI <strong>自主决定探索路径</strong>：
+    </div>
+  </li>
+</ul>
+
+<div class="mcp-flow">
+  <span class="call">AI: doc_search("认证流程")</span>           <span class="comment">// 得到摘要 + section_id</span><br>
+  <span class="arrow">→</span> <span class="call">doc_get_section(id=...)</span>        <span class="comment">// 深读具体章节</span><br>
+  <span class="arrow">→</span> <span class="call">doc_related(id=...)</span>            <span class="comment">// 发现关联文档/术语</span><br>
+  <span class="arrow">→</span> <span class="call">doc_impact(id=..., direction=out)</span> <span class="comment">// 分析影响范围</span><br>
+  <span class="arrow">→</span> <span class="call">doc_propose_relation(...)</span>      <span class="comment">// 主动标注文档间关系</span><br>
+  <br>
+  <span class="comment">// 这是渐进式探索，而非一次性注入。AI 可根据前一步的结果决定下一步查什么。</span>
+</div>
+
+<ul class="advantage-list">
+  <li>
+    <div class="title"><span class="emoji">🔍</span> 4. 可追溯性与可审计性</div>
+    <div class="desc">
+      • 每条边都有 <code>Provenance</code>（来源：sync / rule / html_link / manual）
+      <br>• 搜索结果有 <code>ScoreBreakdown</code>（精确列出每个 boost 来源和分值）
+      <br>• 向量搜索有 <code>Trace</code>（chunk_id、embedding_model、generator_version）
+      <br>• 反馈系统可标记 <code>relationship_wrong</code>、<code>document_stale</code>、<code>document_canonical</code>
+      <br><br>RAG 方案几乎不提供这种粒度的可审计性。
+    </div>
+  </li>
+  <li>
+    <div class="title"><span class="emoji">🔄</span> 5. 人工反馈闭环 — 自我纠错能力</div>
+    <div class="desc">
+      • <code>doc_propose_relation</code>：AI 可提议文档间关系（如"这篇文档已过时"），经人工审批后影响检索
+      <br>• <code>document_canonical</code> boost：标记权威文档，搜索时优先呈现
+      <br>• <code>document_stale</code> 过滤：标记过时文档，搜索时排除
+      <br><br>传统 RAG 没有这种纠错机制 — 错误的检索结果会反复出现。
+    </div>
+  </li>
+  <li>
+    <div class="title"><span class="emoji">🔒</span> 6. 内容地址稳定 ID — 幂等同步</div>
+    <div class="desc">
+      SHA-256 基的稳定 ID 使得重复同步不会产生冗余数据。RAG 方案通常用随机 ID，重新索引会产生重复切片。
+    </div>
+  </li>
+</ul>
+
+<!-- 劣势 -->
+<h2><span class="icon">❌</span> DocGraph 的劣势</h2>
+
+<ul class="disadvantage-list">
+  <li>
+    <div class="title"><span class="emoji">⚙️</span> 1. 图谱构建复杂度高</div>
+    <div class="desc">
+      • 需定义节点/边类型、层级结构、provenance 体系（sync.go 866 行）
+      <br>• 对<strong>无结构的杂散文档</strong>（零散笔记、聊天记录），图谱构建价值有限
+      <br>• RAG 方案更简单：切块 → 嵌入 → 存向量库，无需理解文档间结构关系
+    </div>
+  </li>
+  <li>
+    <div class="title"><span class="emoji">📦</span> 2. 向量搜索需要 pgvector 外部依赖</div>
+    <div class="desc">
+      DocGraph 向量搜索需要 PostgreSQL + pgvector，而项目核心理念是"单一 Go 二进制、零外部依赖"。引入 pgvector 打破了这一承诺。
+      <br>传统 RAG 方案本就依赖向量数据库，这不是额外负担。
+    </div>
+  </li>
+  <li>
+    <div class="title"><span class="emoji">⏱️</span> 3. 图谱遍历延迟可能更高</div>
+    <div class="desc">
+      • <code>doc_impact</code> BFS 在 Go 层实现（非递归 CTE），多层遍历需多次数据库查询
+      <br>• 大规模图谱（百万级节点）BFS 性能可能成为瓶颈
+      <br>• 向量数据库（Milvus/Pinecone）在 ANN 检索上有成熟 HNSW 优化，延迟通常更低
+    </div>
+  </li>
+  <li>
+    <div class="title"><span class="emoji">💰</span> 4. MCP 交互需要多轮 LLM 调用 — 成本和延迟</div>
+    <div class="desc">
+      传统 RAG：单次检索 + 单次 LLM 调用。DocGraph MCP 下，AI 可能需要 3-5 次工具调用：
+      <br><code>search → get_section → related → impact → propose_relation</code>
+      <br>每次工具调用 = 一次 LLM 推理，<strong>token 消耗和延迟显著增加</strong>。
+    </div>
+  </li>
+  <li>
+    <div class="title"><span class="emoji">🔧</span> 5. 搜索策略级联可能过度复杂</div>
+    <div class="desc">
+      9 层搜索策略 + 多种 boost/penalty 组合，覆盖全面但：
+      <br>• 调优困难（多个权重参数相互影响）
+      <br>• 某些策略对特定领域可能是噪音（如 <code>like_fallback</code> 对英文文档价值有限）
+      <br>• RAG 的向量检索虽然"粗糙"，但行为更可预测
+    </div>
+  </li>
+  <li>
+    <div class="title"><span class="emoji">📋</span> 6. 知识图谱覆盖范围受限于预定义类型</div>
+    <div class="desc">
+      节点/边类型是预定义的（Product/Module/Document/Section/API/Term），对<strong>不属于这些类型的内容</strong>（非技术文档、叙事性内容、多媒体）表达力不足。
+      <br>RAG 对任何文本平等对待，无结构限制。
+    </div>
+  </li>
+</ul>
+
+<!-- 适用场景 -->
+<h2><span class="icon">📊</span> 适用场景对比</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>场景</th>
+      <th>DocGraph 更优 ✅</th>
+      <th>RAG 更优 ✅</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>API / 代码文档检索</td>
+      <td style="color:var(--pro)">✅ entity 精确匹配 + API 节点</td>
+      <td style="color:var(--con)">❌ 向量对符号匹配差</td>
+    </tr>
+    <tr>
+      <td>影响链 / 依赖追踪</td>
+      <td style="color:var(--pro)">✅ 多跳 BFS 遍历</td>
+      <td style="color:var(--con)">❌ 完全无法</td>
+    </tr>
+    <tr>
+      <td>中文技术文档</td>
+      <td style="color:var(--pro)">✅ n-gram + FTS5</td>
+      <td style="color:var(--con)">❌ 依赖分词器</td>
+    </tr>
+    <tr>
+      <td>杂散无结构内容</td>
+      <td style="color:var(--con)">❌ 图谱表达力有限</td>
+      <td style="color:var(--pro)">✅ 平面切块即可</td>
+    </tr>
+    <tr>
+      <td>低延迟 / 低成本交互</td>
+      <td style="color:var(--con)">❌ 多轮 MCP 调用</td>
+      <td style="color:var(--pro)">✅ 单次检索</td>
+    </tr>
+    <tr>
+      <td>可审计 / 可纠错</td>
+      <td style="color:var(--pro)">✅ 反馈闭环</td>
+      <td style="color:var(--con)">❌ 无纠错机制</td>
+    </tr>
+    <tr>
+      <td>大规模部署 (>百万文档)</td>
+      <td style="color:var(--con)">❌ BFS + SQLite 瓶颈</td>
+      <td style="color:var(--pro)">✅ 向量数据库成熟</td>
+    </tr>
+    <tr>
+      <td>快速原型 / 最小依赖</td>
+      <td style="color:var(--con)">❌ 图谱 + pgvector</td>
+      <td style="color:var(--pro)">✅ 向量库即可</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- 结论 -->
+<h2><span class="icon">🔑</span> 核心结论</h2>
+
+<div class="conclusion-box">
+  <h3>从"语义相似度匹配"升级到"结构化关系推理"</h3>
+  <p>DocGraph 的 MCP + 知识图谱方案的本质跃迁：</p>
+
+  <div class="key-point">
+    <span class="num">1</span>
+    <span class="text"><strong>AI 可以理解文档间的关系</strong>，而非仅仅找到"看起来类似"的文本块。图谱遍历让 AI 能够沿层级和语义边进行推理，这是向量检索的语义相似度无法替代的。</span>
+  </div>
+
+  <div class="key-point">
+    <span class="num">2</span>
+    <span class="text"><strong>多策略搜索比纯向量更精准</strong>，尤其对代码符号和 API 路径。entity 精确匹配 + FTS5 BM25 + 向量补充的组合，覆盖了向量搜索的盲区。</span>
+  </div>
+
+  <div class="key-point">
+    <span class="num">3</span>
+    <span class="text"><strong>反馈闭环让系统可以自我纠错</strong>，这是 RAG 的盲区。标记 <code>document_stale</code>、<code>relationship_wrong</code>、<code>document_canonical</code> 构建了持续改进的闭环。</span>
+  </div>
+
+  <p style="margin-top:20px; color:var(--warn)">代价：</p>
+  <div class="key-point">
+    <span class="num" style="background:var(--con)">A</span>
+    <span class="text">架构复杂度更高（图谱构建 + pgvector 依赖 + 多轮交互成本）</span>
+  </div>
+  <div class="key-point">
+    <span class="num" style="background:var(--con)">B</span>
+    <span class="text">对无结构内容的覆盖不如 RAG</span>
+  </div>
+  <div class="key-point">
+    <span class="num" style="background:var(--con)">C</span>
+    <span class="text">规模化场景需要更多优化工作</span>
+  </div>
+
+  <p style="margin-top:24px; color:var(--accent); font-weight:600">
+    🎯 最佳策略是 DocGraph 已经在做的事情 — <strong>混合方案</strong>：知识图谱负责结构化推理，向量搜索补充语义匹配，两者结合而非互斥。<code>VectorOnlyPenalty</code> 和 <code>strong_hybrid</code> evidence level 设计正是这个思路的体现。
+  </p>
+</div>
+
+</div>
+
+<div class="footer">
+  DocGraph Knowledge Graph vs RAG Comparison · Generated 2026-07-06 · <a href="https://github.com/docgraph/docgraph" style="color:var(--accent)">github.com/docgraph/docgraph</a>
+</div>
+
+</body>
+</html>

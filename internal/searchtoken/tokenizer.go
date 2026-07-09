@@ -7,6 +7,7 @@ import (
 	"sync"
 	"unicode"
 
+	"github.com/docgraph/docgraph/internal/technical/extract"
 	"github.com/go-ego/gse"
 )
 
@@ -150,8 +151,20 @@ func (ruleTokenizer) SymbolTerms(text string) []string {
 }
 
 func symbolTerms(text string) []string {
+	paths := extract.PathLiterals(text)
+	terms := make([]string, 0, len(paths)*4)
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		terms = append(terms, path, strings.ToLower(path))
+		for _, part := range splitIdentifier(path) {
+			if part != "" && !isLanguageKeyword(strings.ToLower(part)) {
+				terms = append(terms, part, strings.ToLower(part))
+			}
+		}
+	}
 	raw := identifierPattern.FindAllString(text, -1)
-	terms := make([]string, 0, len(raw)*3)
 	for _, token := range raw {
 		token = strings.Trim(token, `"'.,;:!?()[]{}<>`)
 		if token == "" || isLanguageKeyword(strings.ToLower(token)) {

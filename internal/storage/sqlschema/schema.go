@@ -1,6 +1,6 @@
 package sqlschema
 
-const CurrentSchemaVersion = 2
+const CurrentSchemaVersion = 4
 
 type Status struct {
 	StorageDSN string `json:"storage_dsn"`
@@ -86,6 +86,22 @@ create table if not exists document_profiles (
   generated_at text not null default '',
   created_at text not null default current_timestamp,
   updated_at text not null default current_timestamp
+);
+
+create table if not exists section_entities (
+  id text primary key,
+  section_id text not null references sections(id) on delete cascade,
+  document_id text not null references documents(id) on delete cascade,
+  kind text not null,
+  raw_text text not null default '',
+  canonical_text text not null default '',
+  method text not null default '',
+  path text not null default '',
+  operation text not null default '',
+  source text not null default '',
+  confidence real not null default 0,
+  evidence_json text not null default '{}',
+  created_at text not null default current_timestamp
 );
 
 create table if not exists knowledge_relation_proposals (
@@ -259,6 +275,9 @@ create virtual table if not exists fts_nodes using fts5(
 create index if not exists idx_documents_source on documents(source_id);
 create index if not exists idx_sections_document on sections(document_id);
 create index if not exists idx_document_profiles_generated_hash on document_profiles(generated_from_hash);
+create index if not exists idx_section_entities_document on section_entities(document_id, kind, canonical_text);
+create index if not exists idx_section_entities_section on section_entities(section_id, kind, canonical_text);
+create index if not exists idx_section_entities_path on section_entities(kind, method, path, confidence);
 create index if not exists idx_relation_proposals_status_created on knowledge_relation_proposals(status, created_at);
 create index if not exists idx_relation_proposals_from on knowledge_relation_proposals(from_document_id, status);
 create index if not exists idx_relation_proposals_to on knowledge_relation_proposals(to_document_id, status);

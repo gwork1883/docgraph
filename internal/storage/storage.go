@@ -9,9 +9,11 @@ import (
 	"github.com/docgraph/docgraph/internal/domain"
 	"github.com/docgraph/docgraph/internal/storage/sqlite"
 	"github.com/docgraph/docgraph/internal/storage/sqlschema"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 var ErrSyncInProgress = domain.ErrSyncInProgress
+var ErrJobNotCancelable = domain.ErrJobNotCancelable
 
 type Store interface {
 	Migrate(ctx context.Context) error
@@ -31,16 +33,23 @@ type Store interface {
 	GetConfluenceCookieCredential(ctx context.Context, id string) (ConfluenceCookieCredential, error)
 	ListSourceArtifacts(ctx context.Context, sourceID string, limit, offset int) (SourceArtifacts, error)
 	GetSourceArtifactCounts(ctx context.Context, sourceID string) (SourceArtifactCounts, error)
+	GetSourceHealth(ctx context.Context, sourceID string) (SourceHealth, error)
 	ListSourceDocuments(ctx context.Context, sourceID string, limit, offset int) ([]DocumentSummary, error)
 	ListSourceSections(ctx context.Context, sourceID string, limit, offset int) ([]SectionSummary, error)
+	ListSourceSectionEntities(ctx context.Context, sourceID string, limit, offset int) ([]SectionEntity, error)
 	ListSourceNodes(ctx context.Context, sourceID string, limit, offset int) ([]Node, error)
 	ListSourceEdges(ctx context.Context, sourceID string, limit, offset int) ([]EdgeSummary, error)
+	GetDocument(ctx context.Context, id string) (DocumentSummary, error)
+	ListDocumentSections(ctx context.Context, documentID string, limit, offset int) ([]SectionSummary, error)
 	GetDocumentBySourceExternalID(ctx context.Context, sourceID string, externalID string) (DocumentSummary, error)
 	ReplaceDocument(ctx context.Context, doc DocumentInput, sections []SectionInput) error
 	DeleteDocumentsNotInSource(ctx context.Context, sourceID string, keepDocumentIDs []string) error
 	GetDocumentProfile(ctx context.Context, documentID string) (DocumentProfile, error)
 	UpdateDocumentProfileDesc(ctx context.Context, input DocumentProfileInput) (DocumentProfile, error)
 	UpsertDocumentRetrievalProfile(ctx context.Context, input RetrievalProfileInput) (DocumentProfile, error)
+	ReplaceSectionEntities(ctx context.Context, documentID string, entities []SectionEntityInput) error
+	ListDocumentEntities(ctx context.Context, documentID string) ([]SectionEntity, error)
+	SearchEntities(ctx context.Context, query string, limit int) ([]SectionEntity, error)
 	CreateKnowledgeRelationProposal(ctx context.Context, input KnowledgeRelationProposalInput) (KnowledgeRelationProposal, error)
 	ListKnowledgeRelationProposals(ctx context.Context, opts KnowledgeRelationProposalListOptions) ([]KnowledgeRelationProposal, error)
 	GetKnowledgeRelationProposal(ctx context.Context, id string) (KnowledgeRelationProposal, error)
@@ -55,9 +64,12 @@ type Store interface {
 	UpdateJobProgress(ctx context.Context, id string, progressJSON string) error
 	CompleteJob(ctx context.Context, id string, resultJSON string) error
 	FailJob(ctx context.Context, id string, errText string) error
+	CancelJob(ctx context.Context, id string, reason string) (Job, error)
+	MarkJobCanceled(ctx context.Context, id string, reason string) error
 	ListJobs(ctx context.Context, opts JobListOptions) ([]Job, error)
 	CountJobs(ctx context.Context, opts JobListOptions) (int, error)
 	GetJob(ctx context.Context, id string) (Job, error)
+	CreateEmbeddingEnsureJobIfIdle(ctx context.Context, sourceID string) (Job, error)
 	CreateSyncJob(ctx context.Context, sourceID string) (SyncJob, error)
 	CreateSyncJobIfIdle(ctx context.Context, sourceID string) (SyncJob, error)
 	CompleteSyncJob(ctx context.Context, id string, result ResultPayload) error
@@ -76,6 +88,20 @@ type Store interface {
 	SearchSections(ctx context.Context, query string, limit int) ([]SearchHit, error)
 	SearchSectionsWithOptions(ctx context.Context, opts SearchOptions) (SearchResult, error)
 	GetSection(ctx context.Context, id string) (SectionContent, error)
+	UpsertSectionEmbedding(ctx context.Context, input SectionEmbeddingInput) error
+	GetSectionEmbedding(ctx context.Context, sectionID string, model string) (VectorSearchHit, []float32, error)
+	DeleteSectionEmbeddings(ctx context.Context, sectionID string) error
+	SearchSectionsByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]VectorSearchHit, error)
+	ListSectionEmbeddingHashes(ctx context.Context, model string, limit, offset int) ([]SectionEmbeddingHash, error)
+	UpsertEmbeddingChunk(ctx context.Context, input EmbeddingChunkInput) error
+	GetEmbeddingChunk(ctx context.Context, chunkID string, model string) (VectorSearchHit, []float32, error)
+	DeleteEmbeddingChunksBySection(ctx context.Context, sectionID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) error
+	SearchChunksByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]VectorSearchHit, error)
+	ListEmbeddingChunkHashes(ctx context.Context, model string, limit, offset int) ([]EmbeddingChunkHash, error)
+	GetSourceEmbeddingStatus(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string, chunkTargetTokens int) (EmbeddingStatus, error)
+	GetSectionForEmbedding(ctx context.Context, sectionID string) (EmbeddingSection, error)
+	CountSectionsForEmbedding(ctx context.Context, sourceID string) (int, error)
+	ListSectionsForEmbedding(ctx context.Context, sourceID string, limit, offset int) ([]EmbeddingSection, error)
 	RecordQueryObservation(ctx context.Context, input QueryObservationInput) error
 	Close() error
 }
@@ -92,6 +118,10 @@ type SectionInput = domain.SectionInput
 type DocumentProfile = domain.DocumentProfile
 type DocumentProfileInput = domain.DocumentProfileInput
 type RetrievalProfileInput = domain.RetrievalProfileInput
+type SectionEntityInput = domain.SectionEntityInput
+type SectionEntity = domain.SectionEntity
+type MatchedEntity = domain.MatchedEntity
+type EntityDiagnostics = domain.EntityDiagnostics
 type KnowledgeRelationProposalInput = domain.KnowledgeRelationProposalInput
 type KnowledgeRelationProposal = domain.KnowledgeRelationProposal
 type KnowledgeRelationProposalListOptions = domain.KnowledgeRelationProposalListOptions
@@ -103,12 +133,22 @@ type SearchHit = domain.SearchHit
 type SearchOptions = domain.SearchOptions
 type SearchResult = domain.SearchResult
 type SearchAttempt = domain.SearchAttempt
+type SectionEmbeddingInput = domain.SectionEmbeddingInput
+type EmbeddingChunkInput = domain.EmbeddingChunkInput
+type VectorSearchHit = domain.VectorSearchHit
+type SectionEmbeddingHash = domain.SectionEmbeddingHash
+type EmbeddingChunkHash = domain.EmbeddingChunkHash
+type EmbeddingStatus = domain.EmbeddingStatus
+type EmbeddingSection = domain.EmbeddingSection
 type Job = domain.Job
 type JobInput = domain.JobInput
 type JobListOptions = domain.JobListOptions
 type SourceArtifacts = domain.SourceArtifacts
 type SourceArtifactCounts = domain.SourceArtifactCounts
+type SourceHealth = domain.SourceHealth
+type SourceHealthWarning = domain.SourceHealthWarning
 type DocumentSummary = domain.DocumentSummary
+type DocumentDetail = domain.DocumentDetail
 type SectionSummary = domain.SectionSummary
 type EdgeSummary = domain.EdgeSummary
 type QueryObservationInput = domain.QueryObservationInput

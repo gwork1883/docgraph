@@ -3,10 +3,14 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +18,7 @@ import (
 
 	"github.com/docgraph/docgraph/internal/domain"
 	"github.com/docgraph/docgraph/internal/storage/sqlschema"
+	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 func TestPathFromDSN(t *testing.T) {
@@ -181,6 +186,51 @@ func TestGenericJobLifecycleAndLease(t *testing.T) {
 	}
 }
 
+func TestCreateEmbeddingEnsureJobIfIdleDedupesActiveScopes(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	sourceJob, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "src-embedding-ensure")
+	if err != nil {
+		t.Fatalf("CreateEmbeddingEnsureJobIfIdle source returned error: %v", err)
+	}
+	if sourceJob.Kind != "maintenance_embedding_ensure" || sourceJob.Status != "queued" || sourceJob.SourceID != "src-embedding-ensure" || sourceJob.TargetKind != "source" {
+		t.Fatalf("source ensure job = %+v, want queued source-scoped embedding ensure job", sourceJob)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "src-embedding-ensure"); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("duplicate source ensure error = %v, want ErrSyncInProgress", err)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, ""); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("global ensure while source active error = %v, want ErrSyncInProgress", err)
+	}
+	if err := store.CompleteJob(ctx, sourceJob.ID, `{}`); err != nil {
+		t.Fatalf("CompleteJob source returned error: %v", err)
+	}
+	globalJob, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "")
+	if err != nil {
+		t.Fatalf("CreateEmbeddingEnsureJobIfIdle global returned error: %v", err)
+	}
+	if globalJob.SourceID != "" || globalJob.TargetKind != "embedding" {
+		t.Fatalf("global ensure job = %+v, want global embedding job", globalJob)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "other-source"); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("source ensure while global active error = %v, want ErrSyncInProgress", err)
+	}
+	if err := store.CompleteJob(ctx, globalJob.ID, `{}`); err != nil {
+		t.Fatalf("CompleteJob global returned error: %v", err)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "other-source"); err != nil {
+		t.Fatalf("CreateEmbeddingEnsureJobIfIdle after global completed returned error: %v", err)
+	}
+}
+
 func TestOpenCreatesParentDirectory(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "nested", "data", "docgraph.db")
@@ -332,6 +382,8 @@ func TestMigrateAndStatus(t *testing.T) {
 	if schemaVersion != sqlschema.CurrentSchemaVersion {
 		t.Fatalf("schema version = %d, want %d", schemaVersion, sqlschema.CurrentSchemaVersion)
 	}
+	assertCount(t, ctx, store, "sqlite_master", "type = 'table' and name = 'section_entities'", 1)
+	assertCount(t, ctx, store, "sqlite_master", "type = 'index' and name = 'idx_section_entities_document'", 1)
 
 	status, err := store.Status(ctx)
 	if err != nil {
@@ -394,6 +446,42 @@ func TestCheckSchemaRejectsFutureVersion(t *testing.T) {
 	err := store.CheckSchema(ctx)
 	if err == nil || !strings.Contains(err.Error(), "newer than supported") {
 		t.Fatalf("CheckSchema future version error = %v, want newer-than-supported", err)
+	}
+}
+
+func TestSectionEntitiesSchemaRequiresMigrateFromOlderVersion(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+
+	if _, err := store.db.ExecContext(ctx, `
+create table schema_migrations (
+  version integer primary key,
+  applied_at text not null default current_timestamp
+);
+insert into schema_migrations (version) values (2);
+`); err != nil {
+		t.Fatalf("seed old schema version: %v", err)
+	}
+	if err := store.CheckSchema(ctx); err == nil || !strings.Contains(err.Error(), "run docgraph migrate") {
+		t.Fatalf("CheckSchema before migrate error = %v, want migrate hint for old schema", err)
+	}
+	assertCount(t, ctx, store, "sqlite_master", "type = 'table' and name = 'section_entities'", 0)
+
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate from old schema returned error: %v", err)
+	}
+	if err := store.CheckSchema(ctx); err != nil {
+		t.Fatalf("CheckSchema after migrate returned error: %v", err)
+	}
+	assertCount(t, ctx, store, "sqlite_master", "type = 'table' and name = 'section_entities'", 1)
+	assertCount(t, ctx, store, "sqlite_master", "type = 'index' and name = 'idx_section_entities_document'", 1)
+
+	var schemaVersion int
+	if err := store.readDB().QueryRowContext(ctx, `select max(version) from schema_migrations`).Scan(&schemaVersion); err != nil {
+		t.Fatalf("query schema version: %v", err)
+	}
+	if schemaVersion != sqlschema.CurrentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", schemaVersion, sqlschema.CurrentSchemaVersion)
 	}
 }
 
@@ -662,6 +750,44 @@ func TestUpdateDeleteSourceAndSyncJobsLifecycle(t *testing.T) {
 	if !syncJobsContain(jobs, "completed", `"documents":1`) || !syncJobsContain(jobs, "failed", "boom") {
 		t.Fatalf("sync jobs = %+v, want completed and failed job history", jobs)
 	}
+	cancelQueued, err := store.CreateSyncJobIfIdle(ctx, "source-life")
+	if err != nil {
+		t.Fatalf("CreateSyncJobIfIdle for queued cancel returned error: %v", err)
+	}
+	cancelQueued, err = store.CancelJob(ctx, cancelQueued.ID, "stop queued")
+	if err != nil {
+		t.Fatalf("CancelJob queued returned error: %v", err)
+	}
+	if cancelQueued.Status != "canceled" {
+		t.Fatalf("queued cancel status = %q, want canceled", cancelQueued.Status)
+	}
+	cancelRunning, err := store.CreateSyncJob(ctx, "source-life")
+	if err != nil {
+		t.Fatalf("CreateSyncJob for running cancel returned error: %v", err)
+	}
+	cancelRunning, err = store.CancelJob(ctx, cancelRunning.ID, "stop running")
+	if err != nil {
+		t.Fatalf("CancelJob running returned error: %v", err)
+	}
+	if cancelRunning.Status != "canceling" {
+		t.Fatalf("running cancel status = %q, want canceling", cancelRunning.Status)
+	}
+	if _, err := store.CreateSyncJobIfIdle(ctx, "source-life"); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("CreateSyncJobIfIdle with canceling job error = %v, want ErrSyncInProgress", err)
+	}
+	if err := store.DeleteSyncJob(ctx, "source-life", cancelRunning.ID); !errors.Is(err, domain.ErrJobNotCancelable) {
+		t.Fatalf("DeleteSyncJob active error = %v, want ErrJobNotCancelable", err)
+	}
+	if err := store.MarkJobCanceled(ctx, cancelRunning.ID, "stopped"); err != nil {
+		t.Fatalf("MarkJobCanceled returned error: %v", err)
+	}
+	cancelRunning, err = store.GetJob(ctx, cancelRunning.ID)
+	if err != nil {
+		t.Fatalf("GetJob canceled returned error: %v", err)
+	}
+	if cancelRunning.Status != "canceled" || cancelRunning.WorkerID != "" || cancelRunning.LockedUntil != "" {
+		t.Fatalf("marked canceled job = %+v, want canceled with cleared lease", cancelRunning)
+	}
 	if err := store.DeleteSyncJob(ctx, "source-life", failed.ID); err != nil {
 		t.Fatalf("DeleteSyncJob returned error: %v", err)
 	}
@@ -669,8 +795,11 @@ func TestUpdateDeleteSourceAndSyncJobsLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListSyncJobs after DeleteSyncJob returned error: %v", err)
 	}
-	if len(jobs) != 1 || jobs[0].ID == failed.ID {
+	if syncJobsContain(jobs, "failed", "boom") {
 		t.Fatalf("jobs after DeleteSyncJob = %+v, want failed job removed", jobs)
+	}
+	if !syncJobsContain(jobs, "completed", `"documents":1`) || !syncJobsContain(jobs, "canceled", "stopped") || !syncJobsContain(jobs, "canceled", "stop queued") {
+		t.Fatalf("jobs after DeleteSyncJob = %+v, want completed and canceled history retained", jobs)
 	}
 
 	if err := store.DeleteSource(ctx, "source-life"); err != nil {
@@ -758,6 +887,200 @@ func TestReplaceDocumentReplacesSectionsAndFTSRows(t *testing.T) {
 	assertCount(t, ctx, store, "fts_section_tokens", "section_id in ('section-old-1', 'section-old-2')", 0)
 }
 
+func TestSectionEntitiesReplaceListSearchAndPropagation(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+
+	doc := domain.DocumentInput{
+		ID:          "doc-entities",
+		SourceID:    "source-1",
+		ExternalID:  "entities.md",
+		Title:       "Entity API",
+		ContentHash: "hash-doc-entities",
+	}
+	if err := store.ReplaceDocument(ctx, doc, []domain.SectionInput{
+		{ID: "section-entities-1", Title: "First", Content: "GET /entity/v1/entities", ContentHash: "hash-section-1", Ordinal: 1},
+		{ID: "section-entities-0", Title: "Zero", Content: "BatchGetEntityMeta", ContentHash: "hash-section-0", Ordinal: 0},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+
+	inputs := []domain.SectionEntityInput{
+		{
+			SectionID:     "section-entities-1",
+			Kind:          "api_endpoint",
+			RawText:       "GET /entity/v1/entities",
+			CanonicalText: "GET /entity/v1/entities",
+			Method:        "get",
+			Path:          "/entity/v1/entities",
+			Source:        "text",
+			Confidence:    0.95,
+			Evidence:      "GET /entity/v1/entities",
+			SpanStart:     4,
+			SpanEnd:       23,
+			Notes:         []string{"method_from_same_line"},
+		},
+		{
+			SectionID:     "section-entities-1",
+			Kind:          "api_endpoint",
+			RawText:       "GET /entity/v1/entities",
+			CanonicalText: "GET /entity/v1/entities",
+			Method:        "GET",
+			Path:          "/entity/v1/entities",
+			Source:        "text",
+			Confidence:    0.90,
+			Evidence:      "retry GET /entity/v1/entities",
+			SpanStart:     10,
+			SpanEnd:       29,
+			Notes:         []string{"method_from_same_line"},
+		},
+		{
+			SectionID:     "section-entities-0",
+			Kind:          "operation_candidate",
+			RawText:       "BatchGetEntityMeta",
+			CanonicalText: "BatchGetEntityMeta",
+			Operation:     "BatchGetEntityMeta",
+			Source:        "text",
+			Confidence:    0.55,
+			Evidence:      "BatchGetEntityMeta",
+		},
+	}
+	if err := store.ReplaceSectionEntities(ctx, doc.ID, inputs); err != nil {
+		t.Fatalf("ReplaceSectionEntities returned error: %v", err)
+	}
+
+	entities, err := store.ListDocumentEntities(ctx, doc.ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities returned error: %v", err)
+	}
+	if len(entities) != 2 {
+		t.Fatalf("entities = %+v, want aggregated API endpoint and operation", entities)
+	}
+	if entities[0].SectionID != "section-entities-0" || entities[0].Kind != "operation_candidate" {
+		t.Fatalf("first entity = %+v, want section ordinal ordering", entities[0])
+	}
+	apiEntity := entities[1]
+	if apiEntity.Kind != "api_endpoint" || apiEntity.Method != "GET" || apiEntity.Path != "/entity/v1/entities" || apiEntity.Confidence != 0.95 {
+		t.Fatalf("api entity = %+v, want canonical aggregated endpoint", apiEntity)
+	}
+	var evidence sectionEntityEvidence
+	if err := json.Unmarshal([]byte(apiEntity.EvidenceJSON), &evidence); err != nil {
+		t.Fatalf("evidence json = %q, unmarshal error: %v", apiEntity.EvidenceJSON, err)
+	}
+	if len(evidence.Occurrences) != 2 || len(evidence.Notes) != 1 || evidence.Occurrences[0].Evidence == "" {
+		t.Fatalf("evidence = %+v, want two occurrences and one deduped note", evidence)
+	}
+	counts, err := store.GetSourceArtifactCounts(ctx, "source-1")
+	if err != nil {
+		t.Fatalf("GetSourceArtifactCounts returned error: %v", err)
+	}
+	if counts.SectionEntities != 2 {
+		t.Fatalf("artifact counts = %+v, want two section entities", counts)
+	}
+	sourceEntities, err := store.ListSourceSectionEntities(ctx, "source-1", 10, 0)
+	if err != nil {
+		t.Fatalf("ListSourceSectionEntities returned error: %v", err)
+	}
+	if len(sourceEntities) != 2 || sourceEntities[0].SectionID != "section-entities-0" {
+		t.Fatalf("source entities = %+v, want source-scoped entity list", sourceEntities)
+	}
+	artifacts, err := store.ListSourceArtifacts(ctx, "source-1", 10, 0)
+	if err != nil {
+		t.Fatalf("ListSourceArtifacts returned error: %v", err)
+	}
+	if artifacts.Counts.SectionEntities != 2 || len(artifacts.SectionEntities) != 2 || artifacts.EntityDiagnostics.Total != 2 {
+		t.Fatalf("artifacts = %+v, want entity counts, list, and diagnostics", artifacts)
+	}
+
+	found, err := store.SearchEntities(ctx, "/entity/v1/entities", 10)
+	if err != nil {
+		t.Fatalf("SearchEntities path returned error: %v", err)
+	}
+	if len(found) == 0 || found[0].ID != apiEntity.ID {
+		t.Fatalf("SearchEntities path = %+v, want API entity first", found)
+	}
+	found, err = store.SearchEntities(ctx, "BatchGetEntityMeta", 10)
+	if err != nil {
+		t.Fatalf("SearchEntities operation returned error: %v", err)
+	}
+	if len(found) == 0 || found[0].Operation != "BatchGetEntityMeta" {
+		t.Fatalf("SearchEntities operation = %+v, want operation entity", found)
+	}
+
+	if err := store.ReplaceSectionEntities(ctx, doc.ID, []domain.SectionEntityInput{
+		{
+			SectionID:     "section-entities-1",
+			Kind:          "path_literal",
+			RawText:       "/entity/v1/entities:filter-filter-count",
+			CanonicalText: "/entity/v1/entities:filter-filter-count",
+			Path:          "/entity/v1/entities:filter-filter-count",
+			Source:        "table",
+			Confidence:    0.65,
+		},
+	}); err != nil {
+		t.Fatalf("second ReplaceSectionEntities returned error: %v", err)
+	}
+	entities, err = store.ListDocumentEntities(ctx, doc.ID)
+	if err != nil {
+		t.Fatalf("ListDocumentEntities after replace returned error: %v", err)
+	}
+	if len(entities) != 1 || entities[0].Kind != "path_literal" || entities[0].Path != "/entity/v1/entities:filter-filter-count" {
+		t.Fatalf("entities after replace = %+v, want only replacement path literal", entities)
+	}
+	assertCount(t, ctx, store, "section_entities", "canonical_text = 'GET /entity/v1/entities'", 0)
+
+	if err := store.ReplaceDocument(ctx, doc, []domain.SectionInput{
+		{ID: "section-entities-new", Title: "New", Content: "new content", ContentHash: "hash-new", Ordinal: 0},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument replacing sections returned error: %v", err)
+	}
+	assertCount(t, ctx, store, "section_entities", "document_id = 'doc-entities'", 0)
+}
+
+func TestReplaceSectionEntitiesValidatesDocumentSectionsAndPropagationsDocumentDelete(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-one",
+		SourceID:    "source-1",
+		ExternalID:  "one.md",
+		Title:       "One",
+		ContentHash: "hash-one",
+	}, []domain.SectionInput{{ID: "section-one", Title: "One", Content: "one", ContentHash: "hash-section-one"}}); err != nil {
+		t.Fatalf("ReplaceDocument doc-one returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-two",
+		SourceID:    "source-1",
+		ExternalID:  "two.md",
+		Title:       "Two",
+		ContentHash: "hash-two",
+	}, []domain.SectionInput{{ID: "section-two", Title: "Two", Content: "two", ContentHash: "hash-section-two"}}); err != nil {
+		t.Fatalf("ReplaceDocument doc-two returned error: %v", err)
+	}
+
+	err := store.ReplaceSectionEntities(ctx, "doc-one", []domain.SectionEntityInput{
+		{SectionID: "section-two", Kind: "path_literal", CanonicalText: "/entity/v1/entities", Path: "/entity/v1/entities"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not belong") {
+		t.Fatalf("cross-document ReplaceSectionEntities error = %v, want section ownership error", err)
+	}
+
+	if err := store.ReplaceSectionEntities(ctx, "doc-one", []domain.SectionEntityInput{
+		{SectionID: "section-one", Kind: "path_literal", CanonicalText: "/entity/v1/entities", Path: "/entity/v1/entities"},
+	}); err != nil {
+		t.Fatalf("ReplaceSectionEntities doc-one returned error: %v", err)
+	}
+	assertCount(t, ctx, store, "section_entities", "document_id = 'doc-one'", 1)
+	if err := store.DeleteDocumentsNotInSource(ctx, "source-1", []string{"doc-two"}); err != nil {
+		t.Fatalf("DeleteDocumentsNotInSource returned error: %v", err)
+	}
+	assertCount(t, ctx, store, "section_entities", "document_id = 'doc-one'", 0)
+}
+
 func TestGetDocumentBySourceExternalID(t *testing.T) {
 	ctx := context.Background()
 	store := openMigratedTempStore(t, ctx)
@@ -787,6 +1110,85 @@ func TestGetDocumentBySourceExternalID(t *testing.T) {
 	}
 	if _, err := store.GetDocumentBySourceExternalID(ctx, "source-1", "missing.md"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("missing GetDocumentBySourceExternalID error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestSourceHealthReportsDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-health")
+
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-health",
+		SourceID:    "source-health",
+		ExternalID:  "health.md",
+		Title:       "Health",
+		ContentHash: "hash-health",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-health",
+			Title:       "Tiny",
+			Content:     "tiny",
+			ContentHash: "hash-section",
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument health returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-empty",
+		SourceID:    "source-health",
+		ExternalID:  "empty.md",
+		Title:       "Empty",
+		ContentHash: "hash-empty",
+	}, nil); err != nil {
+		t.Fatalf("ReplaceDocument empty returned error: %v", err)
+	}
+	if _, err := store.CreateFeedbackEvent(ctx, domain.FeedbackEventInput{
+		TargetKind:   "document",
+		TargetID:     "doc-health",
+		FeedbackKind: "document_stale",
+	}); err != nil {
+		t.Fatalf("CreateFeedbackEvent stale returned error: %v", err)
+	}
+	job, err := store.CreateSyncJob(ctx, "source-health")
+	if err != nil {
+		t.Fatalf("CreateSyncJob returned error: %v", err)
+	}
+	if err := store.CompleteSyncJob(ctx, job.ID, domain.ResultPayload{
+		Documents: 2,
+		BrokenLinks: []domain.BrokenLink{{
+			SourceDocument: "health.md",
+			SourceSection:  "Tiny",
+			Href:           "missing.html",
+		}},
+	}); err != nil {
+		t.Fatalf("CompleteSyncJob returned error: %v", err)
+	}
+
+	health, err := store.GetSourceHealth(ctx, "source-health")
+	if err != nil {
+		t.Fatalf("GetSourceHealth returned error: %v", err)
+	}
+	if health.Counts.Documents != 2 || health.Counts.Sections != 1 {
+		t.Fatalf("health counts = %+v, want 2 documents and 1 section", health.Counts)
+	}
+	if len(health.BrokenLinks) != 1 || health.BrokenLinks[0].Href != "missing.html" {
+		t.Fatalf("health broken links = %+v, want missing.html", health.BrokenLinks)
+	}
+	if len(health.ZeroSectionDocuments) != 1 || health.ZeroSectionDocuments[0].ID != "doc-empty" {
+		t.Fatalf("health zero-section docs = %+v, want doc-empty", health.ZeroSectionDocuments)
+	}
+	if len(health.LowContentSections) != 1 || health.LowContentSections[0].ID != "section-health" {
+		t.Fatalf("health low-content sections = %+v, want section-health", health.LowContentSections)
+	}
+	if len(health.StaleFeedback) != 1 || health.StaleFeedback[0].TargetID != "doc-health" {
+		t.Fatalf("health stale feedback = %+v, want doc-health", health.StaleFeedback)
+	}
+	if health.EntityDiagnostics.Total != 0 || health.Counts.SectionEntities != 0 {
+		t.Fatalf("health entity diagnostics = %+v counts = %+v, want no entities", health.EntityDiagnostics, health.Counts)
+	}
+	if !healthWarningsContain(health.Warnings, "broken_links") || !healthWarningsContain(health.Warnings, "zero_section_documents") || !healthWarningsContain(health.Warnings, "stale_documents") || !healthWarningsContain(health.Warnings, "no_section_entities") {
+		t.Fatalf("health warnings = %+v, want broken_links, zero_section_documents, stale_documents, no_section_entities", health.Warnings)
 	}
 }
 
@@ -853,7 +1255,550 @@ func TestSearchSections(t *testing.T) {
 	}
 }
 
-func TestDocumentProfilePreservesDescAndCascades(t *testing.T) {
+func TestSearchSectionsRanksExactPhraseBeforePartialCanonicalMatches(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+
+	query := "display字段控制group是否显示的需求"
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-exact-phrase",
+		SourceID:    "source-1",
+		ExternalID:  "exact.md",
+		Title:       "需求记录",
+		ContentHash: "hash-exact-phrase",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-exact-phrase",
+			Title:       "需求说明",
+			HeadingPath: "需求 > 配置",
+			Content:     "这里记录 display字段控制group是否显示的需求，并说明验收标准。",
+			ContentHash: "hash-section-exact-phrase",
+			Ordinal:     0,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument exact returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-partial-canonical",
+		SourceID:    "source-1",
+		ExternalID:  "partial.md",
+		Title:       "display group 字段控制",
+		ContentHash: "hash-partial-canonical",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-partial-canonical",
+			Title:       "group 显示控制",
+			HeadingPath: "display > group > 字段控制",
+			Content:     "这篇文档分散描述 display 字段、group 是否显示和需求背景，但不包含完整查询短语。",
+			ContentHash: "hash-section-partial-canonical",
+			Ordinal:     0,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument partial returned error: %v", err)
+	}
+	if _, err := store.CreateFeedbackEvent(ctx, domain.FeedbackEventInput{
+		TargetKind:   "document",
+		TargetID:     "doc-partial-canonical",
+		FeedbackKind: "document_canonical",
+	}); err != nil {
+		t.Fatalf("CreateFeedbackEvent document_canonical returned error: %v", err)
+	}
+
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query:                  query,
+		Limit:                  5,
+		MaxSearches:            5,
+		MaxSectionsPerDocument: 5,
+		ProfileDetail:          "compact",
+	})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) < 2 {
+		t.Fatalf("hits = %+v, want exact and partial hits", result.Hits)
+	}
+	// In RRF mode, verify both hits have valid RRF contributions
+	var exactPhraseHit, partialCanonicalHit *domain.SearchHit
+	for i := range result.Hits {
+		if result.Hits[i].SectionID == "section-exact-phrase" {
+			exactPhraseHit = &result.Hits[i]
+		}
+		if result.Hits[i].SectionID == "section-partial-canonical" {
+			partialCanonicalHit = &result.Hits[i]
+		}
+	}
+	if exactPhraseHit == nil || partialCanonicalHit == nil {
+		t.Fatalf("missing expected hits; all hits: %+v", result.Hits)
+	}
+	// Both hits should have RRFContribution with positive scores
+	if exactPhraseHit.RRFContribution == nil || exactPhraseHit.RRFContribution.FinalScore <= 0 {
+		t.Fatalf("exact phrase RRF contribution = %+v, want positive score", exactPhraseHit.RRFContribution)
+	}
+	if partialCanonicalHit.RRFContribution == nil || partialCanonicalHit.RRFContribution.FinalScore <= 0 {
+		t.Fatalf("partial canonical RRF contribution = %+v, want positive score", partialCanonicalHit.RRFContribution)
+	}
+	// Verify HybridSearchMeta is populated
+	if result.HybridSearchMeta == nil {
+		t.Fatal("HybridSearchMeta is nil, want populated")
+	}
+	// Exact phrase hit should have exact_match_boost evidence
+	if exactPhraseHit.ScoreBreakdown == nil || exactPhraseHit.ScoreBreakdown.ExactMatchBoost == 0 {
+		t.Fatalf("exact hit score breakdown = %+v, want exact phrase boost", exactPhraseHit.ScoreBreakdown)
+	}
+	if exactPhraseHit.QueryMatch == nil || !containsString(exactPhraseHit.QueryMatch.MatchedFields, "exact_phrase") {
+		t.Fatalf("query match = %+v, want exact_phrase evidence", exactPhraseHit.QueryMatch)
+	}
+}
+
+func TestExactPhraseBoostScalesByQueryComplexity(t *testing.T) {
+	tests := []struct {
+		query string
+		want  float64
+	}{
+		{query: "node", want: 80},
+		{query: "display group", want: 160},
+		{query: "display字段控制group是否显示的需求", want: 260},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			if got := exactPhraseBoost(tt.query); got != tt.want {
+				t.Fatalf("exactPhraseBoost(%q) = %.0f, want %.0f", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSearchSectionsUsesLowerExactPhraseBoostForShortQueries(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-short-phrase",
+		SourceID:    "source-1",
+		ExternalID:  "short.md",
+		Title:       "Service Notes",
+		ContentHash: "hash-short-phrase",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-short-phrase",
+			Title:       "Notes",
+			HeadingPath: "Operations > Notes",
+			Content:     "node appears in an operational note.",
+			ContentHash: "hash-section-short-phrase",
+			Ordinal:     0,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query:                  "node",
+		Limit:                  5,
+		MaxSearches:            5,
+		MaxSectionsPerDocument: 5,
+		ProfileDetail:          "compact",
+	})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) == 0 {
+		t.Fatalf("hits empty, want short query hit")
+	}
+	boost := result.Hits[0].ScoreBreakdown.ExactMatchBoost
+	if boost != 80 {
+		t.Fatalf("short exact phrase boost = %.0f, want 80; hit = %+v", boost, result.Hits[0])
+	}
+}
+
+func TestSearchSectionsPrioritizesExactAPILiterals(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+
+	cases := []struct {
+		name        string
+		path        string
+		term        string
+		relatedPath string
+	}{
+		{
+			name:        "operation suffix",
+			path:        "/entity/v1/entities:filter-filter-count",
+			term:        "entity",
+			relatedPath: "/entity/v1/entities:filter-filter-count-archive",
+		},
+		{
+			name:        "camel case operation",
+			path:        "/EntityV1/BatchGetEntityMeta",
+			term:        "entity",
+			relatedPath: "/EntityV1/BatchGetEntityMetaPreview",
+		},
+		{
+			name:        "templated field",
+			path:        "/access/v1/access/{object.id}/meta",
+			term:        "access",
+			relatedPath: "/access/v1/access/{object.id}/meta/preview",
+		},
+	}
+
+	for i, tc := range cases {
+		exactDocID := fmt.Sprintf("doc-exact-path-%d", i)
+		exactSectionID := fmt.Sprintf("section-exact-path-%d", i)
+		if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+			ID:          exactDocID,
+			SourceID:    "source-1",
+			ExternalID:  exactDocID + ".md",
+			Title:       "Exact API " + strconv.Itoa(i),
+			ContentHash: "hash-" + exactDocID,
+		}, []domain.SectionInput{
+			{
+				ID:          exactSectionID,
+				HeadingPath: "Exact API > Operation",
+				Title:       "Exact Operation",
+				Content:     "Use GET " + tc.path + " to retrieve the exact resource.",
+				ContentHash: "hash-" + exactSectionID,
+				Ordinal:     0,
+			},
+		}); err != nil {
+			t.Fatalf("ReplaceDocument(%s) returned error: %v", exactDocID, err)
+		}
+
+		relatedDocID := fmt.Sprintf("doc-related-path-%d", i)
+		relatedSectionID := fmt.Sprintf("section-related-path-%d", i)
+		if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+			ID:          relatedDocID,
+			SourceID:    "source-1",
+			ExternalID:  relatedDocID + ".md",
+			Title:       "Related API " + strconv.Itoa(i),
+			ContentHash: "hash-" + relatedDocID,
+		}, []domain.SectionInput{
+			{
+				ID:          relatedSectionID,
+				HeadingPath: "Related API > Operation",
+				Title:       "Related Operation",
+				Content:     "Use GET " + tc.relatedPath + " for a neighboring operation.",
+				ContentHash: "hash-" + relatedSectionID,
+				Ordinal:     0,
+			},
+		}); err != nil {
+			t.Fatalf("ReplaceDocument(%s) returned error: %v", relatedDocID, err)
+		}
+
+		noiseDocID := fmt.Sprintf("doc-token-noise-%d", i)
+		noiseSectionID := fmt.Sprintf("section-token-noise-%d", i)
+		if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+			ID:          noiseDocID,
+			SourceID:    "source-1",
+			ExternalID:  noiseDocID + ".md",
+			Title:       "Token Overview " + strconv.Itoa(i),
+			ContentHash: "hash-" + noiseDocID,
+		}, []domain.SectionInput{
+			{
+				ID:          noiseSectionID,
+				HeadingPath: "Token Overview > Concepts",
+				Title:       "Concepts",
+				Content:     tc.term + " documents describe lifecycle, ownership, review, and metadata.",
+				ContentHash: "hash-" + noiseSectionID,
+				Ordinal:     0,
+			},
+		}); err != nil {
+			t.Fatalf("ReplaceDocument(%s) returned error: %v", noiseDocID, err)
+		}
+	}
+
+	for i, tc := range cases {
+		for _, query := range []string{tc.path, "GET " + tc.path} {
+			t.Run(tc.name+"/"+query, func(t *testing.T) {
+				result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+					Query:                  query,
+					Limit:                  10,
+					MaxSearches:            5,
+					MaxSectionsPerDocument: 5,
+					ProfileDetail:          "compact",
+				})
+				if err != nil {
+					t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+				}
+				if len(result.Hits) == 0 {
+					t.Fatalf("SearchSectionsWithOptions returned no hits")
+				}
+				wantSectionID := fmt.Sprintf("section-exact-path-%d", i)
+				if result.Hits[0].SectionID != wantSectionID {
+					t.Fatalf("first hit = %+v, want exact API path first; all hits: %+v", result.Hits[0], result.Hits)
+				}
+				if !strings.Contains(result.Hits[0].Snippet, "<mark>"+tc.path+"</mark>") && !strings.Contains(result.Hits[0].Snippet, "<mark>GET "+tc.path+"</mark>") {
+					t.Fatalf("exact path snippet = %q, want full path highlight for %q", result.Hits[0].Snippet, tc.path)
+				}
+				noiseSectionID := fmt.Sprintf("section-token-noise-%d", i)
+				relatedSectionID := fmt.Sprintf("section-related-path-%d", i)
+				for _, hit := range result.Hits {
+					if hit.SectionID == noiseSectionID && hit.Rank >= result.Hits[0].Rank {
+						t.Fatalf("token-only noise rank >= exact path rank: %+v", result.Hits)
+					}
+					if hit.SectionID == relatedSectionID && hit.ScoreBreakdown != nil && hit.ScoreBreakdown.ExactMatchBoost >= result.Hits[0].ScoreBreakdown.ExactMatchBoost {
+						t.Fatalf("longer neighboring path received exact-equivalent boost: %+v", result.Hits)
+					}
+				}
+				if result.Hits[0].QueryMatch == nil || !containsString(result.Hits[0].QueryMatch.MatchedFields, "entity_exact") {
+					t.Fatalf("query match = %+v, want entity_exact evidence", result.Hits[0].QueryMatch)
+				}
+				var exactAttemptHits int
+				var normalizedAttemptHits int
+				for _, attempt := range result.Attempts {
+					switch attempt.Kind {
+					case "entity_exact":
+						exactAttemptHits = attempt.Hits
+					case "entity_normalized":
+						normalizedAttemptHits = attempt.Hits
+					}
+				}
+				if exactAttemptHits == 0 || normalizedAttemptHits != 0 {
+					t.Fatalf("attempts = %+v, want exact hits without normalized hits for exact query", result.Attempts)
+				}
+			})
+		}
+	}
+}
+
+func TestSearchSectionsUsesNormalizedEntityBoostAndKeepsFallback(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-normalized-path",
+		SourceID:    "source-1",
+		ExternalID:  "normalized.md",
+		Title:       "Normalized API",
+		ContentHash: "hash-normalized",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-normalized-path",
+			Title:       "Normalized Placeholder",
+			Content:     "Use DELETE /access/v1/access/{ object.id }/meta for placeholder metadata.",
+			ContentHash: "hash-section-normalized",
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument normalized returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-fallback-path",
+		SourceID:    "source-1",
+		ExternalID:  "fallback.md",
+		Title:       "Fallback API",
+		ContentHash: "hash-fallback",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-fallback-path",
+			Title:       "Fallback Path",
+			Content:     "The fallback example mentions entity filter count behavior for adjacent APIs.",
+			ContentHash: "hash-section-fallback",
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument fallback returned error: %v", err)
+	}
+
+	normalized, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query:                  "/access/v1/access/{object.id}/meta",
+		Limit:                  5,
+		MaxSearches:            5,
+		MaxSectionsPerDocument: 5,
+		ProfileDetail:          "compact",
+	})
+	if err != nil {
+		t.Fatalf("normalized SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(normalized.Hits) == 0 || normalized.Hits[0].SectionID != "section-normalized-path" {
+		t.Fatalf("normalized hits = %+v, want normalized path section first", normalized.Hits)
+	}
+	if normalized.Hits[0].QueryMatch == nil || !containsString(normalized.Hits[0].QueryMatch.MatchedFields, "entity_normalized") {
+		t.Fatalf("normalized query match = %+v, want entity_normalized evidence", normalized.Hits[0].QueryMatch)
+	}
+
+	fallback, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query:                  "/entity/v1/entities:filter-count",
+		Limit:                  5,
+		MaxSearches:            5,
+		MaxSectionsPerDocument: 5,
+		ProfileDetail:          "compact",
+	})
+	if err != nil {
+		t.Fatalf("fallback SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(fallback.Hits) == 0 {
+		t.Fatalf("fallback hits empty, want fuzzy/token recovery")
+	}
+	foundEntityExactZero := false
+	foundFallbackAttempt := false
+	for _, attempt := range fallback.Attempts {
+		if attempt.Kind == "entity_exact" && attempt.Hits == 0 {
+			foundEntityExactZero = true
+		}
+		if (attempt.Kind == "unicode61" || attempt.Kind == "trigram" || attempt.Kind == "like_fallback") && attempt.Hits > 0 {
+			foundFallbackAttempt = true
+		}
+	}
+	if !foundEntityExactZero || !foundFallbackAttempt {
+		t.Fatalf("fallback attempts = %+v, want exact miss plus fallback recovery", fallback.Attempts)
+	}
+
+	budgetedMiss, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query:                  "/qpathx/v9/nohit:zzzz-yyyy uniquemissx",
+		Limit:                  5,
+		MaxSearches:            5,
+		MaxSectionsPerDocument: 5,
+		ProfileDetail:          "compact",
+	})
+	if err != nil {
+		t.Fatalf("budgeted miss SearchSectionsWithOptions returned error: %v", err)
+	}
+	foundLikeFallbackAttempt := false
+	for _, attempt := range budgetedMiss.Attempts {
+		if attempt.Kind == "like_fallback" {
+			foundLikeFallbackAttempt = true
+		}
+	}
+	if !foundLikeFallbackAttempt {
+		t.Fatalf("budgeted miss attempts = %+v, want LIKE fallback even after entity attempts consume nominal budget", budgetedMiss.Attempts)
+	}
+}
+
+func TestSearchSectionsUsesStoredEntitiesBeforeExtractorFallback(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+
+	doc := domain.DocumentInput{
+		ID:          "doc-stored-entity-search",
+		SourceID:    "source-1",
+		ExternalID:  "stored-entity.md",
+		Title:       "Stored Entity Search",
+		ContentHash: "hash-stored-entity",
+	}
+	if err := store.ReplaceDocument(ctx, doc, []domain.SectionInput{
+		{
+			ID:          "section-stored-entity",
+			Title:       "Stored Entity",
+			Content:     "This section describes the stored endpoint without spelling out the route literal.",
+			ContentHash: "hash-section-stored-entity",
+			Ordinal:     0,
+		},
+		{
+			ID:          "section-token-only",
+			Title:       "Token Only",
+			Content:     "entity lifecycle notes without endpoint evidence",
+			ContentHash: "hash-section-token-only",
+			Ordinal:     1,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	if err := store.ReplaceSectionEntities(ctx, doc.ID, []domain.SectionEntityInput{
+		{
+			SectionID:     "section-stored-entity",
+			Kind:          "api_endpoint",
+			RawText:       "GET /entity/v1/entities",
+			CanonicalText: "GET /entity/v1/entities",
+			Method:        "GET",
+			Path:          "/entity/v1/entities",
+			Source:        "text",
+			Confidence:    0.95,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceSectionEntities returned error: %v", err)
+	}
+
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query:                  "/entity/v1/entities",
+		Limit:                  5,
+		MaxSearches:            5,
+		MaxSectionsPerDocument: 5,
+		ProfileDetail:          "compact",
+	})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) == 0 || result.Hits[0].SectionID != "section-stored-entity" {
+		t.Fatalf("hits = %+v, want stored entity section first", result.Hits)
+	}
+	if result.Hits[0].QueryMatch == nil || !containsString(result.Hits[0].QueryMatch.MatchedFields, "entity_exact") {
+		t.Fatalf("query match = %+v, want entity_exact from stored entity", result.Hits[0].QueryMatch)
+	}
+	if len(result.Hits[0].MatchedEntities) != 1 || result.Hits[0].MatchedEntities[0].Path != "/entity/v1/entities" || result.Hits[0].MatchedEntities[0].MatchMode != "entity_exact" {
+		t.Fatalf("matched entities = %+v, want stored exact entity metadata", result.Hits[0].MatchedEntities)
+	}
+	foundEntityAttempt := false
+	for _, attempt := range result.Attempts {
+		if attempt.Kind == "entity_exact" && attempt.Hits > 0 {
+			foundEntityAttempt = true
+		}
+	}
+	if !foundEntityAttempt {
+		t.Fatalf("attempts = %+v, want stored entity exact attempt", result.Attempts)
+	}
+}
+
+func TestSearchSectionsEntityFallbackSkipsSectionsWithStoredEntities(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+
+	doc := domain.DocumentInput{
+		ID:          "doc-stored-entity-authority",
+		SourceID:    "source-1",
+		ExternalID:  "stored-authority.md",
+		Title:       "Stored Entity Authority",
+		ContentHash: "hash-stored-authority",
+	}
+	if err := store.ReplaceDocument(ctx, doc, []domain.SectionInput{
+		{
+			ID:          "section-stored-authority",
+			Title:       "Updated Entity",
+			Content:     "Legacy prose still mentions GET /entity/v1/entities for background.",
+			ContentHash: "hash-section-stored-authority",
+			Ordinal:     0,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	if err := store.ReplaceSectionEntities(ctx, doc.ID, []domain.SectionEntityInput{
+		{
+			SectionID:     "section-stored-authority",
+			Kind:          "api_endpoint",
+			RawText:       "GET /entity/v1/entities:filter-filter-count",
+			CanonicalText: "GET /entity/v1/entities:filter-filter-count",
+			Method:        "GET",
+			Path:          "/entity/v1/entities:filter-filter-count",
+			Source:        "text",
+			Confidence:    0.95,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceSectionEntities returned error: %v", err)
+	}
+
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query:                  "/entity/v1/entities",
+		Limit:                  5,
+		MaxSearches:            5,
+		MaxSectionsPerDocument: 5,
+		ProfileDetail:          "compact",
+	})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) == 0 {
+		t.Fatalf("hits empty, want general fallback to preserve recall")
+	}
+	for _, attempt := range result.Attempts {
+		if attempt.Kind == "entity_exact" && attempt.Hits != 0 {
+			t.Fatalf("attempts = %+v, want entity_exact to trust stored entities over text fallback", result.Attempts)
+		}
+	}
+}
+
+func TestDocumentProfilePreservesDescAndPropagations(t *testing.T) {
 	ctx := context.Background()
 	store := openMigratedTempStore(t, ctx)
 	createTestSource(t, ctx, store, "source-1")
@@ -878,6 +1823,7 @@ func TestDocumentProfilePreservesDescAndCascades(t *testing.T) {
 	if profile.Desc != "" || profile.RetrievalProfileJSON != "{}" {
 		t.Fatalf("default profile = %+v, want empty desc and empty retrieval profile", profile)
 	}
+	assertCount(t, ctx, store, "document_profiles", "document_id = 'doc-profile'", 0)
 
 	profile, err = store.UpdateDocumentProfileDesc(ctx, domain.DocumentProfileInput{
 		DocumentID: doc.ID,
@@ -996,6 +1942,132 @@ func TestKnowledgeRelationProposalApprovalExpandsSearch(t *testing.T) {
 	}
 	if !searchHitsContainRelation(result.Hits, relation.ID) {
 		t.Fatalf("search hits = %+v, want relation match %s", result.Hits, relation.ID)
+	}
+}
+
+func TestGetSectionExplicitReferencesResolveHeadingNumberAndMarkdownAnchor(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+	seedExplicitReferenceDocument(t, ctx, store, "See §5 Baking Temperatures for details. Also see [Cookie Settings](#cookie-settings).")
+
+	section, err := store.GetSection(ctx, "section-source")
+	if err != nil {
+		t.Fatalf("GetSection returned error: %v", err)
+	}
+	headingRef := findExplicitReference(section.ExplicitReferences, "heading_number_reference_extractor")
+	if headingRef == nil {
+		t.Fatalf("explicit_references = %+v, want heading number reference", section.ExplicitReferences)
+	}
+	if !headingRef.Resolved || headingRef.TargetSectionID != "section-propagation" || headingRef.TargetDocumentID != "doc-explicit" {
+		t.Fatalf("heading reference = %+v, want resolved propagation section", *headingRef)
+	}
+	if headingRef.TargetHeadingPath != "Schema > 5 Baking Temperatures" {
+		t.Fatalf("heading target path = %q, want propagation heading path", headingRef.TargetHeadingPath)
+	}
+
+	markdownRef := findExplicitReference(section.ExplicitReferences, "markdown_link_extractor")
+	if markdownRef == nil {
+		t.Fatalf("explicit_references = %+v, want markdown reference", section.ExplicitReferences)
+	}
+	if !markdownRef.Resolved || markdownRef.TargetSectionID != "section-operation" {
+		t.Fatalf("markdown reference = %+v, want resolved operation section", *markdownRef)
+	}
+}
+
+func TestGetSectionExplicitReferencesReturnAmbiguousCandidates(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+	seedExplicitReferenceDocument(t, ctx, store, "See Baking Temperatures for details.")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-explicit",
+		SourceID:    "source-1",
+		ExternalID:  "schema.md",
+		Title:       "Schema",
+		URL:         "file:///docs/schema.md",
+		ContentHash: "hash-doc-explicit-ambiguous",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-source",
+			DocumentID:  "doc-explicit",
+			HeadingPath: "Schema > Operation",
+			Title:       "Operation",
+			Content:     "See Baking Temperatures for details.",
+			ContentHash: "hash-section-source-ambiguous",
+			Ordinal:     0,
+		},
+		{
+			ID:          "section-propagation",
+			DocumentID:  "doc-explicit",
+			HeadingPath: "Schema > 5 Baking Temperatures",
+			Title:       "5 Baking Temperatures",
+			Content:     "Baking temperature rules for oven settings.",
+			ContentHash: "hash-section-propagation",
+			Ordinal:     1,
+		},
+		{
+			ID:          "section-propagation-other",
+			DocumentID:  "doc-explicit",
+			HeadingPath: "Schema > Appendix > Baking Temperatures",
+			Title:       "Baking Temperatures",
+			Content:     "Another propagation section.",
+			ContentHash: "hash-section-propagation-other",
+			Ordinal:     2,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument ambiguous returned error: %v", err)
+	}
+
+	section, err := store.GetSection(ctx, "section-source")
+	if err != nil {
+		t.Fatalf("GetSection returned error: %v", err)
+	}
+	ref := findExplicitReference(section.ExplicitReferences, "plain_title_reference_extractor")
+	if ref == nil {
+		t.Fatalf("explicit_references = %+v, want plain title reference", section.ExplicitReferences)
+	}
+	if ref.Resolved {
+		t.Fatalf("plain title reference = %+v, want unresolved ambiguous reference", *ref)
+	}
+	if len(ref.Candidates) < 2 {
+		t.Fatalf("plain title candidates = %+v, want ambiguous candidates", ref.Candidates)
+	}
+}
+
+func TestSearchSectionsExplicitReferenceMetadataAndSuggestedReads(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+	seedExplicitReferenceDocument(t, ctx, store, "When configuring cookies, detailed rules see §5 Baking Temperatures.")
+
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query:                  "configuring operations",
+		Limit:                  5,
+		MaxSearches:            5,
+		MaxSectionsPerDocument: 5,
+		Detail:                 "summary",
+		ProfileDetail:          "none",
+	})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	hit := findSearchHit(result.Hits, "section-source")
+	if hit == nil {
+		t.Fatalf("hits = %+v, want source section", result.Hits)
+	}
+	if !hit.HasExplicitReferences || hit.ExplicitReferenceCount != 1 {
+		t.Fatalf("source hit explicit reference metadata = %+v, want one explicit reference", *hit)
+	}
+	if len(result.SuggestedReads.ExplicitReferences) == 0 {
+		t.Fatalf("suggested_reads = %+v, want explicit references", result.SuggestedReads)
+	}
+	ref := result.SuggestedReads.ExplicitReferences[0]
+	if ref.SourceSectionID != "section-source" || ref.TargetSectionID != "section-propagation" || !ref.Resolved {
+		t.Fatalf("suggested explicit reference = %+v, want resolved propagation reference", ref)
+	}
+	if result.SuggestedReads.ImplicitSymbolLinks == nil || result.SuggestedReads.CuratedRelations == nil || result.SuggestedReads.StructuralNeighbors == nil {
+		t.Fatalf("suggested_reads = %+v, want separate empty non-explicit groups", result.SuggestedReads)
 	}
 }
 
@@ -1687,6 +2759,67 @@ func createTestSource(t *testing.T, ctx context.Context, store *Store, id string
 	}
 }
 
+func seedExplicitReferenceDocument(t *testing.T, ctx context.Context, store *Store, sourceContent string) {
+	t.Helper()
+
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID:          "doc-explicit",
+		SourceID:    "source-1",
+		ExternalID:  "schema.md",
+		Title:       "Schema",
+		URL:         "file:///docs/schema.md",
+		ContentHash: "hash-doc-explicit",
+	}, []domain.SectionInput{
+		{
+			ID:          "section-source",
+			DocumentID:  "doc-explicit",
+			HeadingPath: "Schema > Operation",
+			Title:       "Operation",
+			Content:     sourceContent,
+			ContentHash: "hash-section-source",
+			Ordinal:     0,
+		},
+		{
+			ID:          "section-operation",
+			DocumentID:  "doc-explicit",
+			HeadingPath: "Schema > Cookie Settings",
+			Title:       "Cookie Settings",
+			Content:     "Cookie configuration syntax.",
+			ContentHash: "hash-section-operation",
+			Ordinal:     1,
+		},
+		{
+			ID:          "section-propagation",
+			DocumentID:  "doc-explicit",
+			HeadingPath: "Schema > 5 Baking Temperatures",
+			Title:       "5 Baking Temperatures",
+			Content:     "Baking temperature rules for oven settings.",
+			ContentHash: "hash-section-propagation",
+			Ordinal:     2,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument explicit returned error: %v", err)
+	}
+}
+
+func findExplicitReference(refs []domain.ExplicitReference, extractor string) *domain.ExplicitReference {
+	for i := range refs {
+		if refs[i].Extractor == extractor {
+			return &refs[i]
+		}
+	}
+	return nil
+}
+
+func findSearchHit(hits []domain.SearchHit, sectionID string) *domain.SearchHit {
+	for i := range hits {
+		if hits[i].SectionID == sectionID {
+			return &hits[i]
+		}
+	}
+	return nil
+}
+
 func assertCount(t *testing.T, ctx context.Context, store *Store, table string, where string, want int64) {
 	t.Helper()
 
@@ -1766,6 +2899,15 @@ func syncJobsContain(jobs []domain.SyncJob, status string, text string) bool {
 			continue
 		}
 		if strings.Contains(job.PayloadJSON, text) || strings.Contains(job.LastError, text) {
+			return true
+		}
+	}
+	return false
+}
+
+func healthWarningsContain(warnings []domain.SourceHealthWarning, kind string) bool {
+	for _, warning := range warnings {
+		if warning.Kind == kind {
 			return true
 		}
 	}
@@ -2180,6 +3322,483 @@ func TestRecordQueryObservationCacheHitFlag(t *testing.T) {
 	if resultCount != 0 {
 		t.Fatalf("search_result_events count = %d, want 0", resultCount)
 	}
+}
+
+func TestSectionEmbeddingsStoreMetadataAndVectorSearch(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	backend := newFakeVectorBackend()
+	store.SetVectorBackend(backend)
+	createTestSource(t, ctx, store, "source-embedding")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-embedding", SourceID: "source-embedding", ExternalID: "embedding.md", Title: "Embedding Metadata", ContentHash: "hash-doc-embedding"}, []domain.SectionInput{{
+		ID: "section-embedding", Title: "Vector Trace", Content: "embedding metadata must be traceable", ContentHash: "hash-section-embedding",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	input := domain.SectionEmbeddingInput{SectionID: "section-embedding", DocumentID: "doc-embedding", SourceID: "source-embedding", Model: "test-embedding", Dimensions: 3, Embedding: []float32{1, 0, 0}, ContentHash: "hash-section-embedding", EmbeddingTextHash: "hash-embedding-text", GeneratorVersion: "generator-v1"}
+	if err := store.UpsertSectionEmbedding(ctx, input); err != nil {
+		t.Fatalf("UpsertSectionEmbedding returned error: %v", err)
+	}
+	hit, vector, err := store.GetSectionEmbedding(ctx, "section-embedding", "test-embedding")
+	if err != nil {
+		t.Fatalf("GetSectionEmbedding returned error: %v", err)
+	}
+	if hit.SourceID != input.SourceID || hit.DocumentID != input.DocumentID || hit.ContentHash != input.ContentHash || hit.EmbeddingTextHash != input.EmbeddingTextHash || hit.Model != input.Model || hit.GeneratorVersion != input.GeneratorVersion {
+		t.Fatalf("embedding metadata = %+v, want source/document/hash/model/generator trace", hit)
+	}
+	if fmt.Sprint(vector) != fmt.Sprint(input.Embedding) {
+		t.Fatalf("embedding vector = %v, want %v", vector, input.Embedding)
+	}
+	hits, err := store.SearchSectionsByVector(ctx, []float32{1, 0, 0}, "test-embedding", 10, 0.5, vectorstore.EmbeddingPlanFilter{})
+	if err != nil {
+		t.Fatalf("SearchSectionsByVector returned error: %v", err)
+	}
+	if len(hits) != 1 || hits[0].SectionID != "section-embedding" || hits[0].SourceID != "source-embedding" || hits[0].Similarity < 0.99 {
+		t.Fatalf("vector hits = %+v, want traceable section hit", hits)
+	}
+	if hits[0].ChunkID == "" {
+		t.Fatalf("vector hit = %+v, want chunk_id", hits[0])
+	}
+	chunkHit, _, err := store.GetEmbeddingChunk(ctx, hits[0].ChunkID, "test-embedding")
+	if err != nil {
+		t.Fatalf("GetEmbeddingChunk returned error: %v", err)
+	}
+	if chunkHit.SectionID != "section-embedding" || chunkHit.DocumentID != "doc-embedding" || chunkHit.SourceID != "source-embedding" {
+		t.Fatalf("chunk reverse trace = %+v, want section/document/source", chunkHit)
+	}
+}
+
+func TestVectorHitWithMismatchedContentHashIsFiltered(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	store.SetVectorBackend(newFakeVectorBackend())
+	store.SetVectorSearchRuntime(vectorstore.SearchRuntime{Embedder: fakeQueryEmbedder{model: "test-embedding", vector: []float32{1, 0}}, SearchWeight: 0.4})
+	createTestSource(t, ctx, store, "source-stale-vector")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-stale-vector", SourceID: "source-stale-vector", ExternalID: "stale.md", Title: "Stale Vector", ContentHash: "hash-doc-stale-vector"}, []domain.SectionInput{{
+		ID: "section-stale-vector", Title: "Semantic Only", Content: "nothing lexical should match this content", ContentHash: "hash-current-section",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	if err := store.UpsertSectionEmbedding(ctx, domain.SectionEmbeddingInput{SectionID: "section-stale-vector", DocumentID: "doc-stale-vector", SourceID: "source-stale-vector", Model: "test-embedding", Dimensions: 2, Embedding: []float32{1, 0}, ContentHash: "hash-old-section", EmbeddingTextHash: "hash-text", GeneratorVersion: "generator-v1"}); err != nil {
+		t.Fatalf("UpsertSectionEmbedding returned error: %v", err)
+	}
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{Query: "zzzznomatch", Limit: 10, MaxSearches: 5, MaxSectionsPerDocument: 5, ProfileDetail: "compact"})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) != 0 {
+		t.Fatalf("hits = %+v, want mismatched vector hit filtered", result.Hits)
+	}
+}
+
+func TestVectorSearchFiltersToActiveEmbeddingPlan(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	store.SetVectorBackend(newFakeVectorBackend())
+	store.SetVectorSearchRuntime(vectorstore.SearchRuntime{
+		Embedder:         fakeQueryEmbedder{model: "test-embedding", vector: []float32{1, 0}},
+		SearchWeight:     1,
+		GeneratorVersion: "generator-v2",
+		Tokenizer:        "conservative",
+		ChunkStrategy:    "auto",
+	})
+	createTestSource(t, ctx, store, "source-active-plan")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-active-plan", SourceID: "source-active-plan", ExternalID: "active.md", Title: "Active Plan", ContentHash: "hash-doc-active-plan"}, []domain.SectionInput{{
+		ID: "section-active-plan", Title: "Active", Content: "semantic target only", ContentHash: "hash-section-active-plan",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	for _, input := range []domain.EmbeddingChunkInput{
+		{
+			ChunkID:            "chunk-old-structural",
+			SectionID:          "section-active-plan",
+			DocumentID:         "doc-active-plan",
+			SourceID:           "source-active-plan",
+			ChunkOrdinal:       0,
+			ChunkText:          "old structural chunk",
+			Model:              "test-embedding",
+			Dimensions:         2,
+			Embedding:          []float32{1, 0},
+			SectionContentHash: "hash-section-active-plan",
+			ChunkTextHash:      "hash-old-structural",
+			Tokenizer:          "conservative",
+			ChunkStrategy:      "structural",
+			GeneratorVersion:   "generator-v1",
+		},
+		{
+			ChunkID:            "chunk-current-auto",
+			SectionID:          "section-active-plan",
+			DocumentID:         "doc-active-plan",
+			SourceID:           "source-active-plan",
+			ChunkOrdinal:       0,
+			ChunkText:          "current auto chunk",
+			Model:              "test-embedding",
+			Dimensions:         2,
+			Embedding:          []float32{0, 1},
+			SectionContentHash: "hash-section-active-plan",
+			ChunkTextHash:      "hash-current-auto",
+			Tokenizer:          "conservative",
+			ChunkStrategy:      "auto",
+			GeneratorVersion:   "generator-v2",
+		},
+	} {
+		if err := store.UpsertEmbeddingChunk(ctx, input); err != nil {
+			t.Fatalf("UpsertEmbeddingChunk returned error: %v", err)
+		}
+	}
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{Query: "zzzznomatch", Limit: 10, MaxSearches: 5, MaxSectionsPerDocument: 5, ProfileDetail: "compact"})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) != 1 {
+		t.Fatalf("hits = %+v, want one active-plan vector hit", result.Hits)
+	}
+	trace := result.Hits[0].Trace
+	if trace == nil || trace.ChunkID != "chunk-current-auto" || trace.ChunkStrategy != "auto" || trace.GeneratorVersion != "generator-v2" {
+		t.Fatalf("trace = %+v, want current auto plan hit", trace)
+	}
+}
+
+func TestVectorOnlyResultDoesNotOutrankStrongExactHit(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	store.SetVectorBackend(newFakeVectorBackend())
+	store.SetVectorSearchRuntime(vectorstore.SearchRuntime{Embedder: fakeQueryEmbedder{model: "test-embedding", vector: []float32{1, 0}}, SearchWeight: 1})
+	createTestSource(t, ctx, store, "source-vector-rank")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-exact-vector-rank", SourceID: "source-vector-rank", ExternalID: "exact.md", Title: "Exact API", ContentHash: "hash-doc-exact-vector-rank"}, []domain.SectionInput{{
+		ID: "section-exact-vector-rank", Title: "GET /api/users", Content: "The exact endpoint is GET /api/users.", ContentHash: "hash-section-exact-vector-rank",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument exact returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-vector-only-rank", SourceID: "source-vector-rank", ExternalID: "semantic.md", Title: "Semantic Neighbor", ContentHash: "hash-doc-vector-only-rank"}, []domain.SectionInput{{
+		ID: "section-vector-only-rank", Title: "Neighbor", Content: "A semantically close but lexically unrelated section.", ContentHash: "hash-section-vector-only-rank",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument vector returned error: %v", err)
+	}
+	for _, input := range []domain.SectionEmbeddingInput{
+		{SectionID: "section-exact-vector-rank", DocumentID: "doc-exact-vector-rank", SourceID: "source-vector-rank", Model: "test-embedding", Dimensions: 2, Embedding: []float32{0, 1}, ContentHash: "hash-section-exact-vector-rank", EmbeddingTextHash: "hash-exact-text", GeneratorVersion: "generator-v1"},
+		{SectionID: "section-vector-only-rank", DocumentID: "doc-vector-only-rank", SourceID: "source-vector-rank", Model: "test-embedding", Dimensions: 2, Embedding: []float32{1, 0}, ContentHash: "hash-section-vector-only-rank", EmbeddingTextHash: "hash-vector-text", GeneratorVersion: "generator-v1"},
+	} {
+		if err := store.UpsertSectionEmbedding(ctx, input); err != nil {
+			t.Fatalf("UpsertSectionEmbedding returned error: %v", err)
+		}
+	}
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{Query: "GET /api/users", Limit: 10, MaxSearches: 5, MaxSectionsPerDocument: 5, ProfileDetail: "compact"})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) < 2 {
+		t.Fatalf("hits = %+v, want exact and vector-only hits", result.Hits)
+	}
+	if result.Hits[0].SectionID != "section-exact-vector-rank" {
+		t.Fatalf("first hit = %+v, want exact hit before vector-only hit", result.Hits[0])
+	}
+	for _, hit := range result.Hits {
+		if hit.SectionID == "section-vector-only-rank" && hit.EvidenceLevel != "weak_vector_only" {
+			t.Fatalf("vector-only evidence level = %q, want weak_vector_only", hit.EvidenceLevel)
+		}
+	}
+}
+
+func TestSourceEmbeddingStatusCountsCoverageAndPendingSections(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	store.SetVectorBackend(newFakeVectorBackend())
+	createTestSource(t, ctx, store, "source-embedding-status")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-embedding-status", SourceID: "source-embedding-status", ExternalID: "status.md", Title: "Embedding Status", ContentHash: "hash-doc-embedding-status"}, []domain.SectionInput{
+		{ID: "section-embedding-current", Content: "current", ContentHash: "hash-current", Ordinal: 0},
+		{ID: "section-embedding-stale", Content: "stale", ContentHash: "hash-stale-current", Ordinal: 1},
+		{ID: "section-embedding-stale-text", Content: "stale text", ContentHash: "hash-stale-text-current", Ordinal: 2},
+		{ID: "section-embedding-pending", Content: "pending", ContentHash: "hash-pending", Ordinal: 3},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	for _, input := range []domain.SectionEmbeddingInput{
+		{SectionID: "section-embedding-current", DocumentID: "doc-embedding-status", SourceID: "source-embedding-status", Model: "test-embedding", Dimensions: 2, Embedding: []float32{1, 0}, ContentHash: "hash-current", EmbeddingTextHash: "text-hash-current", GeneratorVersion: "generator-v1"},
+		{SectionID: "section-embedding-stale", DocumentID: "doc-embedding-status", SourceID: "source-embedding-status", Model: "test-embedding", Dimensions: 2, Embedding: []float32{0, 1}, ContentHash: "hash-stale-old", EmbeddingTextHash: "hash-stale-text", GeneratorVersion: "generator-v1"},
+		{SectionID: "section-embedding-stale-text", DocumentID: "doc-embedding-status", SourceID: "source-embedding-status", Model: "test-embedding", Dimensions: 2, Embedding: []float32{1, 1}, ContentHash: "hash-stale-text-current", EmbeddingTextHash: "old-text-hash", GeneratorVersion: "generator-v1"},
+	} {
+		if err := store.UpsertSectionEmbedding(ctx, input); err != nil {
+			t.Fatalf("UpsertSectionEmbedding returned error: %v", err)
+		}
+	}
+	status, err := store.GetSourceEmbeddingStatus(ctx, "source-embedding-status", "test-embedding", "generator-v1", "auto", "structural", 1200)
+	if err != nil {
+		t.Fatalf("GetSourceEmbeddingStatus returned error: %v", err)
+	}
+	// 4 total sections, 3 have embeddings in the vector backend → 3 embedded, 1 pending
+	if status.TotalSections != 4 || status.EmbeddedSections != 3 || status.PendingSections != 1 {
+		t.Fatalf("status = %+v, want total=4 embedded=3 pending=1", status)
+	}
+	if status.Status != "indexing" {
+		t.Fatalf("status.Status = %q, want indexing", status.Status)
+	}
+}
+
+type fakeVectorBackend struct {
+	hits    map[string]domain.VectorSearchHit
+	vectors map[string][]float32
+}
+
+type fakeQueryEmbedder struct {
+	model  string
+	vector []float32
+	err    error
+}
+
+func (e fakeQueryEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	out := make([][]float32, len(texts))
+	for i := range texts {
+		out[i] = append([]float32{}, e.vector...)
+	}
+	return out, nil
+}
+
+func (e fakeQueryEmbedder) Model() string {
+	return e.model
+}
+
+func newFakeVectorBackend() *fakeVectorBackend {
+	return &fakeVectorBackend{
+		hits:    map[string]domain.VectorSearchHit{},
+		vectors: map[string][]float32{},
+	}
+}
+
+func (f *fakeVectorBackend) UpsertSectionEmbedding(ctx context.Context, input domain.SectionEmbeddingInput) error {
+	return f.UpsertEmbeddingChunk(ctx, domain.EmbeddingChunkInput{
+		ChunkID:            "chunk-" + input.SectionID,
+		SectionID:          input.SectionID,
+		DocumentID:         input.DocumentID,
+		SourceID:           input.SourceID,
+		ChunkOrdinal:       0,
+		ChunkText:          input.EmbeddingTextHash,
+		Model:              input.Model,
+		Dimensions:         input.Dimensions,
+		Embedding:          input.Embedding,
+		SectionContentHash: input.ContentHash,
+		ChunkTextHash:      input.EmbeddingTextHash,
+		Tokenizer:          "conservative",
+		ChunkStrategy:      "structural",
+		GeneratorVersion:   input.GeneratorVersion,
+	})
+}
+
+func (f *fakeVectorBackend) GetSectionEmbedding(ctx context.Context, sectionID string, model string) (domain.VectorSearchHit, []float32, error) {
+	for chunkID, hit := range f.hits {
+		if hit.SectionID == sectionID && hit.Model == model {
+			return hit, append([]float32{}, f.vectors[chunkID]...), nil
+		}
+	}
+	return domain.VectorSearchHit{}, nil, sql.ErrNoRows
+}
+
+func (f *fakeVectorBackend) DeleteSectionEmbeddings(ctx context.Context, sectionID string) error {
+	return f.DeleteEmbeddingChunksBySection(ctx, sectionID, "", "", "", "")
+}
+
+func (f *fakeVectorBackend) SearchSectionsByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]domain.VectorSearchHit, error) {
+	return f.SearchChunksByVector(ctx, embedding, model, limit, minSimilarity, plan)
+}
+
+func (f *fakeVectorBackend) UpsertEmbeddingChunk(ctx context.Context, input domain.EmbeddingChunkInput) error {
+	if input.ChunkID == "" {
+		input.ChunkID = "chunk-" + input.SectionID
+	}
+	f.hits[input.ChunkID] = domain.VectorSearchHit{
+		ChunkID:            input.ChunkID,
+		SectionID:          input.SectionID,
+		DocumentID:         input.DocumentID,
+		SourceID:           input.SourceID,
+		ChunkOrdinal:       input.ChunkOrdinal,
+		ChunkText:          input.ChunkText,
+		Model:              input.Model,
+		ContentHash:        input.SectionContentHash,
+		SectionContentHash: input.SectionContentHash,
+		EmbeddingTextHash:  input.ChunkTextHash,
+		ChunkTextHash:      input.ChunkTextHash,
+		Tokenizer:          input.Tokenizer,
+		ChunkStrategy:      input.ChunkStrategy,
+		GeneratorVersion:   input.GeneratorVersion,
+		GeneratedAt:        "2026-07-03T00:00:00Z",
+	}
+	f.vectors[input.ChunkID] = append([]float32{}, input.Embedding...)
+	return nil
+}
+
+func (f *fakeVectorBackend) GetEmbeddingChunk(ctx context.Context, chunkID string, model string) (domain.VectorSearchHit, []float32, error) {
+	hit, ok := f.hits[chunkID]
+	if !ok || hit.Model != model {
+		return domain.VectorSearchHit{}, nil, sql.ErrNoRows
+	}
+	return hit, append([]float32{}, f.vectors[chunkID]...), nil
+}
+
+func (f *fakeVectorBackend) DeleteEmbeddingChunksBySection(ctx context.Context, sectionID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) error {
+	for chunkID, hit := range f.hits {
+		if hit.SectionID != sectionID {
+			continue
+		}
+		if model != "" && hit.Model != model {
+			continue
+		}
+		if generatorVersion != "" && hit.GeneratorVersion != generatorVersion {
+			continue
+		}
+		if tokenizer != "" && hit.Tokenizer != tokenizer {
+			continue
+		}
+		if chunkStrategy != "" && hit.ChunkStrategy != chunkStrategy {
+			continue
+		}
+		delete(f.hits, chunkID)
+		delete(f.vectors, chunkID)
+	}
+	return nil
+}
+
+func (f *fakeVectorBackend) SearchChunksByVector(ctx context.Context, embedding []float32, model string, limit int, minSimilarity float64, plan vectorstore.EmbeddingPlanFilter) ([]domain.VectorSearchHit, error) {
+	hits := make([]domain.VectorSearchHit, 0)
+	for chunkID, hit := range f.hits {
+		if hit.Model != model {
+			continue
+		}
+		if plan.GeneratorVersion != "" && hit.GeneratorVersion != plan.GeneratorVersion {
+			continue
+		}
+		if plan.Tokenizer != "" && hit.Tokenizer != plan.Tokenizer {
+			continue
+		}
+		if plan.ChunkStrategy != "" && hit.ChunkStrategy != plan.ChunkStrategy {
+			continue
+		}
+		hit.Similarity = testCosine(embedding, f.vectors[chunkID])
+		if hit.Similarity >= minSimilarity {
+			hits = append(hits, hit)
+		}
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		return hits[i].Similarity > hits[j].Similarity
+	})
+	if limit > 0 && len(hits) > limit {
+		hits = hits[:limit]
+	}
+	return hits, nil
+}
+
+func (f *fakeVectorBackend) ListSectionEmbeddingHashes(ctx context.Context, model string, limit, offset int) ([]domain.SectionEmbeddingHash, error) {
+	chunks, err := f.ListEmbeddingChunkHashes(ctx, model, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.SectionEmbeddingHash, 0)
+	seen := map[string]bool{}
+	for _, hit := range chunks {
+		if seen[hit.SectionID] {
+			continue
+		}
+		seen[hit.SectionID] = true
+		items = append(items, domain.SectionEmbeddingHash{
+			SectionID:         hit.SectionID,
+			DocumentID:        hit.DocumentID,
+			SourceID:          hit.SourceID,
+			Model:             hit.Model,
+			ContentHash:       hit.SectionContentHash,
+			EmbeddingTextHash: hit.ChunkTextHash,
+			GeneratorVersion:  hit.GeneratorVersion,
+			GeneratedAt:       hit.GeneratedAt,
+		})
+	}
+	return items, nil
+}
+
+func (f *fakeVectorBackend) ListEmbeddingChunkHashes(ctx context.Context, model string, limit, offset int) ([]domain.EmbeddingChunkHash, error) {
+	items := make([]domain.EmbeddingChunkHash, 0)
+	for _, hit := range f.hits {
+		if hit.Model != model {
+			continue
+		}
+		items = append(items, domain.EmbeddingChunkHash{
+			ChunkID:            hit.ChunkID,
+			SectionID:          hit.SectionID,
+			DocumentID:         hit.DocumentID,
+			SourceID:           hit.SourceID,
+			ChunkOrdinal:       hit.ChunkOrdinal,
+			Model:              hit.Model,
+			SectionContentHash: hit.SectionContentHash,
+			ChunkTextHash:      hit.ChunkTextHash,
+			Tokenizer:          hit.Tokenizer,
+			ChunkStrategy:      hit.ChunkStrategy,
+			GeneratorVersion:   hit.GeneratorVersion,
+			GeneratedAt:        hit.GeneratedAt,
+		})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].SectionID == items[j].SectionID {
+			return items[i].ChunkOrdinal < items[j].ChunkOrdinal
+		}
+		return items[i].SectionID < items[j].SectionID
+	})
+	if offset >= len(items) {
+		return nil, nil
+	}
+	if limit <= 0 || offset+limit > len(items) {
+		limit = len(items) - offset
+	}
+	return items[offset : offset+limit], nil
+}
+
+func (f *fakeVectorBackend) GetEmbeddingCoverage(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) (domain.EmbeddingCoverage, error) {
+	coverage := domain.EmbeddingCoverage{}
+	seenSections := map[string]bool{}
+	for _, hit := range f.hits {
+		if sourceID != "" && hit.SourceID != sourceID {
+			continue
+		}
+		if model != "" && hit.Model != model {
+			continue
+		}
+		if generatorVersion != "" && hit.GeneratorVersion != generatorVersion {
+			continue
+		}
+		if tokenizer != "" && hit.Tokenizer != tokenizer {
+			continue
+		}
+		if chunkStrategy != "" && hit.ChunkStrategy != chunkStrategy {
+			continue
+		}
+		coverage.EmbeddedChunks++
+		if !seenSections[hit.SectionID] {
+			seenSections[hit.SectionID] = true
+			coverage.EmbeddedSections++
+		}
+	}
+	return coverage, nil
+}
+
+func (f *fakeVectorBackend) Close() error {
+	return nil
+}
+
+func testCosine(left []float32, right []float32) float64 {
+	if len(left) == 0 || len(left) != len(right) {
+		return 0
+	}
+	var dot, leftNorm, rightNorm float64
+	for i := range left {
+		l := float64(left[i])
+		r := float64(right[i])
+		dot += l * r
+		leftNorm += l * l
+		rightNorm += r * r
+	}
+	if leftNorm == 0 || rightNorm == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(leftNorm) * math.Sqrt(rightNorm))
 }
 
 func nodesContainID(nodes []domain.Node, id string) bool {

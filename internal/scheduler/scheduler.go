@@ -80,7 +80,7 @@ func (r *Runner) due(ctx context.Context, source storage.Source, now time.Time) 
 	if len(jobs) == 0 {
 		return true, nil
 	}
-	if jobs[0].Status == "queued" || jobs[0].Status == "running" {
+	if jobs[0].Status == "queued" || jobs[0].Status == "running" || jobs[0].Status == "canceling" {
 		return false, nil
 	}
 	last, ok := parseJobTime(jobs[0].UpdatedAt)

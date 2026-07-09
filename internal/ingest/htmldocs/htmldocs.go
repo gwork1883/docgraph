@@ -158,6 +158,13 @@ func (p *pageParser) walk(node *html.Node) {
 			}
 			p.currentLinks = append(p.currentLinks, internalLinks(node)...)
 			return
+		case "table":
+			lines := tableLines(node)
+			if len(lines) > 0 {
+				p.currentLines = append(p.currentLines, lines...)
+			}
+			p.currentLinks = append(p.currentLinks, internalLinks(node)...)
+			return
 		case "div", "span":
 			// SPA pages often put visible text inside <div> or <span> instead
 			// of traditional <p>/<li>. Only extract text from leaf-level div/span
@@ -228,6 +235,47 @@ func textContent(node *html.Node) string {
 	}
 	walk(node)
 	return strings.Join(parts, " ")
+}
+
+func tableLines(node *html.Node) []string {
+	lines := make([]string, 0)
+	var walkRows func(*html.Node)
+	walkRows = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "tr" {
+			if line := tableRowLine(n); line != "" {
+				lines = append(lines, line)
+			}
+			return
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walkRows(child)
+		}
+	}
+	walkRows(node)
+	if len(lines) == 0 {
+		text := strings.TrimSpace(textContent(node))
+		if text != "" {
+			lines = append(lines, text)
+		}
+	}
+	return lines
+}
+
+func tableRowLine(node *html.Node) string {
+	cells := make([]string, 0)
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if child.Type != html.ElementNode {
+			continue
+		}
+		switch child.Data {
+		case "th", "td":
+			text := strings.TrimSpace(textContent(child))
+			if text != "" {
+				cells = append(cells, text)
+			}
+		}
+	}
+	return strings.Join(cells, " | ")
 }
 
 // isLeafTextElement checks if a <div> or <span> is a "leaf" element that

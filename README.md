@@ -25,7 +25,7 @@ Search provides local retrieval across document sections and generated retrieval
 - Single Go binary with an embedded Web UI.
 - Local SQLite + FTS5 storage, no external database required.
 - Connectors for `local`, `git`, `static`, `html`, `sftp`, `confluence`, `openapi`, and `webdocs` sources.
-- MCP tools: `doc_search`, `doc_context`, `doc_get_node`, `doc_get_section`, `doc_related`, and `doc_impact`.
+- MCP tools: `doc_search`, `doc_get_node`, `doc_get_section`, `doc_related`, and `doc_impact`; legacy `doc_context` calls remain compatible but are no longer advertised.
 - Document-backed knowledge graph with nodes, edges, provenance, sync history, and feedback markers.
 - Chinese-aware retrieval profile generation for mixed Chinese/English internal docs.
 - Optional token authentication for Web/API/MCP endpoints.

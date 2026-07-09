@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/docgraph/docgraph/internal/config"
+	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/ingest/confluence"
 	jobrunner "github.com/docgraph/docgraph/internal/jobs"
@@ -56,6 +57,202 @@ func TestHealthAndStatusHandlers(t *testing.T) {
 	}
 	if !strings.HasPrefix(status.StorageDSN, "sqlite://") {
 		t.Fatalf("status storage dsn = %q, want sqlite dsn", status.StorageDSN)
+	}
+}
+
+func TestSourceEmbeddingStatusHandler(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{ID: "source-embedding-status-api", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, storage.DocumentInput{ID: "doc-embedding-status-api", SourceID: source.ID, ExternalID: "status.md", Title: "Status", ContentHash: "hash-doc"}, []storage.SectionInput{
+		{ID: "section-embedding-status-api-current", Content: "current", ContentHash: "hash-current"},
+		{ID: "section-embedding-status-api-pending", Content: "pending", ContentHash: "hash-pending"},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/sources/"+source.ID+"/embedding-status?model=test-embedding&generator_version=generator-v1", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("embedding status code = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var status storage.EmbeddingStatus
+	decodeJSON(t, rr, &status)
+	if status.Enabled || status.Status != "disabled" || status.Reason != "vector_db_not_configured" || status.TotalSections != 2 || status.EmbeddedSections != 0 || status.PendingSections != 2 || status.StaleSections != 0 {
+		t.Fatalf("embedding status = %+v, want disabled with total=2 pending=2", status)
+	}
+}
+
+func TestSearchFallsBackWhenVectorEmbeddingFails(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithEmbedding(t, failingEmbedder{})
+	defer cleanup()
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{ID: "source-search-vector-fallback", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, storage.DocumentInput{
+		ID:          "doc-search-vector-fallback",
+		SourceID:    source.ID,
+		ExternalID:  "fallback.md",
+		Title:       "Fallback Search",
+		ContentHash: "hash-doc-search-vector-fallback",
+	}, []storage.SectionInput{{
+		ID:          "section-search-vector-fallback",
+		Title:       "Search fallback",
+		Content:     "embedding outage should still return lexical search results",
+		ContentHash: "hash-section-search-vector-fallback",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+
+	rr := postJSON(t, handler, "/api/search", map[string]any{
+		"query": "embedding outage lexical",
+		"limit": 10,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("search status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var result struct {
+		Attempts []storage.SearchAttempt `json:"attempts"`
+		Hits     []storage.SearchHit     `json:"hits"`
+	}
+	decodeJSON(t, rr, &result)
+	if len(result.Hits) == 0 || result.Hits[0].DocumentID != "doc-search-vector-fallback" {
+		t.Fatalf("search hits = %+v, want lexical fallback hit", result.Hits)
+	}
+	if !hasAttemptError(result.Attempts, "vector", "embedding_failed") {
+		t.Fatalf("attempts = %+v, want vector embedding_failed attempt", result.Attempts)
+	}
+}
+
+func TestEmbeddingChunkOptionsAndCompareHandlers(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{ID: "source-chunk-plan", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	content := strings.Join([]string{
+		strings.Repeat("alpha beta gamma delta epsilon zeta eta theta\n\n", 40),
+		"| Name | Description |",
+		"| --- | --- |",
+		strings.Repeat("| DOCGRAPH_TOKEN | Browser-mediated auth token |\n", 8),
+		"",
+		strings.Repeat("omega sigma lambda kappa\n\n", 40),
+	}, "\n")
+	if err := store.ReplaceDocument(ctx, storage.DocumentInput{
+		ID:          "doc-chunk-plan",
+		SourceID:    source.ID,
+		ExternalID:  "chunk.md",
+		Title:       "Chunk Plan",
+		ContentHash: "hash-doc-chunk-plan",
+	}, []storage.SectionInput{{
+		ID:          "section-chunk-plan",
+		Title:       "Chunk plan",
+		Content:     content,
+		ContentHash: "hash-section-chunk-plan",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/embedding/chunk-options", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("chunk options status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var options struct {
+		Tokenizers []availableChunkOption `json:"tokenizers"`
+		Strategies []availableChunkOption `json:"strategies"`
+	}
+	decodeJSON(t, rr, &options)
+	if len(options.Tokenizers) == 0 || len(options.Strategies) == 0 {
+		t.Fatalf("chunk options = %+v, want tokenizers and strategies", options)
+	}
+	if !hasAvailableOption(options.Tokenizers, "cl100k_base") || !hasAvailableOption(options.Strategies, "adaptive") || !hasAvailableOption(options.Strategies, "block_aware_pack") {
+		t.Fatalf("chunk options = %+v, want available cl100k_base tokenizer, adaptive, and block_aware_pack strategies", options)
+	}
+
+	rr = postJSON(t, handler, "/api/embedding/chunk-plans/compare", map[string]any{
+		"section_id": "section-chunk-plan",
+		"plans": []map[string]any{
+			{"tokenizer": "conservative", "strategy": "structural", "chunk_target_tokens": 80},
+			{"tokenizer": "cl100k_base", "strategy": "recursive", "chunk_target_tokens": 260},
+			{"tokenizer": "conservative", "strategy": "adaptive", "chunk_target_tokens": 140},
+			{"tokenizer": "conservative", "strategy": "block_aware_pack", "chunk_target_tokens": 260, "chunk_overlap_tokens": 0},
+		},
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("compare status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var body struct {
+		Plans []struct {
+			ChunkCount     int `json:"chunk_count"`
+			SizeCompliance struct {
+				MaxTokens float64 `json:"max_tokens"`
+			} `json:"size_compliance"`
+			BlockIntegrity struct {
+				TotalBlocks  int     `json:"total_blocks"`
+				PreserveRate float64 `json:"preserve_rate"`
+			} `json:"block_integrity"`
+		} `json:"plans"`
+	}
+	decodeJSON(t, rr, &body)
+	if len(body.Plans) != 4 || body.Plans[0].ChunkCount <= body.Plans[1].ChunkCount || body.Plans[2].ChunkCount <= 0 || body.Plans[3].ChunkCount <= 0 {
+		t.Fatalf("compare body = %+v, want four summaries with adaptive and block-aware populated", body)
+	}
+	if body.Plans[0].SizeCompliance.MaxTokens <= 0 || body.Plans[3].BlockIntegrity.TotalBlocks == 0 {
+		t.Fatalf("compare body = %+v, want size compliance and BI metrics", body)
+	}
+	if body.Plans[3].BlockIntegrity.PreserveRate < body.Plans[0].BlockIntegrity.PreserveRate {
+		t.Fatalf("compare body = %+v, want block-aware BI preserve rate at least structural", body)
+	}
+}
+
+type availableChunkOption struct {
+	Name      string `json:"name"`
+	Available bool   `json:"available"`
+}
+
+func hasAvailableOption(items []availableChunkOption, name string) bool {
+	for _, item := range items {
+		if item.Name == name && item.Available {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEmbeddingEnsureRejectsDuplicateActiveJob(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{ID: "source-embedding-ensure-api", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+
+	rr := postJSON(t, handler, "/api/maintenance/embedding-ensure?source_id="+source.ID, nil)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("embedding ensure status = %d, want %d; body: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	var created struct {
+		Job storage.Job `json:"job"`
+	}
+	decodeJSON(t, rr, &created)
+	if created.Job.Kind != "maintenance_embedding_ensure" || created.Job.Status != "queued" || created.Job.SourceID != source.ID {
+		t.Fatalf("embedding ensure job = %+v, want queued maintenance job for source", created.Job)
+	}
+
+	rr = postJSON(t, handler, "/api/maintenance/embedding-ensure?source_id="+source.ID, nil)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("duplicate embedding ensure status = %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
 	}
 }
 
@@ -325,6 +522,9 @@ Use GET /member/benefits to load current member benefits for the account.
 	if len(artifacts.Documents) != 1 {
 		t.Fatalf("artifacts documents = %+v, want one document", artifacts.Documents)
 	}
+	if artifacts.EmbeddingStatus == nil || artifacts.EmbeddingStatus.Enabled || artifacts.EmbeddingStatus.PendingSections != int(artifacts.Counts.Sections) {
+		t.Fatalf("artifacts embedding status = %+v counts=%+v, want disabled coverage for all sections", artifacts.EmbeddingStatus, artifacts.Counts)
+	}
 	docID := artifacts.Documents[0].ID
 
 	rr = httptest.NewRecorder()
@@ -337,6 +537,36 @@ Use GET /member/benefits to load current member benefits for the account.
 	decodeJSON(t, rr, &profile)
 	if profile.DocumentID != docID || profile.RetrievalProfileJSON == "" || profile.GeneratedFromHash == "" {
 		t.Fatalf("initial profile = %+v, want generated retrieval profile", profile)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/documents/"+docID, nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get document detail status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var detail storage.DocumentDetail
+	decodeJSON(t, rr, &detail)
+	if detail.Document.ID != docID || detail.Source.ID != created.ID {
+		t.Fatalf("document detail = %+v, want document %q from source %q", detail, docID, created.ID)
+	}
+	if detail.Profile.DocumentID != docID || len(detail.Sections) == 0 || len(detail.Related) == 0 {
+		t.Fatalf("document detail missing profile/sections/related: %+v", detail)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/documents/"+docID+"?summary=1", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get document summary status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var summary storage.DocumentDetail
+	decodeJSON(t, rr, &summary)
+	if summary.Document.ID != docID || summary.Source.ID != created.ID {
+		t.Fatalf("document summary = %+v, want document %q from source %q", summary, docID, created.ID)
+	}
+	if summary.Profile.DocumentID != "" || len(summary.Sections) != 0 || len(summary.Related) != 0 || len(summary.Diagnostics) != 0 {
+		t.Fatalf("document summary included heavy detail fields: %+v", summary)
 	}
 
 	rr = putJSON(t, handler, "/api/documents/"+docID+"/profile", map[string]any{
@@ -383,6 +613,18 @@ Use GET /member/benefits to load current member benefits for the account.
 		t.Fatalf("post-sync status counts = sources:%d documents:%d sections:%d, want 1/1/>0", status.Sources, status.Documents, status.Sections)
 	}
 
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/health", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("source health status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var health storage.SourceHealth
+	decodeJSON(t, rr, &health)
+	if health.SourceID != created.ID || health.Counts.Documents != 1 || health.LatestJob.ID == "" {
+		t.Fatalf("source health = %+v, want source counts and latest job", health)
+	}
+
 	rr = postJSON(t, handler, "/api/search", map[string]any{
 		"query": "member benefits",
 		"limit": 10,
@@ -406,6 +648,28 @@ Use GET /member/benefits to load current member benefits for the account.
 	}
 	if !foundAPISection {
 		t.Fatalf("search hits = %+v, want hit for member benefits/API content", searchResult.Hits)
+	}
+
+	rr = postJSON(t, handler, "/api/feedback", map[string]any{
+		"target_kind":   "document",
+		"target_id":     docID,
+		"feedback_kind": "document_stale",
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create stale feedback status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/documents/"+docID, nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get document detail after feedback status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	decodeJSON(t, rr, &detail)
+	if len(detail.Feedback) != 1 || detail.Feedback[0].FeedbackKind != "document_stale" {
+		t.Fatalf("document detail feedback = %+v, want document_stale", detail.Feedback)
+	}
+	if !sourceHealthWarningsContain(detail.Diagnostics, "document_stale") || detail.LatestJob.ID == "" {
+		t.Fatalf("document detail diagnostics/latest job = %+v / %+v, want stale diagnostic and latest job", detail.Diagnostics, detail.LatestJob)
 	}
 }
 
@@ -550,6 +814,50 @@ func TestSyncTaskHandlersCreateQueuedJobAndRejectDuplicate(t *testing.T) {
 	rr = postJSON(t, handler, "/api/sync-tasks", map[string]any{"source_id": source.ID})
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("duplicate sync task status = %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+}
+
+func TestSyncJobHandlersCancelAndRejectActiveDelete(t *testing.T) {
+	handler, store, cleanup := newTestHandlerWithStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	source, err := store.CreateSource(ctx, storage.Source{
+		ID:   "src_cancel_job",
+		Kind: "local",
+		Name: "Cancelable",
+		DSN:  "file:///tmp/cancelable",
+	})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	job, err := store.CreateSyncJobIfIdle(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("CreateSyncJobIfIdle returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/sources/"+source.ID+"/jobs/"+job.ID, nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("delete active job status = %d, want %d; body: %s", rr.Code, http.StatusConflict, rr.Body.String())
+	}
+
+	rr = postJSON(t, handler, "/api/sources/"+source.ID+"/jobs/"+job.ID+"/cancel", nil)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("cancel queued job status = %d, want %d; body: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+	var canceled struct {
+		Job storage.Job `json:"job"`
+	}
+	decodeJSON(t, rr, &canceled)
+	if canceled.Job.Status != "canceled" {
+		t.Fatalf("canceled job = %+v, want canceled", canceled.Job)
+	}
+
+	rr = postJSON(t, handler, "/api/sources/"+source.ID+"/jobs/"+job.ID+"/cancel", nil)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("cancel already canceled job status = %d, want idempotent accepted; body: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1579,6 +1887,47 @@ func newTestHandlerWithStore(t *testing.T) (http.Handler, storage.Store, func())
 	}
 }
 
+func newTestHandlerWithEmbedding(t *testing.T, embedder embedding.Embedder) (http.Handler, storage.Store, func()) {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	store, err := storage.Open(context.Background(), "sqlite://"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Migrate(context.Background()); err != nil {
+		_ = store.Close()
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	srv := NewWithAuthAndPrefixAndJobsAndEmbedding("127.0.0.1:0", store, slog.New(slog.NewTextHandler(io.Discard, nil)), config.AuthConfig{Mode: "none"}, "", nil, embedder, embedding.DefaultGeneratorVersion, 1200, config.DefaultVectorSearchWeight)
+	handler, err := srv.routes()
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("build routes: %v", err)
+	}
+
+	return newAutoDrainHandler(handler, store), store, func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}
+}
+
+type failingEmbedder struct{}
+
+func (failingEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	return nil, fmt.Errorf("embedding unavailable")
+}
+
+func (failingEmbedder) Model() string {
+	return "test-embedding"
+}
+
+func (failingEmbedder) Dimensions() int {
+	return 2
+}
+
 type autoDrainHandler struct {
 	handler http.Handler
 	runner  *jobrunner.Runner
@@ -1722,6 +2071,15 @@ func assertSyncAccepted(t *testing.T, rr *httptest.ResponseRecorder, sourceID st
 		t.Fatalf("sync job = %+v, want queued sync_source for %q", body.Job, sourceID)
 	}
 	return body.Job
+}
+
+func sourceHealthWarningsContain(warnings []storage.SourceHealthWarning, kind string) bool {
+	for _, warning := range warnings {
+		if warning.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func assertServerSearchContains(t *testing.T, handler http.Handler, query string, wantTitle string) {
@@ -1999,6 +2357,7 @@ func TestSourceArtifactCountsEndpoint(t *testing.T) {
 	writeFile(t, filepath.Join(docsDir, "member.md"), `# Member Benefits
 
 Unique sourceartcounts token.
+GET /entity/v1/entities
 `)
 
 	rr := postJSON(t, handler, "/api/sources", map[string]any{
@@ -2031,6 +2390,21 @@ Unique sourceartcounts token.
 	}
 	if countsBody.Counts.Documents != 1 {
 		t.Fatalf("counts Documents = %d, want 1", countsBody.Counts.Documents)
+	}
+	if countsBody.Counts.SectionEntities == 0 {
+		t.Fatalf("counts SectionEntities = %d, want extracted entities", countsBody.Counts.SectionEntities)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/sources/"+created.ID+"/artifacts?limit=10", nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("artifacts status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var artifacts storage.SourceArtifacts
+	decodeJSON(t, rr, &artifacts)
+	if len(artifacts.SectionEntities) == 0 || artifacts.EntityDiagnostics.APIEndpoints == 0 {
+		t.Fatalf("artifacts entities = %+v diagnostics = %+v, want exposed entity diagnostics", artifacts.SectionEntities, artifacts.EntityDiagnostics)
 	}
 }
 
@@ -2406,6 +2780,15 @@ func TestNodeSearchEndpointCallsStore(t *testing.T) {
 	if body.Nodes == nil || len(body.Nodes) != 0 {
 		t.Fatalf("empty node search nodes = %+v, want empty slice", body.Nodes)
 	}
+}
+
+func hasAttemptError(attempts []storage.SearchAttempt, kind string, contains string) bool {
+	for _, attempt := range attempts {
+		if attempt.Kind == kind && strings.Contains(attempt.Error, contains) {
+			return true
+		}
+	}
+	return false
 }
 
 func writeFile(t *testing.T, path, content string) {

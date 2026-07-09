@@ -13,9 +13,6 @@ import (
 
 	"github.com/docgraph/docgraph/internal/app"
 	"github.com/docgraph/docgraph/internal/config"
-	"github.com/docgraph/docgraph/internal/mcp"
-	"github.com/docgraph/docgraph/internal/query"
-	"github.com/docgraph/docgraph/internal/storage"
 )
 
 var version = "dev"
@@ -59,6 +56,8 @@ func run(args []string) error {
 		return runImpact(args[2:])
 	case "feedback":
 		return runFeedback(args[2:])
+	case "maintenance":
+		return runMaintenance(args[2:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -93,6 +92,7 @@ func runServe(args []string) error {
 	host := fs.String("host", "", "server host")
 	port := fs.Int("port", 0, "server port")
 	dataDir := fs.String("data", "", "data directory")
+	jobWorkers := fs.Int("job-workers", 0, "number of concurrent background job workers")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -110,6 +110,9 @@ func runServe(args []string) error {
 	if *dataDir != "" {
 		cfg.Server.DataDir = *dataDir
 		cfg.Storage.DSN = "sqlite://" + filepath.ToSlash(filepath.Join(*dataDir, "docgraph.db"))
+	}
+	if *jobWorkers != 0 {
+		cfg.Server.JobWorkers = *jobWorkers
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -200,17 +203,7 @@ func runMCP(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := storage.OpenExisting(ctx, cfg.Storage.DSN)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	if err := store.CheckSchema(ctx); err != nil {
-		return err
-	}
-
-	return mcp.NewServerWithStore(query.NewService(store), store, os.Stdin, os.Stdout).Run(ctx)
+	return app.MCP(ctx, cfg, os.Stdin, os.Stdout)
 }
 
 func printUsage() {
@@ -220,7 +213,7 @@ Usage:
   docgraph version
   docgraph migrate [--config docgraph.yaml] [--data ./.docgraph]
   docgraph init [--config docgraph.yaml] [--data ./.docgraph] (alias for migrate)
-  docgraph serve [--config docgraph.yaml] [--host 127.0.0.1] [--port 8787] [--data ./.docgraph]
+  docgraph serve [--config docgraph.yaml] [--host 127.0.0.1] [--port 8787] [--data ./.docgraph] [--job-workers 2]
   docgraph status [--config docgraph.yaml] [--data ./.docgraph]
   docgraph mcp [--config docgraph.yaml] [--data ./.docgraph]
   docgraph source add --name "Docs" --dsn /path/to/docs [--sync-schedule hourly] [--data ./.docgraph]
@@ -236,5 +229,6 @@ Usage:
   docgraph impact --id node_xxx [--direction out|in|both] [--kind exposes_api] [--max-depth 2] [--limit 50] [--data ./.docgraph]
   docgraph feedback add --target-kind edge --target-id edge_xxx --kind relationship_wrong [--payload '{}'] [--actor alice] [--data ./.docgraph]
   docgraph feedback list [--target-kind edge] [--target-id edge_xxx] [--kind relationship_wrong] [--limit 20] [--data ./.docgraph]
+  docgraph maintenance section-entities-backfill [--source-id src_xxx|--document-id doc_xxx] [--data ./.docgraph]
 `)
 }

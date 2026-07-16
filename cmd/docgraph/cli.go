@@ -12,6 +12,7 @@ import (
 	"github.com/docgraph/docgraph/internal/config"
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/query"
+	"github.com/docgraph/docgraph/internal/sourcekind"
 	"github.com/docgraph/docgraph/internal/storage"
 	syncsvc "github.com/docgraph/docgraph/internal/sync"
 	"github.com/docgraph/docgraph/internal/syncschedule"
@@ -120,6 +121,9 @@ func runSourceAdd(args []string) error {
 	}
 	if *dsn == "" {
 		return fmt.Errorf("--dsn is required")
+	}
+	if err := sourcekind.Validate(*kind); err != nil {
+		return err
 	}
 	if _, _, err := syncschedule.Parse(*syncSchedule); err != nil {
 		return err
@@ -255,6 +259,9 @@ func runSourceUpdate(args []string) error {
 	if strings.TrimSpace(*kind) != "" {
 		source.Kind = strings.TrimSpace(*kind)
 	}
+	if err := sourcekind.Validate(source.Kind); err != nil {
+		return err
+	}
 	if strings.TrimSpace(*name) != "" {
 		source.Name = strings.TrimSpace(*name)
 	}
@@ -358,7 +365,11 @@ func runSourceSync(args []string) error {
 	}
 	defer closeStore()
 
-	result, err := syncsvc.NewService(store).SyncSource(context.Background(), *id)
+	resolvedDataDir, err := resolveDataDirFromFlags(*cfgPath, *dataDir)
+	if err != nil {
+		return err
+	}
+	result, err := syncsvc.NewServiceWithOptions(store, syncsvc.ServiceOptions{DataDir: resolvedDataDir}).SyncSource(context.Background(), *id)
 	if err != nil {
 		return err
 	}
@@ -689,6 +700,17 @@ func openStoreFromFlags(cfgPath, dataDir string) (storage.Store, func(), error) 
 			fmt.Fprintf(os.Stderr, "close store: %v\n", err)
 		}
 	}, nil
+}
+
+func resolveDataDirFromFlags(cfgPath, dataDir string) (string, error) {
+	if strings.TrimSpace(dataDir) != "" {
+		return dataDir, nil
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return "", err
+	}
+	return cfg.Server.DataDir, nil
 }
 
 func printJSON(value any) error {

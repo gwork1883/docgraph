@@ -41,7 +41,7 @@ Nodes browse and search the knowledge graph — product, module, document, secti
 - Single Go binary with an embedded Web UI.
 - Local SQLite + FTS5 storage, no external database required. Optional pgvector for hybrid vector search.
 - Connectors for `local`, `git`, `static`, `html`, `sftp`, `confluence`, `openapi`, and `webdocs` sources.
-- MCP tools: `doc_search`, `doc_get_node`, `doc_get_section`, `doc_related`, and `doc_impact`; legacy `doc_context` calls remain compatible but are no longer advertised.
+- MCP tools: `doc_search`, `doc_get_node`, `doc_get_section`, `doc_get_asset_uri`, `doc_related`, and `doc_impact`; legacy `doc_context` calls remain compatible but are no longer advertised.
 - Document-backed knowledge graph with nodes, edges, provenance, sync history, and feedback markers.
 - Hybrid vector search with Reciprocal Rank Fusion (RRF): combines FTS5 text retrieval with pgvector cosine similarity, intent-aware routing for entity/conceptual/general queries.
 - Embedding pipeline with configurable OpenAI-compatible provider, chunking strategies (auto/sentence/fixed), and generator version tracking.
@@ -64,7 +64,7 @@ DocGraph is built for documentation search rather than generic text lookup:
 - Generated retrieval profiles add deterministic tags, keyphrases, aliases, API references, technical terms, and section distribution signals while keeping human-maintained document descriptions separate from sync-generated metadata.
 - Author-written explicit cross-references (e.g., "See also: [Config Guide](../config.md)") are resolved and surfaced as suggested reads alongside knowledge-graph relations.
 - Ranking uses local signals such as canonical document status, title and heading matches, term coverage, profile matches, exact hits, vector similarity, and approved knowledge relations.
-- MCP tools return bounded search summaries first and let agents fetch full sections only when needed, keeping local agent context focused and auditable.
+- MCP tools follow a progressive `doc_search → doc_get_section → doc_get_asset_uri` flow: search and section reads return compact connector-owned asset IDs and MIME types; only the URI tool returns an authenticated download path, and MCP never embeds the binary content.
 
 ## How It Works
 
@@ -160,7 +160,7 @@ stdio mode:
 ./bin/docgraph mcp --data ./.docgraph
 ```
 
-Streamable HTTP is available when `docgraph serve` is running. See [docs/mcp-setup.md](docs/mcp-setup.md) for full setup instructions.
+Streamable HTTP is available when `docgraph serve` is running. When `auth.mode: token` is enabled, `/mcp` and the legacy `/mcp/sse` routes require the same bearer or `X-DocGraph-Token` credential as the REST API. See [docs/mcp-setup.md](docs/mcp-setup.md) for full setup instructions.
 
 ## Runtime Dependencies
 

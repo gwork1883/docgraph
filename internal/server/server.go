@@ -22,6 +22,7 @@ import (
 	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/mcp"
 	"github.com/docgraph/docgraph/internal/query"
+	"github.com/docgraph/docgraph/internal/sourcekind"
 	"github.com/docgraph/docgraph/internal/storage"
 	"github.com/docgraph/docgraph/internal/syncschedule"
 	"github.com/docgraph/docgraph/internal/vectorstore"
@@ -31,6 +32,7 @@ import (
 type Server struct {
 	addr                      string
 	store                     storage.Store
+	blobs                     BlobStore
 	logger                    *slog.Logger
 	auth                      config.AuthConfig
 	webPrefix                 string
@@ -87,6 +89,7 @@ func NewWithAuthAndPrefixAndJobsAndEmbedding(addr string, store storage.Store, l
 	vectorSearchWeight = normalizeVectorSearchWeight(vectorSearchWeight)
 	queryService := query.NewService(store)
 	mcpHandler := mcp.NewHandlerWithEmbeddingAndSearchWeight(queryService, store, embedder, generatorVersion, vectorSearchWeight)
+	mcpHandler.SetAssetURIBasePath(webPrefix)
 	if runtimeSetter, ok := store.(vectorstore.SearchRuntimeSetter); ok && strings.TrimSpace(embedder.Model()) != "" {
 		runtimeSetter.SetVectorSearchRuntime(vectorstore.SearchRuntime{
 			Embedder:         embedder,
@@ -253,8 +256,15 @@ func (s *Server) routes() (http.Handler, error) {
 	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/nodes"), s.handleListSourceNodes)
 	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/edges"), s.handleListSourceEdges)
 	mux.HandleFunc(s.pattern("GET", "/api/documents/{id}"), s.handleGetDocument)
+	mux.HandleFunc(s.pattern("GET", "/api/documents/{id}/outline"), s.handleGetDocumentOutline)
+	mux.HandleFunc(s.pattern("GET", "/api/documents/{id}/media-assets"), s.handleListDocumentMediaAssets)
 	mux.HandleFunc(s.pattern("GET", "/api/documents/{id}/profile"), s.handleGetDocumentProfile)
 	mux.HandleFunc(s.pattern("PUT", "/api/documents/{id}/profile"), s.handleUpdateDocumentProfile)
+	mux.HandleFunc(s.pattern("GET", "/api/sections/{id}"), s.handleGetSection)
+	mux.HandleFunc(s.pattern("GET", "/api/sections/{id}/context"), s.handleGetSectionContext)
+	mux.HandleFunc(s.pattern("GET", "/api/media-assets/{id}"), s.handleGetMediaAsset)
+	mux.HandleFunc(s.pattern("GET", "/api/media-assets/{id}/content"), s.handleGetMediaAssetContent)
+	mux.HandleFunc(s.pattern("GET", "/api/sources/{id}/snapshot"), s.handleGetSourceSnapshot)
 	mux.HandleFunc(s.pattern("POST", "/api/knowledge-relation-proposals"), s.handleCreateKnowledgeRelationProposal)
 	mux.HandleFunc(s.pattern("GET", "/api/knowledge-relation-proposals"), s.handleListKnowledgeRelationProposals)
 	mux.HandleFunc(s.pattern("GET", "/api/knowledge-relation-proposals/{id}"), s.handleGetKnowledgeRelationProposal)
@@ -956,12 +966,7 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func supportedSourceKind(kind string) bool {
-	switch kind {
-	case "local", "static", "sftp", "openapi", "git", "html", "confluence", "webdocs":
-		return true
-	default:
-		return false
-	}
+	return sourcekind.Supported(kind)
 }
 
 func validateSyncSchedule(raw string) error {
@@ -1426,10 +1431,23 @@ func (s *Server) handleListSyncSchedules(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	latestJobs, err := s.store.ListLatestSyncJobs(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	latestJobsBySourceID := make(map[string]storage.SyncJob, len(latestJobs))
+	for _, job := range latestJobs {
+		latestJobsBySourceID[job.SourceID] = job
+	}
 	schedules := make([]syncScheduleResponse, 0, len(sources))
 	now := time.Now()
 	for _, source := range sources {
-		response, err := s.syncScheduleResponse(r.Context(), source, now)
+		var latestJob *storage.SyncJob
+		if job, ok := latestJobsBySourceID[source.ID]; ok {
+			latestJob = &job
+		}
+		response, err := syncScheduleResponseWithLatestJob(source, latestJob, now)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -1535,25 +1553,30 @@ func (s *Server) sourceWithOptionalCredential(ctx context.Context, sourceID stri
 }
 
 func (s *Server) syncScheduleResponse(ctx context.Context, source storage.Source, now time.Time) (syncScheduleResponse, error) {
-	interval, enabled, err := syncschedule.Parse(source.SyncSchedule)
-	if err != nil {
-		return syncScheduleResponse{}, err
-	}
 	jobs, err := s.store.ListSyncJobs(ctx, source.ID, 1)
 	if err != nil {
 		return syncScheduleResponse{}, err
 	}
 	var lastJob *storage.SyncJob
+	if len(jobs) > 0 {
+		lastJob = &jobs[0]
+	}
+	return syncScheduleResponseWithLatestJob(source, lastJob, now)
+}
+
+func syncScheduleResponseWithLatestJob(source storage.Source, lastJob *storage.SyncJob, now time.Time) (syncScheduleResponse, error) {
+	interval, enabled, err := syncschedule.Parse(source.SyncSchedule)
+	if err != nil {
+		return syncScheduleResponse{}, err
+	}
 	var lastRunAt string
 	var nextRunAt string
 	var lastError string
 	inProgress := false
-	if len(jobs) > 0 {
-		job := jobs[0]
-		lastJob = &job
-		inProgress = job.Status == "queued" || job.Status == "running"
-		lastError = strings.TrimSpace(job.LastError)
-		lastRunAt = firstJobTime(job.UpdatedAt, job.CreatedAt)
+	if lastJob != nil {
+		inProgress = lastJob.Status == "queued" || lastJob.Status == "running"
+		lastError = strings.TrimSpace(lastJob.LastError)
+		lastRunAt = firstJobTime(lastJob.UpdatedAt, lastJob.CreatedAt)
 		if enabled && !inProgress {
 			if parsed, ok := parseAPITime(lastRunAt); ok {
 				nextRunAt = parsed.Add(interval).Format(time.RFC3339)
@@ -1716,9 +1739,6 @@ func (s *Server) handleCancelSourceJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobSourceID := job.SourceID
-	if jobSourceID == "" {
-		jobSourceID = sourceIDFromPayload(job.PayloadJSON)
-	}
 	if job.Kind != "sync_source" || jobSourceID != sourceID {
 		writeError(w, http.StatusNotFound, fmt.Errorf("sync job %q not found for source %q", jobID, sourceID))
 		return
@@ -1748,16 +1768,6 @@ func writeCancelJobError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusInternalServerError, err)
-}
-
-func sourceIDFromPayload(payload string) string {
-	var value struct {
-		SourceID string `json:"source_id"`
-	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(payload)), &value); err != nil {
-		return ""
-	}
-	return strings.TrimSpace(value.SourceID)
 }
 
 func (s *Server) handleListSourceArtifacts(w http.ResponseWriter, r *http.Request) {
@@ -1948,7 +1958,6 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("query is required"))
 		return
 	}
-
 	start := time.Now()
 	useRelationExpansion := true
 	if req.UseRelationExpansion != nil {

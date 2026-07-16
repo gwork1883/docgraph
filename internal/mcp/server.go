@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 
 	"github.com/docgraph/docgraph/internal/embedding"
+	"github.com/docgraph/docgraph/internal/ids"
 	"github.com/docgraph/docgraph/internal/query"
 	"github.com/docgraph/docgraph/internal/storage"
 	"github.com/docgraph/docgraph/internal/vectorstore"
@@ -18,6 +20,7 @@ import (
 type Handler struct {
 	query                     *query.Service
 	store                     storage.Store
+	assetURIBasePath          string
 	embedder                  embedding.Embedder
 	embeddingGeneratorVersion string
 	vectorSearchWeight        float64
@@ -49,6 +52,12 @@ func normalizeVectorSearchWeight(weight float64) float64 {
 		return 1
 	}
 	return weight
+}
+
+func (h *Handler) SetAssetURIBasePath(webPrefix string) {
+	if h != nil {
+		h.assetURIBasePath = normalizedAssetURIBasePath(webPrefix)
+	}
 }
 
 // Handle dispatches a single JSON-RPC request and returns the response.
@@ -98,6 +107,12 @@ func NewServerWithStoreAndEmbeddingAndPlan(queryService *query.Service, store st
 	return &Server{handler: NewHandlerWithEmbeddingAndSearchWeight(queryService, store, embedder, generatorVersion, vectorSearchWeight), in: in, out: out}
 }
 
+func (s *Server) SetAssetURIBasePath(webPrefix string) {
+	if s != nil && s.handler != nil {
+		s.handler.SetAssetURIBasePath(webPrefix)
+	}
+}
+
 type Request struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -123,7 +138,7 @@ const (
 )
 
 const (
-	docGraphInstructions = "DocGraph is a local documentation knowledge server. Start with doc_search detail='summary' to discover relevant sections, then call doc_get_section for selected section IDs. Preserve the user's language and exact terms in search intents and queries; do not translate non-English issues into English-only queries. For troubleshooting, narrow the issue intent and evidence chain before searching, and treat keyword-only matches as peripheral unless they directly support the chain. Prompt template: doc_answer."
+	docGraphInstructions = "DocGraph is a local documentation knowledge server. Start with doc_search detail='summary' to discover relevant sections, then call doc_get_section for selected section IDs. Asset summaries include stable IDs and MIME types without binary content; call doc_get_asset_uri only when an authenticated download URI is needed for one selected asset. Preserve the user's language and exact terms in search intents and queries; do not translate non-English issues into English-only queries. For troubleshooting, narrow the issue intent and evidence chain before searching, and treat keyword-only matches as peripheral unless they directly support the chain. Prompt template: doc_answer."
 
 	troubleshootingSearchPromptName = "doc_answer"
 	troubleshootingSearchPromptDesc = "Use DocGraph's local documentation knowledge base to answer a question or build a troubleshooting path from indexed docs."
@@ -241,6 +256,40 @@ type promptGetParams struct {
 	Arguments map[string]any `json:"arguments"`
 }
 
+type sectionToolResult struct {
+	storage.SectionContent
+	NodeID               string                      `json:"node_id,omitempty"`
+	ElementKind          string                      `json:"element_kind,omitempty"`
+	DisplayNumber        string                      `json:"display_number,omitempty"`
+	Ancestry             []storage.SectionSummary    `json:"ancestry,omitempty"`
+	Children             []storage.SectionSummary    `json:"children,omitempty"`
+	ChildrenPage         storage.DocumentOutline     `json:"children_page"`
+	MediaAssets          []storage.MediaAssetSummary `json:"media_assets,omitempty"`
+	MediaAssetsTotal     int                         `json:"media_assets_total"`
+	MediaAssetsTruncated bool                        `json:"media_assets_truncated"`
+	AuthoredRelations    []storage.RelatedNode       `json:"authored_relations,omitempty"`
+	Snapshot             *storage.SourceSnapshot     `json:"snapshot,omitempty"`
+	Document             *storage.DocumentSummary    `json:"document,omitempty"`
+	Source               *sectionSourceEvidence      `json:"source,omitempty"`
+	Provenance           query.ContextProvenance     `json:"provenance"`
+}
+
+type sectionSourceEvidence struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+const (
+	maxMCPSectionAuthoredRelations = 20
+	defaultMCPMediaPerResult       = 3
+	maxMCPMediaPerResult           = 10
+	defaultMCPMediaTotal           = 24
+	maxMCPMediaTotal               = 60
+	defaultMCPSectionAssets        = 20
+	maxMCPSectionAssets            = 100
+)
+
 func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, error) {
 	var call toolCallParams
 	if err := json.Unmarshal(params, &call); err != nil {
@@ -251,18 +300,21 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 	switch call.Name {
 	case "doc_search":
 		var args struct {
-			Query                  string   `json:"query"`
-			Limit                  int      `json:"limit"`
-			MaxSearches            int      `json:"max_searches"`
-			MaxResults             int      `json:"max_results"`
-			MaxSectionsPerDocument int      `json:"max_sections_per_document"`
-			ProfileDetail          string   `json:"profile_detail"`
-			MaxCharsPerResult      int      `json:"max_chars_per_result"`
-			Detail                 string   `json:"detail"`
-			UseRelationExpansion   *bool    `json:"use_relation_expansion"`
-			RelationTypes          []string `json:"relation_types"`
-			ExactTerms             []string `json:"exact_terms"`
-			SemanticIntents        []string `json:"semantic_intents"`
+			Query                   string   `json:"query"`
+			Limit                   int      `json:"limit"`
+			MaxSearches             int      `json:"max_searches"`
+			MaxResults              int      `json:"max_results"`
+			MaxSectionsPerDocument  int      `json:"max_sections_per_document"`
+			ProfileDetail           string   `json:"profile_detail"`
+			MaxCharsPerResult       int      `json:"max_chars_per_result"`
+			MaxMediaAssetsPerResult int      `json:"max_media_assets_per_result"`
+			MaxMediaAssetsTotal     int      `json:"max_media_assets_total"`
+			MediaDetail             string   `json:"media_detail"`
+			Detail                  string   `json:"detail"`
+			UseRelationExpansion    *bool    `json:"use_relation_expansion"`
+			RelationTypes           []string `json:"relation_types"`
+			ExactTerms              []string `json:"exact_terms"`
+			SemanticIntents         []string `json:"semantic_intents"`
 		}
 		if err := json.Unmarshal(call.Arguments, &args); err != nil {
 			return nil, fmt.Errorf("invalid doc_search arguments: %w", err)
@@ -279,6 +331,10 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 		if args.UseRelationExpansion != nil {
 			useRelationExpansion = *args.UseRelationExpansion
 		}
+		mediaDetail := strings.ToLower(strings.TrimSpace(args.MediaDetail))
+		if mediaDetail != "none" {
+			mediaDetail = "compact"
+		}
 		opts := storage.SearchOptions{
 			Query:                     args.Query,
 			Limit:                     clampBudget(maxResults, 8, 30),
@@ -286,6 +342,9 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 			MaxSectionsPerDocument:    clampBudget(args.MaxSectionsPerDocument, 2, 5),
 			ProfileDetail:             strings.TrimSpace(args.ProfileDetail),
 			MaxCharsPerResult:         clampBudget(args.MaxCharsPerResult, 1000, 4000),
+			MaxMediaAssetsPerResult:   clampBudget(args.MaxMediaAssetsPerResult, defaultMCPMediaPerResult, maxMCPMediaPerResult),
+			MaxMediaAssetsTotal:       clampBudget(args.MaxMediaAssetsTotal, defaultMCPMediaTotal, maxMCPMediaTotal),
+			MediaDetail:               mediaDetail,
 			Detail:                    detail,
 			UseRelationExpansion:      useRelationExpansion,
 			RelationDepth:             1,
@@ -393,7 +452,8 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 			return nil, fmt.Errorf("graph storage is not configured")
 		}
 		var args struct {
-			ID string `json:"id"`
+			ID        string `json:"id"`
+			MaxAssets int    `json:"max_assets"`
 		}
 		if err := json.Unmarshal(call.Arguments, &args); err != nil {
 			return nil, fmt.Errorf("invalid doc_get_section arguments: %w", err)
@@ -402,11 +462,37 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 		if id == "" {
 			return nil, fmt.Errorf("id is required")
 		}
-		section, err := h.store.GetSection(ctx, id)
+		section, err := h.sectionEvidence(ctx, id, clampBudget(args.MaxAssets, defaultMCPSectionAssets, maxMCPSectionAssets))
 		if err != nil {
 			return nil, err
 		}
 		return toolResult(section), nil
+	case "doc_get_asset_uri":
+		if h.store == nil {
+			return nil, fmt.Errorf("asset storage is not configured")
+		}
+		var args struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(call.Arguments, &args); err != nil {
+			return nil, fmt.Errorf("invalid doc_get_asset_uri arguments: %w", err)
+		}
+		id := strings.TrimSpace(args.ID)
+		if id == "" {
+			return nil, fmt.Errorf("id is required")
+		}
+		mediaStore, ok := h.store.(storage.MediaStore)
+		if !ok {
+			return nil, fmt.Errorf("associated assets are not supported by this storage backend")
+		}
+		asset, err := mediaStore.GetMediaAsset(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("get asset %q: %w", id, err)
+		}
+		if strings.TrimSpace(asset.BlobSHA256) == "" {
+			return nil, fmt.Errorf("asset %q has no preserved content (status %s)", id, firstNonEmptyString(asset.Status, "unavailable"))
+		}
+		return toolResult(h.assetURIResult(asset)), nil
 	case "doc_propose_relation":
 		if h.store == nil {
 			return nil, fmt.Errorf("graph storage is not configured")
@@ -503,6 +589,145 @@ func callTool(ctx context.Context, h *Handler, params json.RawMessage) (any, err
 	default:
 		return nil, fmt.Errorf("unknown tool %q", call.Name)
 	}
+}
+
+func (h *Handler) sectionEvidence(ctx context.Context, id string, maxAssets int) (sectionToolResult, error) {
+	section, err := h.store.GetSection(ctx, id)
+	if err != nil {
+		return sectionToolResult{}, err
+	}
+	media, mediaTotal, mediaTruncated := boundedCompactMediaAssetSummaries(section.MediaAssets, maxAssets)
+	result := sectionToolResult{
+		SectionContent:       section,
+		MediaAssets:          media,
+		MediaAssetsTotal:     mediaTotal,
+		MediaAssetsTruncated: mediaTruncated,
+		Provenance: query.ContextProvenance{
+			DocumentID: section.DocumentID,
+			SectionID:  section.SectionID,
+		},
+	}
+	if contextStore, ok := h.store.(storage.SectionContextStore); ok {
+		detail, err := contextStore.GetSectionContext(ctx, id, 100)
+		if err != nil {
+			return sectionToolResult{}, err
+		}
+		result.SectionContent = detail.Section
+		result.Ancestry = detail.Ancestors
+		result.Children = detail.Children
+		result.ChildrenPage = detail.ChildrenPage
+		result.MediaAssets, result.MediaAssetsTotal, result.MediaAssetsTruncated = boundedCompactMediaAssetSummaries(detail.MediaAssets, maxAssets)
+		result.AuthoredRelations = boundedSectionRelations(detail.AuthoredRelations, maxMCPSectionAuthoredRelations)
+		result.Snapshot = detail.Snapshot
+		if detail.Structure != nil {
+			result.ElementKind = detail.Structure.ElementKind
+			result.DisplayNumber = detail.Structure.DisplayNumber
+			result.Provenance.SourceElementID = detail.Structure.SourceElementID
+		}
+		if detail.Snapshot != nil {
+			result.Provenance.SourceID = detail.Snapshot.SourceID
+			result.Provenance.SnapshotID = detail.Snapshot.ID
+			result.Provenance.SnapshotHash = detail.Snapshot.SourceHash
+			result.Provenance.FormatFamily = detail.Snapshot.FormatFamily
+			result.Provenance.FormatVersion = detail.Snapshot.FormatVersion
+		}
+	}
+	result.NodeID = currentSectionNodeID(result.SectionID, result.AuthoredRelations)
+	result.Provenance.NodeID = result.NodeID
+	if result.ElementKind == "" && result.Structure != nil {
+		result.ElementKind = result.Structure.ElementKind
+	}
+	if result.DisplayNumber == "" && result.Structure != nil {
+		result.DisplayNumber = result.Structure.DisplayNumber
+	}
+	if doc, err := h.store.GetDocument(ctx, result.DocumentID); err == nil {
+		result.Document = &doc
+		result.Provenance.SourceID = firstNonEmptyString(result.Provenance.SourceID, doc.SourceID)
+		if source, err := h.store.GetSource(ctx, doc.SourceID); err == nil {
+			result.Source = &sectionSourceEvidence{ID: source.ID, Kind: source.Kind, Name: source.Name}
+		}
+	}
+	return result, nil
+}
+
+func boundedCompactMediaAssetSummaries(assets []storage.MediaAssetSummary, limit int) ([]storage.MediaAssetSummary, int, bool) {
+	total := len(assets)
+	if limit > 0 && len(assets) > limit {
+		assets = assets[:limit]
+	}
+	if len(assets) == 0 {
+		return assets, total, total > len(assets)
+	}
+	compact := make([]storage.MediaAssetSummary, len(assets))
+	copy(compact, assets)
+	for i := range compact {
+		compact[i].MetadataJSON = ""
+		compact[i].ReferenceMetadataJSON = ""
+	}
+	return compact, total, total > len(compact)
+}
+
+func (h *Handler) assetURIResult(asset storage.MediaAsset) map[string]any {
+	return map[string]any{
+		"asset_id":      asset.ID,
+		"kind":          asset.Kind,
+		"mime_type":     firstNonEmptyString(asset.MediaType, "application/octet-stream"),
+		"original_name": asset.OriginalName,
+		"size_bytes":    asset.SizeBytes,
+		"download_uri":  h.assetContentURI(asset.ID),
+		"auth":          "same_as_docgraph",
+	}
+}
+
+func normalizedAssetURIBasePath(webPrefix string) string {
+	prefix := strings.Trim(strings.TrimSpace(webPrefix), "/")
+	if prefix == "" {
+		return "/api/media-assets"
+	}
+	return "/" + prefix + "/api/media-assets"
+}
+
+func (h *Handler) assetContentURI(assetID string) string {
+	base := strings.TrimRight(h.assetURIBasePath, "/")
+	if base == "" {
+		base = normalizedAssetURIBasePath("")
+	}
+	return base + "/" + url.PathEscape(strings.TrimSpace(assetID)) + "/content"
+}
+
+func boundedSectionRelations(relations []storage.RelatedNode, limit int) []storage.RelatedNode {
+	if limit <= 0 || len(relations) <= limit {
+		return relations
+	}
+	return relations[:limit]
+}
+
+func currentSectionNodeID(sectionID string, relations []storage.RelatedNode) string {
+	for _, relation := range relations {
+		switch relation.Direction {
+		case "out":
+			if relation.Edge.SrcID != "" {
+				return relation.Edge.SrcID
+			}
+		case "in":
+			if relation.Edge.DstID != "" {
+				return relation.Edge.DstID
+			}
+		}
+	}
+	if strings.TrimSpace(sectionID) == "" {
+		return ""
+	}
+	return ids.Stable("node", "section", sectionID)
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (h *Handler) queryEmbedding(ctx context.Context, queryText string, intents []string, enabled bool) ([]float32, string, error) {
@@ -631,8 +856,9 @@ func troubleshootingSearchPromptText(issue string) string {
 		"4. Search with exact user-provided terms first, then add maintainer-facing terminology only as supplemental aliases.\n" +
 		"5. Start with doc_search detail='summary' to scan matching sections and next-read signals.\n" +
 		"6. Fetch selected sections with doc_get_section before relying on detailed claims.\n" +
-		"7. Build the answer from evidence directly tied to the chain.\n" +
-		"8. Downgrade keyword-only matches to peripheral notes unless they directly support the chain."
+		"7. If the selected section has an associated asset that must be displayed or analyzed, resolve its download_uri by ID with doc_get_asset_uri.\n" +
+		"8. Build the answer from evidence directly tied to the chain.\n" +
+		"9. Downgrade keyword-only matches to peripheral notes unless they directly support the chain."
 }
 
 func tools() []map[string]any {
@@ -640,7 +866,7 @@ func tools() []map[string]any {
 		{
 			"name": "doc_search",
 			"description": "Search indexed local documentation with hybrid retrieval over Chinese terms, technical symbols, identifier subterms, Unicode FTS, trigram matching, profile fallback, substring fallback, and maintained terminology dictionaries. When vector search is enabled, results also include semantic vector candidates fused via intent-adaptive RRF. " +
-				"Default detail='summary' returns section IDs, titles, heading paths, snippets, suggested_reads.explicit_references, and hit metadata (plus hybrid diagnostics when vector search is enabled); use detail='content' for one-shot full text or call doc_get_section for selected section IDs. " +
+				"Default detail='summary' returns section IDs, Topic node/element/display metadata, bounded compact associated-asset summaries with stable IDs and MIME types, snippets, suggested_reads.explicit_references, bounded suggested_reads.authored_relations kept separate from curated_relations, and other hit metadata (plus hybrid diagnostics when vector search is enabled); use detail='content' for one-shot full text or call doc_get_section for selected section IDs. Asset summaries never embed binary content or download URIs; call doc_get_asset_uri only for one selected asset. " +
 				"Preserve product names, business terms, config keys, schema fields, enum values, API names, paths, and code symbols verbatim; add clear aliases or module names only when they clarify intent. " +
 				"For troubleshooting, search with a concise issue intent plus exact user-provided terms; prefer evidence directly tied to the issue chain over keyword-only matches.",
 			"annotations": map[string]any{
@@ -689,6 +915,23 @@ func tools() []map[string]any {
 						"maximum":     4000,
 						"description": "Maximum characters of section content per result. Only applies when detail='content'. Increase this (up to 4000) for more detailed content. Default 1000.",
 					},
+					"max_media_assets_per_result": map[string]any{
+						"type":        "integer",
+						"minimum":     1,
+						"maximum":     maxMCPMediaPerResult,
+						"description": "Maximum compact media summaries returned for one search result. Default 3, hard maximum 10. The response includes the true per-result media_assets_total and media_assets_truncated flag.",
+					},
+					"max_media_assets_total": map[string]any{
+						"type":        "integer",
+						"minimum":     1,
+						"maximum":     maxMCPMediaTotal,
+						"description": "Maximum compact media summaries across the entire search response, allocated in hit-rank order. Default 24, hard maximum 60.",
+					},
+					"media_detail": map[string]any{
+						"type":        "string",
+						"enum":        []string{"none", "compact"},
+						"description": "Media output detail. 'compact' (default) returns bounded identity/type/status summaries without raw metadata JSON; 'none' returns counts and truncation metadata only.",
+					},
 					"detail": map[string]any{
 						"type":        "string",
 						"enum":        []string{"summary", "content"},
@@ -700,8 +943,8 @@ func tools() []map[string]any {
 					},
 					"exact_terms": map[string]any{
 						"type":        "array",
-						"items":       map[string]any{"type": "string"},
-						"description": "Must-keep exact terms such as API paths, config keys, error codes, symbols, or identifiers. They continue through exact/lexical search even when semantic intents are supplied.",
+						"items":       map[string]any{"type": "string", "minLength": 1},
+						"description": "Must-keep exact terms such as API paths, config keys, error codes, symbols, or identifiers. They continue through exact/lexical search even when semantic intents are supplied, including one- and two-character substrings.",
 					},
 					"semantic_intents": map[string]any{
 						"type":        "array",
@@ -816,7 +1059,8 @@ func tools() []map[string]any {
 		{
 			"name": "doc_get_section",
 			"description": "Retrieve the full text content of a specific documentation section by its section_id. " +
-				"Returns the complete section content with document title, heading path, source URL, and explicit author-written references. " +
+				"Returns the complete section content with document title, heading path, source URL, Topic node/element/display metadata, ordered ancestry and children, compact connector-owned asset summaries, source-authored relations, snapshot provenance, and explicit author-written references. " +
+				"Associated images and attachments are represented by stable asset IDs and MIME types without binary bytes, download URIs, or connector metadata; call doc_get_asset_uri only when one selected asset needs an authenticated download URI. " +
 				"It does not automatically read referenced target sections.\n\n" +
 				"Use this tool when:\n" +
 				"- You have a section_id from a previous doc_search (summary mode) result and need the full content\n" +
@@ -829,6 +1073,30 @@ func tools() []map[string]any {
 					"id": map[string]any{
 						"type":        "string",
 						"description": "Section ID from a previous doc_search result or suggested read",
+					},
+					"max_assets": map[string]any{
+						"type":        "integer",
+						"minimum":     1,
+						"maximum":     maxMCPSectionAssets,
+						"description": "Maximum compact associated-asset summaries to return. Default 20, hard maximum 100. The response reports media_assets_total and media_assets_truncated.",
+					},
+				},
+				"required": []string{"id"},
+			},
+		},
+		{
+			"name":        "doc_get_asset_uri",
+			"description": "Resolve one connector-owned associated asset by its stable asset ID. Returns compact metadata including MIME type and a prefix-aware authenticated REST download_uri; it never embeds binary content, accepts filesystem paths, exposes tokens, or fetches from the upstream connector. Resolve the root-relative URI against the DocGraph HTTP server and reuse the same Bearer or X-DocGraph-Token credential when token authentication is enabled.",
+			"annotations": map[string]any{
+				"readOnlyHint":  true,
+				"openWorldHint": false,
+			},
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{
+						"type":        "string",
+						"description": "Stable opaque asset ID from a doc_search or doc_get_section media_assets entry",
 					},
 				},
 				"required": []string{"id"},

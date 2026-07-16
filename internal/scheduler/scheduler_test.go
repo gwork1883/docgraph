@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/docgraph/docgraph/internal/domain"
+	"github.com/docgraph/docgraph/internal/storage"
 	"github.com/docgraph/docgraph/internal/storage/sqlite"
 )
 
@@ -78,6 +79,41 @@ func TestRunOnceSkipsPausedAndRunningSources(t *testing.T) {
 	}
 }
 
+func TestRunOnceLoadsLatestSyncJobsInOneBatch(t *testing.T) {
+	ctx := context.Background()
+	store := openSchedulerStore(t, ctx)
+	docsDir := t.TempDir()
+	for _, source := range []domain.Source{
+		{ID: "src_batch_due_a", Kind: "local", Name: "Batch Due A", DSN: docsDir, SyncSchedule: "hourly"},
+		{ID: "src_batch_due_b", Kind: "local", Name: "Batch Due B", DSN: docsDir, SyncSchedule: "daily"},
+	} {
+		if _, err := store.CreateSource(ctx, source); err != nil {
+			t.Fatalf("CreateSource(%s) returned error: %v", source.ID, err)
+		}
+	}
+	countingStore := &syncJobCountingStore{Store: store}
+	newTestRunner(countingStore).RunOnce(ctx)
+	if countingStore.listLatestCalls != 1 || countingStore.listCalls != 0 {
+		t.Fatalf("sync job reads = latest:%d list:%d, want one batch latest and no per-source lists", countingStore.listLatestCalls, countingStore.listCalls)
+	}
+}
+
+type syncJobCountingStore struct {
+	storage.Store
+	listCalls       int
+	listLatestCalls int
+}
+
+func (s *syncJobCountingStore) ListSyncJobs(ctx context.Context, sourceID string, limit int) ([]storage.SyncJob, error) {
+	s.listCalls++
+	return s.Store.ListSyncJobs(ctx, sourceID, limit)
+}
+
+func (s *syncJobCountingStore) ListLatestSyncJobs(ctx context.Context) ([]storage.SyncJob, error) {
+	s.listLatestCalls++
+	return s.Store.ListLatestSyncJobs(ctx)
+}
+
 func openSchedulerStore(t *testing.T, ctx context.Context) *sqlite.Store {
 	t.Helper()
 	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
@@ -95,7 +131,7 @@ func openSchedulerStore(t *testing.T, ctx context.Context) *sqlite.Store {
 	return store
 }
 
-func newTestRunner(store *sqlite.Store) *Runner {
+func newTestRunner(store storage.Store) *Runner {
 	runner := NewRunner(store, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	runner.now = func() time.Time { return time.Now().Add(time.Hour) }
 	return runner

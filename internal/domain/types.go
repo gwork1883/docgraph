@@ -77,9 +77,25 @@ type JobListOptions struct {
 }
 
 type ResultPayload struct {
-	Documents         int               `json:"documents"`
-	EntityDiagnostics EntityDiagnostics `json:"entity_diagnostics,omitempty"`
-	BrokenLinks       []BrokenLink      `json:"broken_links,omitempty"`
+	Documents            int                   `json:"documents"`
+	EntityDiagnostics    EntityDiagnostics     `json:"entity_diagnostics,omitempty"`
+	BrokenLinks          []BrokenLink          `json:"broken_links,omitempty"`
+	ConnectorDiagnostics *ConnectorDiagnostics `json:"connector_diagnostics,omitempty"`
+}
+
+type ConnectorDiagnostics struct {
+	ParseStatus      string                  `json:"parse_status,omitempty"`
+	FormatFamily     string                  `json:"format_family,omitempty"`
+	FormatVersion    string                  `json:"format_version,omitempty"`
+	SnapshotID       string                  `json:"snapshot_id,omitempty"`
+	SnapshotHash     string                  `json:"snapshot_hash,omitempty"`
+	Sheets           int                     `json:"sheets,omitempty"`
+	Topics           int                     `json:"topics,omitempty"`
+	AuthoredEdges    int                     `json:"authored_edges,omitempty"`
+	MediaAssets      int                     `json:"media_assets,omitempty"`
+	MediaBytes       int64                   `json:"media_bytes,omitempty"`
+	FeatureInventory []FeatureInventoryEntry `json:"feature_inventory,omitempty"`
+	Warnings         []string                `json:"warnings,omitempty"`
 }
 
 type BrokenLink struct {
@@ -91,23 +107,196 @@ type BrokenLink struct {
 }
 
 type DocumentInput struct {
-	ID          string
-	SourceID    string
-	ExternalID  string
-	Title       string
-	URL         string
-	Version     string
-	ContentHash string
+	ID           string
+	SourceID     string
+	ExternalID   string
+	Title        string
+	URL          string
+	Version      string
+	ContentHash  string
+	MetadataJSON string
 }
 
 type SectionInput struct {
-	ID          string
-	DocumentID  string
-	HeadingPath string
-	Title       string
-	Content     string
-	ContentHash string
-	Ordinal     int
+	ID           string
+	DocumentID   string
+	HeadingPath  string
+	Title        string
+	Content      string
+	SearchText   string
+	ContentHash  string
+	Ordinal      int
+	MetadataJSON string
+	Structure    *SectionStructureInput
+}
+
+type SectionStructureInput struct {
+	ParentSectionID  string
+	SourceElementID  string
+	ElementKind      string
+	Depth            int
+	SiblingOrdinal   int
+	OrderPath        []int
+	DisplayNumber    string
+	PresentationJSON string
+}
+
+type SectionStructure struct {
+	SectionID        string `json:"section_id"`
+	DocumentID       string `json:"document_id"`
+	ParentSectionID  string `json:"parent_section_id,omitempty"`
+	SourceElementID  string `json:"source_element_id"`
+	ElementKind      string `json:"element_kind"`
+	Depth            int    `json:"depth"`
+	SiblingOrdinal   int    `json:"sibling_ordinal"`
+	OrderPath        []int  `json:"order_path"`
+	DisplayNumber    string `json:"display_number,omitempty"`
+	PresentationJSON string `json:"presentation_json"`
+}
+
+type WorkbookDocumentInput struct {
+	Document DocumentInput
+	Sections []SectionInput
+}
+
+type MediaBlobInput struct {
+	SHA256           string
+	SizeBytes        int64
+	SniffedMediaType string
+	StorageKey       string
+}
+
+type MediaBlob struct {
+	SHA256           string `json:"sha256"`
+	SizeBytes        int64  `json:"size_bytes"`
+	SniffedMediaType string `json:"sniffed_media_type"`
+	StorageKey       string `json:"storage_key"`
+	CreatedAt        string `json:"created_at"`
+}
+
+type SourceSnapshotInput struct {
+	ID                string
+	SourceID          string
+	SourceHash        string
+	BlobSHA256        string
+	FormatFamily      string
+	FormatVersion     string
+	SemanticHash      string
+	MediaManifestHash string
+	MetadataJSON      string
+}
+
+type SourceSnapshot struct {
+	ID                string `json:"id"`
+	SourceID          string `json:"source_id"`
+	SourceHash        string `json:"source_hash"`
+	BlobSHA256        string `json:"blob_sha256"`
+	FormatFamily      string `json:"format_family"`
+	FormatVersion     string `json:"format_version"`
+	SemanticHash      string `json:"semantic_hash"`
+	MediaManifestHash string `json:"media_manifest_hash"`
+	MetadataJSON      string `json:"metadata_json"`
+	Active            bool   `json:"active"`
+	CreatedAt         string `json:"created_at"`
+}
+
+type MediaAssetInput struct {
+	ID           string
+	SourceID     string
+	SnapshotID   string
+	DocumentID   string
+	ExternalID   string
+	BlobSHA256   string
+	Kind         string
+	OriginalName string
+	MediaType    string
+	SizeBytes    int64
+	Status       string
+	MetadataJSON string
+}
+
+type MediaAsset struct {
+	ID           string `json:"id"`
+	SourceID     string `json:"source_id"`
+	SnapshotID   string `json:"snapshot_id"`
+	DocumentID   string `json:"document_id"`
+	ExternalID   string `json:"external_id"`
+	BlobSHA256   string `json:"blob_sha256,omitempty"`
+	Kind         string `json:"kind"`
+	OriginalName string `json:"original_name"`
+	MediaType    string `json:"media_type"`
+	SizeBytes    int64  `json:"size_bytes"`
+	Status       string `json:"status"`
+	MetadataJSON string `json:"metadata_json"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
+}
+
+type MediaAssetSummary struct {
+	ID                    string `json:"id"`
+	Kind                  string `json:"kind"`
+	OriginalName          string `json:"original_name"`
+	MediaType             string `json:"media_type"`
+	SizeBytes             int64  `json:"size_bytes"`
+	Status                string `json:"status"`
+	Role                  string `json:"role,omitempty"`
+	Ordinal               int    `json:"ordinal,omitempty"`
+	MetadataJSON          string `json:"metadata_json,omitempty"`
+	ReferenceMetadataJSON string `json:"reference_metadata_json,omitempty"`
+}
+
+type SectionMediaRefInput struct {
+	SectionID    string
+	AssetID      string
+	Role         string
+	Ordinal      int
+	MetadataJSON string
+}
+
+type SectionNodeInput struct {
+	SectionID  string
+	NodeID     string
+	Role       string
+	Confidence float64
+}
+
+type FeatureInventoryInput struct {
+	ID             string
+	SnapshotID     string
+	FeatureKey     string
+	CoverageStatus string
+	ElementPath    string
+	Count          int
+	MetadataJSON   string
+}
+
+type FeatureInventoryEntry struct {
+	ID             string `json:"id"`
+	SnapshotID     string `json:"snapshot_id"`
+	FeatureKey     string `json:"feature_key"`
+	CoverageStatus string `json:"coverage_status"`
+	ElementPath    string `json:"element_path,omitempty"`
+	Count          int    `json:"count"`
+	MetadataJSON   string `json:"metadata_json"`
+}
+
+type WorkbookBundle struct {
+	SourceID         string
+	WorkbookKey      string
+	Snapshot         SourceSnapshotInput
+	Documents        []WorkbookDocumentInput
+	Nodes            []NodeInput
+	Edges            []EdgeInput
+	SectionNodes     []SectionNodeInput
+	Blobs            []MediaBlobInput
+	MediaAssets      []MediaAssetInput
+	MediaRefs        []SectionMediaRefInput
+	FeatureInventory []FeatureInventoryInput
+}
+
+type WorkbookReplaceResult struct {
+	ActiveSnapshotID string   `json:"active_snapshot_id"`
+	StaleSectionIDs  []string `json:"stale_section_ids,omitempty"`
 }
 
 type DocumentProfile struct {
@@ -190,30 +379,39 @@ type EntityDiagnostics struct {
 }
 
 type SearchHit struct {
-	SectionID              string            `json:"section_id"`
-	DocumentID             string            `json:"document_id"`
-	SourceID               string            `json:"source_id,omitempty"`
-	DocumentTitle          string            `json:"document_title"`
-	DocumentURL            string            `json:"document_url"`
-	ContentHash            string            `json:"content_hash,omitempty"`
-	Desc                   string            `json:"desc,omitempty"`
-	Canonical              bool              `json:"canonical"`
-	Title                  string            `json:"title"`
-	HeadingPath            string            `json:"heading_path"`
-	Content                string            `json:"content,omitempty"`
-	Snippet                string            `json:"snippet"`
-	Rank                   float64           `json:"rank"`
-	HasExplicitReferences  bool              `json:"has_explicit_references"`
-	ExplicitReferenceCount int               `json:"explicit_reference_count"`
-	Profile                *SearchHitProfile `json:"profile,omitempty"`
-	RetrievalProfile       any               `json:"retrieval_profile,omitempty"`
-	QueryMatch             *QueryMatch       `json:"query_match,omitempty"`
-	ScoreBreakdown         *ScoreBreakdown   `json:"score_breakdown,omitempty"`
-	MatchedEntities        []MatchedEntity   `json:"matched_entities,omitempty"`
-	RelationMatches        []RelationMatch   `json:"relation_matches,omitempty"`
-	EvidenceLevel          string            `json:"evidence_level,omitempty"`
-	Trace                  *SearchHitTrace   `json:"trace,omitempty"`
-	RRFContribution        *RRFContribution  `json:"rrf_contribution,omitempty"`
+	SectionID              string              `json:"section_id"`
+	NodeID                 string              `json:"node_id,omitempty"`
+	DocumentID             string              `json:"document_id"`
+	SourceID               string              `json:"source_id,omitempty"`
+	DocumentTitle          string              `json:"document_title"`
+	DocumentURL            string              `json:"document_url"`
+	ContentHash            string              `json:"content_hash,omitempty"`
+	Desc                   string              `json:"desc,omitempty"`
+	Canonical              bool                `json:"canonical"`
+	Title                  string              `json:"title"`
+	ElementKind            string              `json:"element_kind,omitempty"`
+	DisplayNumber          string              `json:"display_number,omitempty"`
+	HeadingPath            string              `json:"heading_path"`
+	Ancestry               []SectionBreadcrumb `json:"ancestry,omitempty"`
+	MediaAssets            []MediaAssetSummary `json:"media_assets,omitempty"`
+	MediaAssetsTotal       int                 `json:"media_assets_total"`
+	MediaAssetsTruncated   bool                `json:"media_assets_truncated"`
+	AuthoredRelationCount  int                 `json:"authored_relation_count,omitempty"`
+	EvidenceKind           string              `json:"evidence_kind,omitempty"`
+	Content                string              `json:"content,omitempty"`
+	Snippet                string              `json:"snippet"`
+	Rank                   float64             `json:"rank"`
+	HasExplicitReferences  bool                `json:"has_explicit_references"`
+	ExplicitReferenceCount int                 `json:"explicit_reference_count"`
+	Profile                *SearchHitProfile   `json:"profile,omitempty"`
+	RetrievalProfile       any                 `json:"retrieval_profile,omitempty"`
+	QueryMatch             *QueryMatch         `json:"query_match,omitempty"`
+	ScoreBreakdown         *ScoreBreakdown     `json:"score_breakdown,omitempty"`
+	MatchedEntities        []MatchedEntity     `json:"matched_entities,omitempty"`
+	RelationMatches        []RelationMatch     `json:"relation_matches,omitempty"`
+	EvidenceLevel          string              `json:"evidence_level,omitempty"`
+	Trace                  *SearchHitTrace     `json:"trace,omitempty"`
+	RRFContribution        *RRFContribution    `json:"rrf_contribution,omitempty"`
 }
 
 type SearchHitTrace struct {
@@ -282,6 +480,9 @@ type SearchOptions struct {
 	MaxSectionsPerDocument    int
 	ProfileDetail             string
 	MaxCharsPerResult         int
+	MaxMediaAssetsPerResult   int
+	MaxMediaAssetsTotal       int
+	MediaDetail               string // "full" (legacy), "compact", or "none"
 	Detail                    string // "summary" (default) or "content"
 	UseRelationExpansion      bool
 	RelationDepth             int
@@ -404,6 +605,7 @@ type EmbeddingSection struct {
 	HeadingPath   string
 	Title         string
 	Content       string
+	SearchText    string
 	ContentHash   string
 }
 
@@ -416,12 +618,22 @@ type SearchAttempt struct {
 }
 
 type SearchResult struct {
-	Query            string            `json:"query"`
-	SearchesUsed     int               `json:"searches_used"`
-	Attempts         []SearchAttempt   `json:"attempts"`
-	Hits             []SearchHit       `json:"hits"`
-	SuggestedReads   SuggestedReads    `json:"suggested_reads"`
-	HybridSearchMeta *HybridSearchMeta `json:"hybrid_search_meta,omitempty"`
+	Query            string              `json:"query"`
+	SearchesUsed     int                 `json:"searches_used"`
+	Attempts         []SearchAttempt     `json:"attempts"`
+	Hits             []SearchHit         `json:"hits"`
+	MediaSummary     *SearchMediaSummary `json:"media_summary,omitempty"`
+	SuggestedReads   SuggestedReads      `json:"suggested_reads"`
+	HybridSearchMeta *HybridSearchMeta   `json:"hybrid_search_meta,omitempty"`
+}
+
+type SearchMediaSummary struct {
+	Total          int    `json:"total"`
+	Returned       int    `json:"returned"`
+	Truncated      bool   `json:"truncated"`
+	PerResultLimit int    `json:"per_result_limit,omitempty"`
+	TotalLimit     int    `json:"total_limit,omitempty"`
+	Detail         string `json:"detail"`
 }
 
 type HybridSearchMeta struct {
@@ -453,6 +665,7 @@ type SuggestedReads struct {
 	ImplicitSymbolLinks []SuggestedRead     `json:"implicit_symbol_links"`
 	CuratedRelations    []SuggestedRead     `json:"curated_relations"`
 	StructuralNeighbors []SuggestedRead     `json:"structural_neighbors"`
+	AuthoredRelations   []SuggestedRead     `json:"authored_relations,omitempty"`
 }
 
 type SuggestedRead struct {
@@ -587,15 +800,58 @@ type DocumentDetail struct {
 }
 
 type SectionSummary struct {
-	ID             string `json:"id"`
-	DocumentID     string `json:"document_id"`
-	DocumentTitle  string `json:"document_title"`
-	Title          string `json:"title"`
-	HeadingPath    string `json:"heading_path"`
-	ContentSnippet string `json:"content_snippet"`
-	ContentHash    string `json:"content_hash,omitempty"`
-	Ordinal        int    `json:"ordinal"`
-	NodeID         string `json:"node_id"`
+	ID               string `json:"id"`
+	DocumentID       string `json:"document_id"`
+	DocumentTitle    string `json:"document_title"`
+	Title            string `json:"title"`
+	HeadingPath      string `json:"heading_path"`
+	ContentSnippet   string `json:"content_snippet"`
+	ContentHash      string `json:"content_hash,omitempty"`
+	Ordinal          int    `json:"ordinal"`
+	NodeID           string `json:"node_id"`
+	ParentSectionID  string `json:"parent_section_id,omitempty"`
+	SourceElementID  string `json:"source_element_id,omitempty"`
+	ElementKind      string `json:"element_kind,omitempty"`
+	Depth            int    `json:"depth,omitempty"`
+	SiblingOrdinal   int    `json:"sibling_ordinal,omitempty"`
+	OrderPath        []int  `json:"order_path,omitempty"`
+	DisplayNumber    string `json:"display_number,omitempty"`
+	PresentationJSON string `json:"presentation_json,omitempty"`
+	MetadataJSON     string `json:"metadata_json,omitempty"`
+	MediaCount       int    `json:"media_count,omitempty"`
+}
+
+type SectionBreadcrumb struct {
+	SectionID     string `json:"section_id"`
+	Title         string `json:"title"`
+	DisplayNumber string `json:"display_number,omitempty"`
+	Depth         int    `json:"depth"`
+}
+
+type OutlineOptions struct {
+	ParentSectionID string
+	Limit           int
+	Offset          int
+}
+
+type DocumentOutline struct {
+	DocumentID      string           `json:"document_id"`
+	ParentSectionID string           `json:"parent_section_id,omitempty"`
+	Sections        []SectionSummary `json:"sections"`
+	Limit           int              `json:"limit"`
+	Offset          int              `json:"offset"`
+	HasMore         bool             `json:"has_more"`
+}
+
+type SectionContext struct {
+	Section           SectionContent      `json:"section"`
+	Structure         *SectionStructure   `json:"structure,omitempty"`
+	Ancestors         []SectionSummary    `json:"ancestors"`
+	Children          []SectionSummary    `json:"children"`
+	ChildrenPage      DocumentOutline     `json:"children_page"`
+	AuthoredRelations []RelatedNode       `json:"authored_relations"`
+	MediaAssets       []MediaAssetSummary `json:"media_assets"`
+	Snapshot          *SourceSnapshot     `json:"snapshot,omitempty"`
 }
 
 type EdgeSummary struct {
@@ -613,23 +869,32 @@ type EdgeSummary struct {
 }
 
 type SourceArtifactCounts struct {
-	Documents       int64 `json:"documents"`
-	Sections        int64 `json:"sections"`
-	Nodes           int64 `json:"nodes"`
-	Edges           int64 `json:"edges"`
-	SectionEntities int64 `json:"section_entities"`
+	Documents              int64 `json:"documents"`
+	Sections               int64 `json:"sections"`
+	Nodes                  int64 `json:"nodes"`
+	Edges                  int64 `json:"edges"`
+	SectionEntities        int64 `json:"section_entities"`
+	MediaAssets            int64 `json:"media_assets"`
+	Snapshots              int64 `json:"snapshots"`
+	MissingMediaAssets     int64 `json:"missing_media_assets"`
+	RejectedMediaAssets    int64 `json:"rejected_media_assets"`
+	UnavailableMediaAssets int64 `json:"unavailable_media_assets"`
+	SnapshotBytes          int64 `json:"snapshot_bytes"`
+	ReferencedMediaBytes   int64 `json:"referenced_media_bytes"`
 }
 
 type SourceArtifacts struct {
-	SourceID          string               `json:"source_id"`
-	Counts            SourceArtifactCounts `json:"counts"`
-	EmbeddingStatus   *EmbeddingStatus     `json:"embedding_status,omitempty"`
-	EntityDiagnostics EntityDiagnostics    `json:"entity_diagnostics"`
-	Documents         []DocumentSummary    `json:"documents"`
-	Sections          []SectionSummary     `json:"sections"`
-	SectionEntities   []SectionEntity      `json:"section_entities,omitempty"`
-	Nodes             []Node               `json:"nodes"`
-	Edges             []EdgeSummary        `json:"edges"`
+	SourceID          string                  `json:"source_id"`
+	Counts            SourceArtifactCounts    `json:"counts"`
+	EmbeddingStatus   *EmbeddingStatus        `json:"embedding_status,omitempty"`
+	EntityDiagnostics EntityDiagnostics       `json:"entity_diagnostics"`
+	Documents         []DocumentSummary       `json:"documents"`
+	Sections          []SectionSummary        `json:"sections"`
+	SectionEntities   []SectionEntity         `json:"section_entities,omitempty"`
+	Nodes             []Node                  `json:"nodes"`
+	Edges             []EdgeSummary           `json:"edges"`
+	ActiveSnapshot    *SourceSnapshot         `json:"active_snapshot,omitempty"`
+	FeatureInventory  []FeatureInventoryEntry `json:"feature_inventory,omitempty"`
 }
 
 type SourceHealthWarning struct {
@@ -642,15 +907,17 @@ type SourceHealthWarning struct {
 }
 
 type SourceHealth struct {
-	SourceID             string                `json:"source_id"`
-	Counts               SourceArtifactCounts  `json:"counts"`
-	EntityDiagnostics    EntityDiagnostics     `json:"entity_diagnostics"`
-	LatestJob            Job                   `json:"latest_job"`
-	BrokenLinks          []BrokenLink          `json:"broken_links"`
-	ZeroSectionDocuments []DocumentSummary     `json:"zero_section_documents"`
-	LowContentSections   []SectionSummary      `json:"low_content_sections"`
-	StaleFeedback        []FeedbackEvent       `json:"stale_feedback"`
-	Warnings             []SourceHealthWarning `json:"warnings"`
+	SourceID             string                  `json:"source_id"`
+	Counts               SourceArtifactCounts    `json:"counts"`
+	EntityDiagnostics    EntityDiagnostics       `json:"entity_diagnostics"`
+	LatestJob            Job                     `json:"latest_job"`
+	BrokenLinks          []BrokenLink            `json:"broken_links"`
+	ZeroSectionDocuments []DocumentSummary       `json:"zero_section_documents"`
+	LowContentSections   []SectionSummary        `json:"low_content_sections"`
+	StaleFeedback        []FeedbackEvent         `json:"stale_feedback"`
+	Warnings             []SourceHealthWarning   `json:"warnings"`
+	ActiveSnapshot       *SourceSnapshot         `json:"active_snapshot,omitempty"`
+	FeatureInventory     []FeatureInventoryEntry `json:"feature_inventory,omitempty"`
 }
 
 type QueryObservationInput struct {
@@ -687,6 +954,8 @@ type Node struct {
 	CanonicalName string  `json:"canonical_name"`
 	MetadataJSON  string  `json:"metadata_json"`
 	Confidence    float64 `json:"confidence"`
+	OwnerSourceID string  `json:"owner_source_id,omitempty"`
+	OwnerScope    string  `json:"owner_scope,omitempty"`
 	CreatedAt     string  `json:"created_at"`
 	UpdatedAt     string  `json:"updated_at"`
 }
@@ -713,6 +982,8 @@ type Edge struct {
 	EvidenceSectionID string  `json:"evidence_section_id"`
 	SourceRevision    string  `json:"source_revision"`
 	MetadataJSON      string  `json:"metadata_json"`
+	OwnerSourceID     string  `json:"owner_source_id,omitempty"`
+	OwnerScope        string  `json:"owner_scope,omitempty"`
 	CreatedAt         string  `json:"created_at"`
 	UpdatedAt         string  `json:"updated_at"`
 }
@@ -776,12 +1047,17 @@ type FeedbackListOptions struct {
 // including its parent document metadata.
 type SectionContent struct {
 	SectionID          string              `json:"section_id"`
+	NodeID             string              `json:"node_id,omitempty"`
 	DocumentID         string              `json:"document_id"`
 	DocumentTitle      string              `json:"document_title"`
 	DocumentURL        string              `json:"document_url"`
 	Title              string              `json:"title"`
 	HeadingPath        string              `json:"heading_path"`
 	Content            string              `json:"content"`
+	SearchText         string              `json:"search_text,omitempty"`
+	MetadataJSON       string              `json:"metadata_json,omitempty"`
+	Structure          *SectionStructure   `json:"structure,omitempty"`
+	MediaAssets        []MediaAssetSummary `json:"media_assets,omitempty"`
 	ExplicitReferences []ExplicitReference `json:"explicit_references"`
 }
 

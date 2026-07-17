@@ -12,33 +12,59 @@ Dashboard shows source, document, section, node, edge, and sync-job counts for t
 
 ![DocGraph dashboard](docs/assets/screenshots/docgraph-dashboard.png)
 
-Connectors let you add, edit, sync, and inspect documentation sources.
+Connectors let you add, edit, sync, and inspect documentation sources across 8 connector types.
 
 ![DocGraph connectors](docs/assets/screenshots/docgraph-connectors.png)
 
-Search provides local retrieval across document sections and generated retrieval profiles.
+Search provides hybrid local retrieval across document sections, retrieval profiles, and vector embeddings.
 
 ![DocGraph search](docs/assets/screenshots/docgraph-search.png)
+
+Sync Tasks shows job history with status tracking, plus per-source cron schedules for automatic syncs.
+
+![DocGraph sync tasks](docs/assets/screenshots/docgraph-sync-tasks.png)
+
+Credentials manage Confluence cookie credentials for session-based access.
+
+![DocGraph credentials](docs/assets/screenshots/docgraph-credentials.png)
+
+Governance reviews stale documents, knowledge relation proposals, and feedback markers.
+
+![DocGraph governance](docs/assets/screenshots/docgraph-governance.png)
+
+Nodes browse and search the knowledge graph — product, module, document, section, and API nodes with their relationships.
+
+![DocGraph nodes](docs/assets/screenshots/docgraph-nodes.png)
 
 ## Features
 
 - Single Go binary with an embedded Web UI.
-- Local SQLite + FTS5 storage, no external database required.
+- Local SQLite + FTS5 storage, no external database required. Optional pgvector for hybrid vector search.
 - Connectors for `local`, `git`, `static`, `html`, `sftp`, `confluence`, `openapi`, and `webdocs` sources.
-- MCP tools: `doc_search`, `doc_get_node`, `doc_get_section`, `doc_related`, and `doc_impact`; legacy `doc_context` calls remain compatible but are no longer advertised.
+- MCP tools: `doc_search`, `doc_get_node`, `doc_get_section`, `doc_get_asset_uri`, `doc_related`, and `doc_impact`; legacy `doc_context` calls remain compatible but are no longer advertised.
 - Document-backed knowledge graph with nodes, edges, provenance, sync history, and feedback markers.
+- Hybrid vector search with Reciprocal Rank Fusion (RRF): combines FTS5 text retrieval with pgvector cosine similarity, intent-aware routing for entity/conceptual/general queries.
+- Embedding pipeline with configurable OpenAI-compatible provider, chunking strategies (auto/sentence/fixed), and generator version tracking.
+- GSE-based search tokenizer for accurate CJK segmentation alongside English token analysis.
+- Technical term extraction from headings, tables, and code-like content for better recall on API names and config keys.
+- Explicit cross-reference resolution: author-written references surfaced as `suggested_reads.explicit_references`.
+- Sync scheduling with cron expressions per source; job management API for listing, inspecting, and canceling sync jobs.
+- Confluence cookie credential management for session-based Confluence access.
 - Chinese-aware retrieval profile generation for mixed Chinese/English internal docs.
 - Optional token authentication for Web/API/MCP endpoints.
+- MCP over stdio and Streamable HTTP; legacy SSE endpoint retained for older clients.
 
 ## Search Quality
 
 DocGraph is built for documentation search rather than generic text lookup:
 
 - Multi-stage local retrieval combines FTS5 token search, trigram search, profile lookup, and substring fallback so short Chinese phrases, English terms, API names, and symbols can all contribute to recall.
+- Optional hybrid vector search adds a pgvector cosine-similarity lane fused with the text lane via Reciprocal Rank Fusion (RRF). Intent routing classifies queries as entity, conceptual, or general and adjusts text/vector weights accordingly.
 - Search is section-first: results point to the exact document section, heading path, snippet, source URL, and matched evidence instead of only returning whole files.
-- Generated retrieval profiles add deterministic tags, keyphrases, aliases, API references, and section distribution signals while keeping human-maintained document descriptions separate from sync-generated metadata.
-- Ranking uses local signals such as canonical document status, title and heading matches, term coverage, profile matches, exact hits, and approved knowledge relations.
-- MCP tools return bounded search summaries first and let agents fetch full sections only when needed, keeping local agent context focused and auditable.
+- Generated retrieval profiles add deterministic tags, keyphrases, aliases, API references, technical terms, and section distribution signals while keeping human-maintained document descriptions separate from sync-generated metadata.
+- Author-written explicit cross-references (e.g., "See also: [Config Guide](../config.md)") are resolved and surfaced as suggested reads alongside knowledge-graph relations.
+- Ranking uses local signals such as canonical document status, title and heading matches, term coverage, profile matches, exact hits, vector similarity, and approved knowledge relations.
+- MCP tools follow a progressive `doc_search → doc_get_section → doc_get_asset_uri` flow: search and section reads return compact connector-owned asset IDs and MIME types; only the URI tool returns an authenticated download path, and MCP never embeds the binary content.
 
 ## How It Works
 
@@ -46,9 +72,9 @@ DocGraph turns existing documentation into a local, queryable knowledge layer:
 
 1. Connect sources: add local directories, Git repositories, static HTML, Confluence pages, OpenAPI files, SFTP folders, or web documentation centers.
 2. Normalize documents: each connector converts source content into a common document and section model.
-3. Index locally: documents, sections, retrieval profiles, nodes, edges, aliases, and sync jobs are stored in SQLite with FTS5 search.
-4. Build relationships: DocGraph derives product/module/document/section/API nodes and connects them with evidence-backed edges.
-5. Query with evidence: users and agents search sections, assemble task context, inspect related nodes, and run impact analysis through the Web UI, REST API, or MCP.
+3. Index locally: documents, sections, retrieval profiles, nodes, edges, aliases, and sync jobs are stored in SQLite with FTS5 search. Optionally, section chunks are embedded into pgvector for hybrid vector retrieval.
+4. Build relationships: DocGraph derives product/module/document/section/API nodes and connects them with evidence-backed edges. Explicit cross-references and technical terms are extracted for richer retrieval signals.
+5. Query with evidence: users and agents search sections, assemble task context, inspect related nodes, and run impact analysis through the Web UI, REST API, or MCP (stdio and Streamable HTTP).
 
 All data stays in the configured local data directory unless you explicitly expose the server or move the database.
 
@@ -60,6 +86,24 @@ go build -buildvcs=false -o bin/docgraph ./cmd/docgraph
 ```
 
 The first `serve` run creates `docgraph.yaml`, generates a local admin token, migrates the SQLite database, and starts the server. Open `http://127.0.0.1:8787`, enter the token from `docgraph.yaml`, then add and sync documentation sources from the Web UI. `docgraph init` remains available when you want to pre-create or check the config and database without starting the server.
+
+To enable hybrid vector search, add the `vector_search` section to `docgraph.yaml`:
+
+```yaml
+vector_search:
+  enabled: true
+  search_weight: 0.4
+  embedding:
+    provider: openai
+    model: text-embedding-3-small
+    api_url: https://api.openai.com/v1/embeddings
+    api_key: sk-...
+    dimensions: 1536
+  vector_db:
+    dsn: pgvector://user:pass@localhost:5432/docgraph?sslmode=disable
+```
+
+See the configuration reference in `docgraph.yaml` for all options including intent route weights, chunk strategies, and embedding pipeline tuning.
 
 When serving DocGraph behind a reverse proxy path prefix, set `server.web_prefix` in `docgraph.yaml`. For example, `web_prefix: docgraph` serves the Web UI, REST API, and HTTP MCP endpoints under `/docgraph/`; an empty value keeps the default root routes. See `scripts/nginx-docgraph.conf` and `scripts/nginx-docgraph-location.conf` for nginx examples that preserve the prefix when proxying to DocGraph.
 
@@ -102,15 +146,21 @@ git push origin v0.1.0
 
 ## MCP
 
-DocGraph supports stdio MCP:
+DocGraph supports two MCP transports:
+
+| Transport | Endpoint | Use case |
+|-----------|----------|----------|
+| **stdio** | `docgraph mcp` | Local agents, IDE extensions (Claude Code, VS Code, JetBrains) |
+| **Streamable HTTP** | `/mcp` on running server | Remote agents, HTTP-based integrations |
+| **Legacy SSE** | `/mcp/sse` | Older clients; deprecated but retained for compatibility |
+
+stdio mode:
 
 ```bash
 ./bin/docgraph mcp --data ./.docgraph
 ```
 
-Streamable HTTP MCP is available at `/mcp` when `docgraph serve` is running.
-Legacy HTTP/SSE compatibility endpoints remain available at `/mcp/sse`. Setup
-details are documented in [docs/mcp-setup.md](docs/mcp-setup.md).
+Streamable HTTP is available when `docgraph serve` is running. When `auth.mode: token` is enabled, `/mcp` and the legacy `/mcp/sse` routes require the same bearer or `X-DocGraph-Token` credential as the REST API. See [docs/mcp-setup.md](docs/mcp-setup.md) for full setup instructions.
 
 ## Runtime Dependencies
 

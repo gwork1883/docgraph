@@ -116,6 +116,7 @@
                 <option value="git" data-i18n="source.kind.git">Git repository</option>
                 <option value="confluence" data-i18n="source.kind.confluence">Confluence</option>
                 <option value="webdocs" data-i18n="source.kind.webdocs">Online docs center</option>
+                <option value="xmind" data-i18n="source.kind.xmind">XMind workbook</option>
               </select>
               <small class="field-help" data-i18n="source.type.help">Choose how DocGraph should read this documentation source.</small>
             </label>
@@ -539,6 +540,19 @@
             <button id="document-back-search" type="button" data-i18n="document.back_search">Back to Search</button>
           </div>
           <div id="document-detail" class="document-detail"></div>
+        </article>
+      </section>
+
+      <section class="view" data-view="topic">
+        <article class="panel wide topic-viewer-panel">
+          <div class="section-heading">
+            <div>
+              <h2 data-i18n="topic.title">XMind Topic</h2>
+              <p id="topic-detail-subtitle" class="muted"></p>
+            </div>
+            <button id="topic-back-search" type="button" data-i18n="topic.back_search">Back to Search</button>
+          </div>
+          <div id="topic-detail" class="topic-detail"></div>
         </article>
       </section>
 

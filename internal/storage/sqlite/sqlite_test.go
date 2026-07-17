@@ -384,6 +384,8 @@ func TestMigrateAndStatus(t *testing.T) {
 	}
 	assertCount(t, ctx, store, "sqlite_master", "type = 'table' and name = 'section_entities'", 1)
 	assertCount(t, ctx, store, "sqlite_master", "type = 'index' and name = 'idx_section_entities_document'", 1)
+	assertCount(t, ctx, store, "sqlite_master", "type = 'index' and name = 'idx_jobs_sync_source_latest'", 1)
+	assertCount(t, ctx, store, "sqlite_master", "type = 'index' and name = 'idx_jobs_sync_source_active'", 1)
 
 	status, err := store.Status(ctx)
 	if err != nil {
@@ -447,6 +449,32 @@ func TestCheckSchemaRejectsFutureVersion(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "newer than supported") {
 		t.Fatalf("CheckSchema future version error = %v, want newer-than-supported", err)
 	}
+}
+
+func TestShortGramSchemaRequiresMigrationFromVersion6(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+
+	if _, err := store.db.ExecContext(ctx, `
+create table schema_migrations (
+  version integer primary key,
+  applied_at text not null default current_timestamp
+);
+insert into schema_migrations (version) values (6);
+`); err != nil {
+		t.Fatalf("seed version 6 schema: %v", err)
+	}
+	if err := store.CheckSchema(ctx); err == nil || !strings.Contains(err.Error(), "run docgraph migrate") {
+		t.Fatalf("CheckSchema at version 6 error = %v, want migrate hint", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate from version 6 returned error: %v", err)
+	}
+	if err := store.CheckSchema(ctx); err != nil {
+		t.Fatalf("CheckSchema after version 7 migration returned error: %v", err)
+	}
+	assertCount(t, ctx, store, "sqlite_master", "type = 'table' and name = 'fts_section_shortgrams'", 1)
+	assertCount(t, ctx, store, "sqlite_master", "type = 'table' and name = 'fts_nodes_shortgrams'", 1)
 }
 
 func TestSectionEntitiesSchemaRequiresMigrateFromOlderVersion(t *testing.T) {
@@ -824,6 +852,108 @@ func TestUpdateDeleteSourceAndSyncJobsLifecycle(t *testing.T) {
 	}
 }
 
+func TestSyncJobsUseStructuredSourceIDAndBatchLatest(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-sync-a")
+	createTestSource(t, ctx, store, "source-sync-b")
+
+	firstA, err := store.CreateSyncJobIfIdle(ctx, "source-sync-a")
+	if err != nil {
+		t.Fatalf("CreateSyncJobIfIdle first A returned error: %v", err)
+	}
+	if err := store.CompleteSyncJob(ctx, firstA.ID, domain.ResultPayload{Documents: 1}); err != nil {
+		t.Fatalf("CompleteSyncJob first A returned error: %v", err)
+	}
+	latestA, err := store.CreateSyncJobIfIdle(ctx, "source-sync-a")
+	if err != nil {
+		t.Fatalf("CreateSyncJobIfIdle latest A returned error: %v", err)
+	}
+	if err := store.FailSyncJob(ctx, latestA.ID, "latest failure"); err != nil {
+		t.Fatalf("FailSyncJob latest A returned error: %v", err)
+	}
+	latestB, err := store.CreateSyncJobIfIdle(ctx, "source-sync-b")
+	if err != nil {
+		t.Fatalf("CreateSyncJobIfIdle B returned error: %v", err)
+	}
+	if _, err := store.CreateSyncJobIfIdle(ctx, "source-sync-b"); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("duplicate CreateSyncJobIfIdle error = %v, want ErrSyncInProgress", err)
+	}
+
+	if _, err := store.db.ExecContext(ctx, `
+insert into jobs (id, kind, status, source_id, payload_json)
+values ('legacy-payload-only', 'sync_source', 'completed', '', '{"source_id":"source-sync-a"}')
+`); err != nil {
+		t.Fatalf("insert payload-only legacy job: %v", err)
+	}
+
+	jobsA, err := store.ListSyncJobs(ctx, "source-sync-a", 10)
+	if err != nil {
+		t.Fatalf("ListSyncJobs A returned error: %v", err)
+	}
+	for _, job := range jobsA {
+		if job.ID == "legacy-payload-only" {
+			t.Fatalf("ListSyncJobs matched payload-only legacy job: %+v", jobsA)
+		}
+	}
+	if err := store.DeleteSyncJob(ctx, "source-sync-a", "legacy-payload-only"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("DeleteSyncJob payload-only error = %v, want sql.ErrNoRows", err)
+	}
+	if err := store.DeleteSyncJob(ctx, "source-sync-a", latestB.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("DeleteSyncJob cross-source active error = %v, want sql.ErrNoRows", err)
+	}
+
+	latestJobs, err := store.ListLatestSyncJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListLatestSyncJobs returned error: %v", err)
+	}
+	latestBySource := make(map[string]domain.SyncJob, len(latestJobs))
+	for _, job := range latestJobs {
+		latestBySource[job.SourceID] = job
+	}
+	if got := latestBySource["source-sync-a"].ID; got != latestA.ID {
+		t.Fatalf("latest source A job = %q, want %q", got, latestA.ID)
+	}
+	if got := latestBySource["source-sync-b"].ID; got != latestB.ID {
+		t.Fatalf("latest source B job = %q, want %q", got, latestB.ID)
+	}
+
+	if _, err := store.CreateJob(ctx, domain.JobInput{Kind: "sync_source", PayloadJSON: `{"source_id":"source-sync-a"}`}); err == nil || !strings.Contains(err.Error(), "source id is required") {
+		t.Fatalf("CreateJob sync_source without structured source error = %v, want source id validation", err)
+	}
+}
+
+func TestMigrateBackfillsAndValidatesSyncJobSourceID(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	if _, err := store.db.ExecContext(ctx, `
+insert into jobs (id, kind, status, source_id, payload_json)
+values ('legacy-backfill', 'sync_source', 'completed', '', '{"source_id":"source-backfilled"}')
+`); err != nil {
+		t.Fatalf("insert backfillable sync job: %v", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate backfillable sync job returned error: %v", err)
+	}
+	var sourceID string
+	if err := store.db.QueryRowContext(ctx, `select source_id from jobs where id = 'legacy-backfill'`).Scan(&sourceID); err != nil {
+		t.Fatalf("query backfilled sync job: %v", err)
+	}
+	if sourceID != "source-backfilled" {
+		t.Fatalf("backfilled source_id = %q, want source-backfilled", sourceID)
+	}
+
+	if _, err := store.db.ExecContext(ctx, `
+insert into jobs (id, kind, status, source_id, payload_json)
+values ('legacy-unscoped', 'sync_source', 'completed', '', '{}')
+`); err != nil {
+		t.Fatalf("insert unscoped sync job: %v", err)
+	}
+	if err := store.Migrate(ctx); err == nil || !strings.Contains(err.Error(), "sync_source jobs without source_id") {
+		t.Fatalf("Migrate unscoped sync job error = %v, want explicit source_id error", err)
+	}
+}
+
 func TestReplaceDocumentReplacesSectionsAndFTSRows(t *testing.T) {
 	ctx := context.Background()
 	store := openMigratedTempStore(t, ctx)
@@ -1006,6 +1136,13 @@ func TestSectionEntitiesReplaceListSearchAndPropagation(t *testing.T) {
 	}
 	if len(found) == 0 || found[0].Operation != "BatchGetEntityMeta" {
 		t.Fatalf("SearchEntities operation = %+v, want operation entity", found)
+	}
+	found, err = store.SearchEntities(ctx, "GetEntityMeta", 10)
+	if err != nil {
+		t.Fatalf("SearchEntities operation fragment returned error: %v", err)
+	}
+	if len(found) == 0 || found[0].Operation != "BatchGetEntityMeta" {
+		t.Fatalf("SearchEntities operation fragment = %+v, want trigram entity hit", found)
 	}
 
 	if err := store.ReplaceSectionEntities(ctx, doc.ID, []domain.SectionEntityInput{
@@ -1660,8 +1797,8 @@ func TestSearchSectionsUsesNormalizedEntityBoostAndKeepsFallback(t *testing.T) {
 			foundLikeFallbackAttempt = true
 		}
 	}
-	if !foundLikeFallbackAttempt {
-		t.Fatalf("budgeted miss attempts = %+v, want LIKE fallback even after entity attempts consume nominal budget", budgetedMiss.Attempts)
+	if foundLikeFallbackAttempt {
+		t.Fatalf("budgeted miss attempts = %+v, do not want a full-table LIKE fallback", budgetedMiss.Attempts)
 	}
 }
 
@@ -1868,6 +2005,7 @@ func TestDocumentProfilePreservesDescAndPropagations(t *testing.T) {
 	if _, err := store.GetDocumentProfile(ctx, doc.ID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("GetDocumentProfile after document delete error = %v, want sql.ErrNoRows", err)
 	}
+	assertCount(t, ctx, store, "fts_section_shortgrams", "document_id = 'doc-profile'", 0)
 }
 
 func TestKnowledgeRelationProposalApprovalExpandsSearch(t *testing.T) {
@@ -2102,7 +2240,6 @@ func TestSearchSectionsUsesChineseSubstringAndProfileEvidence(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertDocumentRetrievalProfile returned error: %v", err)
 	}
-
 	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
 		Query:                  "错误响应",
 		Limit:                  5,
@@ -2125,6 +2262,129 @@ func TestSearchSectionsUsesChineseSubstringAndProfileEvidence(t *testing.T) {
 	}
 	if hit.Profile == nil || !containsString(hit.Profile.TopTags, "错误响应") {
 		t.Fatalf("hit profile = %+v, want compact generated tags", hit.Profile)
+	}
+}
+
+func TestSearchSectionsExactTermsUseIndexedLiteralCandidates(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-1")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID: "doc-exact-term", SourceID: "source-1", ExternalID: "exact.md", Title: "Error Reference", ContentHash: "doc-exact-hash",
+	}, []domain.SectionInput{{
+		ID: "section-exact-term", Title: "Codes", Content: "Handle E100-ABC before retrying GET /v1/items.", ContentHash: "section-exact-hash",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query: "unrelated miss", ExactTerms: []string{"E100-ABC"}, Limit: 5, MaxSearches: 5, MaxSectionsPerDocument: 5,
+	})
+	if err != nil {
+		t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+	}
+	if len(result.Hits) == 0 || result.Hits[0].SectionID != "section-exact-term" {
+		t.Fatalf("exact term hits = %+v, want indexed literal section", result.Hits)
+	}
+	foundExactAttempt := false
+	for _, attempt := range result.Attempts {
+		if attempt.Kind == "exact_terms" && attempt.Hits > 0 {
+			foundExactAttempt = true
+		}
+		if attempt.Kind == "like_fallback" {
+			t.Fatalf("attempts = %+v, do not want LIKE fallback", result.Attempts)
+		}
+	}
+	if !foundExactAttempt {
+		t.Fatalf("attempts = %+v, want exact_terms indexed hit", result.Attempts)
+	}
+}
+
+func TestSearchSectionsExactTermsUseShortGramPhraseCandidates(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-shortgrams")
+	doc := domain.DocumentInput{
+		ID: "doc-shortgrams", SourceID: "source-shortgrams", ExternalID: "shortgrams.md", Title: "Literal Reference", ContentHash: "doc-shortgrams-v1",
+	}
+	if err := store.ReplaceDocument(ctx, doc, []domain.SectionInput{{
+		ID: "section-shortgrams", Title: "Examples", Content: "prefix abcdefgh; rare 龘靐 marker; mixed xA中By.", ContentHash: "section-shortgrams-v1",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+
+	for _, term := range []string{"bc", "靐", "龘靐", "A中B"} {
+		t.Run(term, func(t *testing.T) {
+			result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+				Query: "definitely unrelated", ExactTerms: []string{term}, Limit: 5, MaxSearches: 5, MaxSectionsPerDocument: 5,
+			})
+			if err != nil {
+				t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+			}
+			if len(result.Hits) == 0 || result.Hits[0].SectionID != "section-shortgrams" {
+				t.Fatalf("exact term %q hits = %+v, want section-shortgrams", term, result.Hits)
+			}
+		})
+	}
+
+	doc.ContentHash = "doc-shortgrams-v2"
+	if err := store.ReplaceDocument(ctx, doc, []domain.SectionInput{{
+		ID: "section-shortgrams", Title: "Replacement", Content: "replacement includes yz only", ContentHash: "section-shortgrams-v2",
+	}}); err != nil {
+		t.Fatalf("second ReplaceDocument returned error: %v", err)
+	}
+	oldResult, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query: "unrelated", ExactTerms: []string{"bc"}, Limit: 5, MaxSearches: 5, MaxSectionsPerDocument: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findSearchHit(oldResult.Hits, "section-shortgrams") != nil {
+		t.Fatalf("old short gram survived replacement: %+v", oldResult.Hits)
+	}
+	newResult, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query: "unrelated", ExactTerms: []string{"yz"}, Limit: 5, MaxSearches: 5, MaxSectionsPerDocument: 5,
+	})
+	if err != nil || findSearchHit(newResult.Hits, "section-shortgrams") == nil {
+		t.Fatalf("replacement short gram hits = %+v, err=%v", newResult.Hits, err)
+	}
+}
+
+func TestSearchSectionsQueryUsesIndexedSubstringFallback(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-query-substring")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID: "doc-query-substring", SourceID: "source-query-substring", ExternalID: "substring.md", Title: "Substring Reference", ContentHash: "doc-query-substring-v1",
+	}, []domain.SectionInput{{
+		ID: "section-query-substring", Title: "Examples", Content: "prefix abcdefgh; rare 龘靐 marker; mixed xA中By.", ContentHash: "section-query-substring-v1",
+	}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+
+	for _, query := range []string{"b", "bc", "A中"} {
+		t.Run(query, func(t *testing.T) {
+			result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+				Query: query, Limit: 5, MaxSearches: 5, MaxSectionsPerDocument: 5,
+			})
+			if err != nil {
+				t.Fatalf("SearchSectionsWithOptions returned error: %v", err)
+			}
+			if findSearchHit(result.Hits, "section-query-substring") == nil {
+				t.Fatalf("query %q hits = %+v, want indexed substring fallback hit", query, result.Hits)
+			}
+			foundSubstringFallback := false
+			for _, attempt := range result.Attempts {
+				if attempt.Kind == "substring_fallback" && attempt.Hits > 0 {
+					foundSubstringFallback = true
+				}
+				if attempt.Kind == "like_fallback" {
+					t.Fatalf("query %q attempts = %+v, do not want LIKE fallback", query, result.Attempts)
+				}
+			}
+			if !foundSubstringFallback {
+				t.Fatalf("query %q attempts = %+v, want indexed substring_fallback hit", query, result.Attempts)
+			}
+		})
 	}
 }
 
@@ -2174,6 +2434,8 @@ func TestSearchSectionsProfileAliasEvidenceAndBoundedFullProfile(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertDocumentRetrievalProfile returned error: %v", err)
 	}
+	assertCount(t, ctx, store, "fts_document_profiles", "document_id = 'doc-alias'", 1)
+	assertCount(t, ctx, store, "fts_document_profiles_trigram", "document_id = 'doc-alias'", 1)
 
 	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
 		Query:                  "alias-only-token",
@@ -3063,25 +3325,13 @@ func TestUpsertNodeUpdatesFTSAndOldTokenNotMatch(t *testing.T) {
 		t.Fatalf("second UpsertNode returned error: %v", err)
 	}
 
-	// The old name should no longer match via FTS.
+	// The old name should no longer match any indexed path.
 	nodes, err = store.SearchNodes(ctx, "AlphaModule", 10)
 	if err != nil {
 		t.Fatalf("SearchNodes old name after update returned error: %v", err)
 	}
-	if len(nodes) != 0 {
-		// If LIKE still finds it, ensure FTS would not have matched.
-		allOld := true
-		for _, n := range nodes {
-			if n.ID == "node-fts-update" {
-				// LIKE fallback may still match via name or canonical_name fields.
-				// But the primary FTS path should not return it for the old name.
-				allOld = false
-				break
-			}
-		}
-		if !allOld {
-			t.Logf("LIKE fallback found the updated node; checking FTS directly")
-		}
+	if nodesContainID(nodes, "node-fts-update") {
+		t.Fatalf("SearchNodes AlphaModule after update = %+v, do not want stale indexed node", nodes)
 	}
 
 	// The new name should be searchable.
@@ -3091,6 +3341,13 @@ func TestUpsertNodeUpdatesFTSAndOldTokenNotMatch(t *testing.T) {
 	}
 	if !nodesContainID(nodes, "node-fts-update") {
 		t.Fatalf("SearchNodes BetaModule = %+v, want node-fts-update", nodes)
+	}
+	nodes, err = store.SearchNodes(ctx, "taMod", 10)
+	if err != nil {
+		t.Fatalf("SearchNodes name fragment returned error: %v", err)
+	}
+	if !nodesContainID(nodes, "node-fts-update") {
+		t.Fatalf("SearchNodes name fragment = %+v, want trigram node-fts-update", nodes)
 	}
 
 	// Verify directly that fts_nodes has only the new content.
@@ -3115,6 +3372,139 @@ func TestUpsertNodeUpdatesFTSAndOldTokenNotMatch(t *testing.T) {
 	}
 }
 
+func TestSearchNodesUsesShortGramIndexWithoutMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	if err := store.UpsertNode(ctx, domain.NodeInput{
+		ID: "node-document-center", Kind: "Module", Name: "文档管理中心", CanonicalName: "文档管理中心",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertNode(ctx, domain.NodeInput{
+		ID: "node-metadata-only", Kind: "Module", Name: "Unrelated Module", CanonicalName: "unrelated-module", MetadataJSON: `{"hidden":"文档"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, query := range []string{"文档", "档管"} {
+		nodes, err := store.SearchNodes(ctx, query, 10)
+		if err != nil {
+			t.Fatalf("SearchNodes(%q) returned error: %v", query, err)
+		}
+		if !nodesContainID(nodes, "node-document-center") {
+			t.Fatalf("SearchNodes(%q) = %+v, want node-document-center", query, nodes)
+		}
+		if nodesContainID(nodes, "node-metadata-only") {
+			t.Fatalf("SearchNodes(%q) = %+v, metadata-only short match must not be indexed", query, nodes)
+		}
+	}
+
+	if err := store.UpsertNode(ctx, domain.NodeInput{
+		ID: "node-document-center", Kind: "Module", Name: "知识中心", CanonicalName: "知识中心",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := store.SearchNodes(ctx, "文档", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodesContainID(nodes, "node-document-center") {
+		t.Fatalf("old node short grams survived update: %+v", nodes)
+	}
+}
+
+func TestSearchNodesSingleRuneFallbackIsFieldScopedAndLiteral(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+
+	for _, node := range []domain.NodeInput{
+		{ID: "node-single-name", Kind: "Module", Name: "文档中心", CanonicalName: "document-center"},
+		{ID: "node-single-canonical", Kind: "Module", Name: "Archive Center", CanonicalName: "资料库"},
+		{ID: "node-single-metadata", Kind: "Module", Name: "Unrelated Module", CanonicalName: "unrelated-module", MetadataJSON: `{"hidden":"档库%_"}`},
+		{ID: "node-literal-percent", Kind: "Module", Name: "Rate%Limit", CanonicalName: "rate-percent-limit"},
+		{ID: "node-literal-underscore", Kind: "Module", Name: "Under_score", CanonicalName: "under-score"},
+		{ID: "node-wildcard-decoy", Kind: "Module", Name: "Ordinary Module", CanonicalName: "ordinary-module"},
+	} {
+		if err := store.UpsertNode(ctx, node); err != nil {
+			t.Fatalf("UpsertNode(%s) returned error: %v", node.ID, err)
+		}
+	}
+	// Simulate an incomplete short-gram index so every case proves that a
+	// single-rune indexed miss still reaches the bounded literal fallback.
+	if _, err := store.db.ExecContext(ctx, `delete from fts_nodes_shortgrams`); err != nil {
+		t.Fatalf("delete short-gram candidates: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		query   string
+		wantID  string
+		notWant []string
+	}{
+		{name: "name", query: "档", wantID: "node-single-name", notWant: []string{"node-single-metadata"}},
+		{name: "canonical", query: "库", wantID: "node-single-canonical", notWant: []string{"node-single-metadata"}},
+		{name: "literal percent", query: "%", wantID: "node-literal-percent", notWant: []string{"node-single-metadata", "node-wildcard-decoy"}},
+		{name: "literal underscore", query: "_", wantID: "node-literal-underscore", notWant: []string{"node-single-metadata", "node-wildcard-decoy"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nodes, err := store.SearchNodes(ctx, tc.query, 10)
+			if err != nil {
+				t.Fatalf("SearchNodes(%q) returned error: %v", tc.query, err)
+			}
+			if !nodesContainID(nodes, tc.wantID) {
+				t.Fatalf("SearchNodes(%q) = %+v, want %s", tc.query, nodes, tc.wantID)
+			}
+			for _, nodeID := range tc.notWant {
+				if nodesContainID(nodes, nodeID) {
+					t.Fatalf("SearchNodes(%q) = %+v, do not want %s", tc.query, nodes, nodeID)
+				}
+			}
+		})
+	}
+}
+
+func TestShortGramSearchIndexMigrationBackfillIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-shortgram-migration")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID: "doc-shortgram-migration", SourceID: "source-shortgram-migration", ExternalID: "migration.md", Title: "Migration", ContentHash: "migration-hash",
+	}, []domain.SectionInput{{
+		ID: "section-shortgram-migration", Title: "Literal", Content: "abcdefgh 龘靐", ContentHash: "section-migration-hash",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertNode(ctx, domain.NodeInput{
+		ID: "node-shortgram-migration", Kind: "Module", Name: "文档管理", CanonicalName: "文档管理",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `delete from fts_section_shortgrams`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `delete from fts_nodes_shortgrams`); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := store.Migrate(ctx); err != nil {
+			t.Fatalf("Migrate pass %d returned error: %v", i+1, err)
+		}
+	}
+	assertCount(t, ctx, store, "fts_section_shortgrams", "section_id = 'section-shortgram-migration'", 1)
+	assertCount(t, ctx, store, "fts_nodes_shortgrams", "node_id = 'node-shortgram-migration'", 1)
+	result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query: "unrelated", ExactTerms: []string{"bc"}, Limit: 5, MaxSearches: 5, MaxSectionsPerDocument: 5,
+	})
+	if err != nil || findSearchHit(result.Hits, "section-shortgram-migration") == nil {
+		t.Fatalf("backfilled section hits = %+v, err=%v", result.Hits, err)
+	}
+	nodes, err := store.SearchNodes(ctx, "文档", 10)
+	if err != nil || !nodesContainID(nodes, "node-shortgram-migration") {
+		t.Fatalf("backfilled node hits = %+v, err=%v", nodes, err)
+	}
+}
+
 func TestSearchNodesHandlesFTSUnsafeQuery(t *testing.T) {
 	ctx := context.Background()
 	store := openMigratedTempStore(t, ctx)
@@ -3129,8 +3519,8 @@ func TestSearchNodesHandlesFTSUnsafeQuery(t *testing.T) {
 		}
 	}
 
-	// An FTS unsafe query (e.g., with special characters that break FTS syntax)
-	// must NOT return an error — it should fall back to LIKE search.
+	// Queries containing FTS syntax characters must be normalized into safe
+	// indexed terms and never surface an FTS parser error.
 	unsafeQueries := []string{
 		`"`,
 		`'`,
@@ -3158,9 +3548,9 @@ func TestSearchNodesHandlesFTSUnsafeQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchNodes with special FTS keywords returned error: %v", err)
 	}
-	// Should still find results via LIKE fallback even if FTS chokes.
+	// Meaningful terms must still be recovered through the indexed FTS path.
 	if len(nodes) == 0 {
-		t.Fatalf("SearchNodes payments AND checkout returned no results, want LIKE fallback hits")
+		t.Fatalf("SearchNodes payments AND checkout returned no indexed results")
 	}
 
 	// Normal queries should work via exact/name matching or FTS.
@@ -3848,4 +4238,474 @@ func insertFixtureRows(t *testing.T, ctx context.Context, store *Store) {
 			t.Fatalf("exec %q: %v", stmt, err)
 		}
 	}
+}
+
+func TestMigrateV5BackfillsSectionSearchText(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-v5")
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{
+		ID: "doc-v5", SourceID: "source-v5", ExternalID: "v5", Title: "V5", ContentHash: "doc-hash",
+	}, []domain.SectionInput{{ID: "section-v5", Title: "Topic", Content: "legacy searchable text", ContentHash: "section-hash"}}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `update sections set search_text = '' where id = 'section-v5'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `delete from schema_migrations`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `insert into schema_migrations(version) values (4)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate v4 to v5 returned error: %v", err)
+	}
+	var searchText string
+	if err := store.readDB().QueryRowContext(ctx, `select search_text from sections where id = 'section-v5'`).Scan(&searchText); err != nil {
+		t.Fatal(err)
+	}
+	if searchText != "legacy searchable text" {
+		t.Fatalf("search_text = %q, want content backfill", searchText)
+	}
+	for _, table := range []string{"section_structures", "media_blobs", "source_snapshots", "media_assets", "section_media_refs", "source_feature_inventory"} {
+		var found int
+		if err := store.readDB().QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'table' and name = ?`, table).Scan(&found); err != nil {
+			t.Fatal(err)
+		}
+		if found != 1 {
+			t.Fatalf("table %s not created", table)
+		}
+	}
+}
+
+func TestReplaceWorkbookBundleAtomicReconcileAndMediaHydration(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-xmind")
+
+	for _, node := range []domain.NodeInput{
+		{ID: "manual-a", Kind: "Product", Name: "Manual A", CanonicalName: "manual-a"},
+		{ID: "manual-b", Kind: "Module", Name: "Manual B", CanonicalName: "manual-b"},
+	} {
+		if err := store.UpsertNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.UpsertEdge(ctx, domain.EdgeInput{ID: "manual-edge", SrcID: "manual-a", DstID: "manual-b", Kind: "related_to", Provenance: "manual"}); err != nil {
+		t.Fatal(err)
+	}
+
+	first := workbookBundleFixture("source-xmind", "a", true, false)
+	result, err := store.ReplaceWorkbookBundle(ctx, first)
+	if err != nil {
+		t.Fatalf("first ReplaceWorkbookBundle returned error: %v", err)
+	}
+	if result.ActiveSnapshotID != "snapshot-a" || len(result.StaleSectionIDs) != 0 {
+		t.Fatalf("first replace result = %+v", result)
+	}
+	shortResult, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+		Query: "unrelated", ExactTerms: []string{"pi"}, Limit: 10, MaxSearches: 5, MaxSectionsPerDocument: 5,
+	})
+	if err != nil || findSearchHit(shortResult.Hits, "topic-move") == nil {
+		t.Fatalf("workbook short-gram section hits = %+v, err=%v", shortResult.Hits, err)
+	}
+	shortNodes, err := store.SearchNodes(ctx, "-a", 10)
+	if err != nil || !nodesContainID(shortNodes, "node-topic-root-a") {
+		t.Fatalf("workbook short-gram node hits = %+v, err=%v", shortNodes, err)
+	}
+	outline, err := store.ListDocumentOutline(ctx, "sheet-a", domain.OutlineOptions{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outline.Sections) != 1 || outline.Sections[0].ID != "topic-root-a" || outline.Sections[0].DisplayNumber != "1" {
+		t.Fatalf("sheet A roots = %+v", outline.Sections)
+	}
+	children, err := store.ListDocumentOutline(ctx, "sheet-a", domain.OutlineOptions{ParentSectionID: "topic-root-a", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children.Sections) != 1 || children.Sections[0].ID != "topic-move" || children.Sections[0].NodeID != "node-topic-move" {
+		t.Fatalf("sheet A children = %+v", children.Sections)
+	}
+	search, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{Query: "diagram-filename.png", Limit: 10, MaxSearches: 5, MaxSectionsPerDocument: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hit := findSearchHit(search.Hits, "topic-move")
+	if hit == nil || hit.NodeID != "node-topic-move" || len(hit.Ancestry) != 1 || hit.Ancestry[0].SectionID != "topic-root-a" || len(hit.MediaAssets) != 1 || hit.MediaAssets[0].ID != "asset-image" || hit.AuthoredRelationCount != 2 || hit.EvidenceKind != "media_metadata" {
+		t.Fatalf("media-backed search hit = %+v", hit)
+	}
+	embeddingSection, err := store.GetSectionForEmbedding(ctx, "topic-move")
+	if err != nil || !strings.Contains(embeddingSection.Content, "diagram-filename.png") {
+		t.Fatalf("embedding source text = %+v, err=%v; want source-authored media metadata", embeddingSection, err)
+	}
+	asset, err := store.GetMediaAsset(ctx, "asset-image")
+	if err != nil || asset.BlobSHA256 != strings.Repeat("c", 64) {
+		t.Fatalf("opaque media asset lookup = %+v, err=%v", asset, err)
+	}
+	assertCount(t, ctx, store, "edges", "id in ('relationship-one', 'relationship-two')", 2)
+	if _, err := store.UpdateDocumentProfileDesc(ctx, domain.DocumentProfileInput{DocumentID: "sheet-b", Desc: "admin-owned description"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertDocumentRetrievalProfile(ctx, domain.RetrievalProfileInput{DocumentID: "sheet-b", RetrievalProfileJSON: `{"terms":["old"]}`, GeneratedFromHash: "sheet-b-hash"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceSectionEntities(ctx, "sheet-b", []domain.SectionEntityInput{{SectionID: "topic-root-b", Kind: "path_literal", RawText: "/old", CanonicalText: "/old"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := workbookBundleFixture("source-xmind", "b", false, true)
+	second.Documents[0].Document.ContentHash = "sheet-b-hash-changed"
+	result, err = store.ReplaceWorkbookBundle(ctx, second)
+	if err != nil {
+		t.Fatalf("second ReplaceWorkbookBundle returned error: %v", err)
+	}
+	if len(result.StaleSectionIDs) != 1 || result.StaleSectionIDs[0] != "topic-root-a" {
+		t.Fatalf("stale sections = %+v", result.StaleSectionIDs)
+	}
+	var movedDocument, movedParent string
+	if err := store.readDB().QueryRowContext(ctx, `
+select sections.document_id, section_structures.parent_section_id
+from sections join section_structures on section_structures.section_id = sections.id
+where sections.id = 'topic-move'
+`).Scan(&movedDocument, &movedParent); err != nil {
+		t.Fatal(err)
+	}
+	if movedDocument != "sheet-b" || movedParent != "topic-root-b" {
+		t.Fatalf("moved topic document/parent = %s/%s", movedDocument, movedParent)
+	}
+	assertCount(t, ctx, store, "nodes", "id = 'node-topic-move' and owner_source_id = 'source-xmind'", 1)
+	assertCount(t, ctx, store, "nodes", "id = 'node-topic-root-a'", 0)
+	assertCount(t, ctx, store, "fts_nodes", "node_id = 'node-topic-root-a'", 0)
+	assertCount(t, ctx, store, "fts_nodes_shortgrams", "node_id = 'node-topic-root-a'", 0)
+	assertCount(t, ctx, store, "fts_section_tokens", "section_id = 'topic-root-a'", 0)
+	assertCount(t, ctx, store, "fts_section_shortgrams", "section_id = 'topic-root-a'", 0)
+	assertCount(t, ctx, store, "edges", "id = 'relationship-one'", 0)
+	assertCount(t, ctx, store, "edges", "id = 'relationship-two'", 1)
+	assertCount(t, ctx, store, "media_assets", "1 = 1", 0)
+	assertCount(t, ctx, store, "section_media_refs", "1 = 1", 0)
+	assertCount(t, ctx, store, "nodes", "id in ('manual-a', 'manual-b') and owner_source_id is null", 2)
+	assertCount(t, ctx, store, "edges", "id = 'manual-edge' and owner_source_id is null", 1)
+	profile, err := store.GetDocumentProfile(ctx, "sheet-b")
+	if err != nil || profile.Desc != "admin-owned description" || profile.GeneratedFromHash != "" || profile.RetrievalProfileJSON != "{}" {
+		t.Fatalf("invalidated generated profile = %+v, err=%v", profile, err)
+	}
+	assertCount(t, ctx, store, "section_entities", "document_id = 'sheet-b'", 0)
+	active, err := store.GetActiveSourceSnapshot(ctx, "source-xmind")
+	if err != nil || active.ID != "snapshot-b" {
+		t.Fatalf("active snapshot = %+v, err=%v", active, err)
+	}
+	referenced, err := store.IsMediaBlobReferenced(ctx, strings.Repeat("c", 64))
+	if err != nil || referenced {
+		t.Fatalf("removed image blob referenced=%v err=%v", referenced, err)
+	}
+	if err := store.DeleteSource(ctx, "source-xmind"); err != nil {
+		t.Fatalf("DeleteSource returned error: %v", err)
+	}
+	assertCount(t, ctx, store, "source_snapshots", "source_id = 'source-xmind'", 0)
+	assertCount(t, ctx, store, "source_feature_inventory", "1 = 1", 0)
+	assertCount(t, ctx, store, "nodes", "owner_source_id = 'source-xmind'", 0)
+	assertCount(t, ctx, store, "fts_nodes", "node_id in ('node-topic-root-b', 'node-topic-move')", 0)
+	assertCount(t, ctx, store, "fts_nodes_shortgrams", "node_id in ('node-topic-root-b', 'node-topic-move')", 0)
+	assertCount(t, ctx, store, "fts_section_shortgrams", "document_id in ('sheet-a', 'sheet-b')", 0)
+	assertCount(t, ctx, store, "nodes", "id in ('manual-a', 'manual-b')", 2)
+	referenced, err = store.IsMediaBlobReferenced(ctx, strings.Repeat("b", 64))
+	if err != nil || referenced {
+		t.Fatalf("snapshot blob after source delete referenced=%v err=%v", referenced, err)
+	}
+}
+
+func TestReplaceWorkbookBundleRollbackKeepsPreviousSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-rollback")
+	if _, err := store.ReplaceWorkbookBundle(ctx, workbookBundleFixture("source-rollback", "a", true, false)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+create trigger fail_new_media before insert on media_assets
+when new.id = 'asset-image' begin select raise(abort, 'forced media failure'); end
+`); err != nil {
+		t.Fatal(err)
+	}
+	failing := workbookBundleFixture("source-rollback", "b", true, true)
+	if _, err := store.ReplaceWorkbookBundle(ctx, failing); err == nil || !strings.Contains(err.Error(), "forced media failure") {
+		t.Fatalf("ReplaceWorkbookBundle error = %v, want forced rollback", err)
+	}
+	active, err := store.GetActiveSourceSnapshot(ctx, "source-rollback")
+	if err != nil || active.ID != "snapshot-a" {
+		t.Fatalf("active snapshot after rollback = %+v, err=%v", active, err)
+	}
+	assertCount(t, ctx, store, "sections", "id = 'topic-root-a'", 1)
+	assertCount(t, ctx, store, "media_assets", "id = 'asset-image'", 1)
+	assertCount(t, ctx, store, "edges", "id = 'relationship-one'", 1)
+}
+
+func TestWorkbookOutlineSupportsLargeDeepTrees(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-large-xmind")
+	bundle := largeWorkbookBundleFixture("source-large-xmind", 512)
+	bundle.Edges = append(bundle.Edges, domain.EdgeInput{
+		ID: "large-authored-relationship", SrcID: "node-topic-000", DstID: "node-topic-511",
+		Kind: "related_to", Provenance: "source_authored", MetadataJSON: `{"label":"late relation"}`,
+	})
+	if _, err := store.ReplaceWorkbookBundle(ctx, bundle); err != nil {
+		t.Fatalf("ReplaceWorkbookBundle large fixture: %v", err)
+	}
+	contextResult, err := store.GetSectionContext(ctx, "topic-011", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contextResult.Ancestors) != 11 || contextResult.Ancestors[0].ID != "topic-000" {
+		t.Fatalf("deep ancestors = %d, first=%+v", len(contextResult.Ancestors), contextResult.Ancestors)
+	}
+	children, err := store.ListDocumentOutline(ctx, "sheet-large", domain.OutlineOptions{ParentSectionID: "topic-000", Limit: 100, Offset: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children.Sections) != 100 || !children.HasMore {
+		t.Fatalf("large outline page len=%d has_more=%v", len(children.Sections), children.HasMore)
+	}
+	allChildIDs := make([]string, 0, 501)
+	seenChildIDs := make(map[string]bool, 501)
+	for offset := 0; ; offset += 100 {
+		page, pageErr := store.ListDocumentOutline(ctx, "sheet-large", domain.OutlineOptions{ParentSectionID: "topic-000", Limit: 100, Offset: offset})
+		if pageErr != nil {
+			t.Fatal(pageErr)
+		}
+		for _, child := range page.Sections {
+			if seenChildIDs[child.ID] {
+				t.Fatalf("duplicate child across outline pages: %s", child.ID)
+			}
+			seenChildIDs[child.ID] = true
+			allChildIDs = append(allChildIDs, child.ID)
+		}
+		if !page.HasMore {
+			break
+		}
+	}
+	if len(allChildIDs) != 501 || allChildIDs[0] != "topic-001" || allChildIDs[len(allChildIDs)-1] != "topic-511" {
+		t.Fatalf("complete paged children len=%d first=%q last=%q", len(allChildIDs), allChildIDs[0], allChildIDs[len(allChildIDs)-1])
+	}
+	rootContext, err := store.GetSectionContext(ctx, "topic-000", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rootContext.Children) != 100 || len(rootContext.ChildrenPage.Sections) != 100 || !rootContext.ChildrenPage.HasMore || rootContext.ChildrenPage.Offset != 0 || rootContext.ChildrenPage.ParentSectionID != "topic-000" || len(rootContext.AuthoredRelations) != 1 || rootContext.AuthoredRelations[0].Edge.ID != "large-authored-relationship" {
+		t.Fatalf("large context child page = %+v", rootContext.ChildrenPage)
+	}
+	section, err := store.GetSection(ctx, "topic-511")
+	if err != nil || section.SectionID != "topic-511" {
+		t.Fatalf("direct deep/late section = %+v, err=%v", section, err)
+	}
+}
+
+func TestSearchMediaBudgetsPreserveTotalsAndFullEvidence(t *testing.T) {
+	ctx := context.Background()
+	store := openMigratedTempStore(t, ctx)
+	createTestSource(t, ctx, store, "source-media-budget")
+
+	bundle := workbookBundleFixture("source-media-budget", "e", true, false)
+	const query = "media budget evidence"
+	for documentIndex := range bundle.Documents {
+		for sectionIndex := range bundle.Documents[documentIndex].Sections {
+			section := &bundle.Documents[documentIndex].Sections[sectionIndex]
+			if section.ID == "topic-move" {
+				section.SearchText += " " + query
+			}
+		}
+	}
+	for i := 1; i <= 4; i++ {
+		metadata := fmt.Sprintf(`{"opaque":"asset-%d"}`, i)
+		if i == 4 {
+			metadata = `{"opaque":"media budget evidence"}`
+		}
+		assetID := fmt.Sprintf("asset-budget-%d", i)
+		bundle.MediaAssets = append(bundle.MediaAssets, domain.MediaAssetInput{
+			ID:           assetID,
+			SourceID:     bundle.SourceID,
+			SnapshotID:   bundle.Snapshot.ID,
+			DocumentID:   "sheet-a",
+			ExternalID:   fmt.Sprintf("budget-%d", i),
+			Kind:         "image",
+			OriginalName: fmt.Sprintf("budget-%d.png", i),
+			MediaType:    "image/png",
+			Status:       "external",
+			MetadataJSON: metadata,
+		})
+		bundle.MediaRefs = append(bundle.MediaRefs, domain.SectionMediaRefInput{
+			SectionID: "topic-move",
+			AssetID:   assetID,
+			Role:      "image",
+			Ordinal:   i,
+		})
+	}
+	if _, err := store.ReplaceWorkbookBundle(ctx, bundle); err != nil {
+		t.Fatalf("ReplaceWorkbookBundle returned error: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		perResultLimit int
+		totalLimit     int
+		detail         string
+		wantReturned   int
+	}{
+		{name: "global limit", perResultLimit: 3, totalLimit: 2, detail: "compact", wantReturned: 2},
+		{name: "per result limit", perResultLimit: 2, totalLimit: 10, detail: "compact", wantReturned: 2},
+		{name: "counts only", perResultLimit: 3, totalLimit: 10, detail: "none", wantReturned: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := store.SearchSectionsWithOptions(ctx, domain.SearchOptions{
+				Query:                   query,
+				Limit:                   10,
+				MaxSearches:             5,
+				MaxSectionsPerDocument:  5,
+				MaxMediaAssetsPerResult: tt.perResultLimit,
+				MaxMediaAssetsTotal:     tt.totalLimit,
+				MediaDetail:             tt.detail,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hit := findSearchHit(result.Hits, "topic-move")
+			if hit == nil {
+				t.Fatalf("search hits = %+v, want topic-move", result.Hits)
+			}
+			if hit.MediaAssetsTotal != 5 || !hit.MediaAssetsTruncated || len(hit.MediaAssets) != tt.wantReturned {
+				t.Fatalf("media budget hit = %+v, want total=5 returned=%d truncated", hit, tt.wantReturned)
+			}
+			if hit.EvidenceKind != "media_metadata" {
+				t.Fatalf("evidence_kind = %q, want media_metadata from omitted asset metadata", hit.EvidenceKind)
+			}
+			for _, asset := range hit.MediaAssets {
+				if asset.MetadataJSON != "" || asset.ReferenceMetadataJSON != "" {
+					t.Fatalf("compact media leaked raw metadata: %+v", asset)
+				}
+			}
+			if result.MediaSummary == nil || result.MediaSummary.Total != 5 || result.MediaSummary.Returned != tt.wantReturned || !result.MediaSummary.Truncated || result.MediaSummary.PerResultLimit != tt.perResultLimit || result.MediaSummary.TotalLimit != tt.totalLimit || result.MediaSummary.Detail != tt.detail {
+				t.Fatalf("media summary = %+v", result.MediaSummary)
+			}
+		})
+	}
+}
+
+func workbookBundleFixture(sourceID string, snapshotSuffix string, includeMedia bool, moved bool) domain.WorkbookBundle {
+	snapshotDigest := strings.Repeat(snapshotSuffix, 64)
+	imageDigest := strings.Repeat("c", 64)
+	bundle := domain.WorkbookBundle{
+		SourceID:    sourceID,
+		WorkbookKey: "workbook-one",
+		Snapshot: domain.SourceSnapshotInput{
+			ID: "snapshot-" + snapshotSuffix, SourceID: sourceID, SourceHash: "source-hash-" + snapshotSuffix,
+			BlobSHA256: snapshotDigest, FormatFamily: "classic_json", FormatVersion: "1",
+			SemanticHash: "semantic-" + snapshotSuffix, MediaManifestHash: "media-" + snapshotSuffix,
+		},
+		Blobs:            []domain.MediaBlobInput{{SHA256: snapshotDigest, SizeBytes: 100, SniffedMediaType: "application/zip", StorageKey: "sha256/" + snapshotDigest}},
+		FeatureInventory: []domain.FeatureInventoryInput{{FeatureKey: "topic", CoverageStatus: "indexed", Count: 2}},
+	}
+	rootB := domain.SectionInput{
+		ID: "topic-root-b", Title: "Root B", Content: "sheet B", SearchText: "Root B sheet B", ContentHash: "root-b-hash",
+		Structure: &domain.SectionStructureInput{SourceElementID: "xmind-root-b", ElementKind: "topic", Depth: 0, SiblingOrdinal: 0, OrderPath: []int{0}, DisplayNumber: "1"},
+	}
+	moving := domain.SectionInput{
+		ID: "topic-move", Title: "1.manual title", Content: "topic notes", SearchText: "topic notes diagram-filename.png", ContentHash: "move-hash",
+		Structure: &domain.SectionStructureInput{SourceElementID: "xmind-topic-move", ElementKind: "topic", Depth: 1, SiblingOrdinal: 0, OrderPath: []int{0, 0}, DisplayNumber: "1.1"},
+	}
+	if moved {
+		moving.DocumentID = "sheet-b"
+		moving.Structure.ParentSectionID = "topic-root-b"
+		bundle.Documents = []domain.WorkbookDocumentInput{{
+			Document: domain.DocumentInput{ID: "sheet-b", SourceID: sourceID, ExternalID: "sheet-b", Title: "Sheet B", ContentHash: "sheet-b-hash"},
+			Sections: []domain.SectionInput{rootB, moving},
+		}}
+		bundle.Nodes = []domain.NodeInput{
+			{ID: "node-topic-root-b", Kind: "DocSection", Name: "Root B", CanonicalName: "root-b"},
+			{ID: "node-topic-move", Kind: "DocSection", Name: "1.manual title", CanonicalName: "manual-title"},
+		}
+		bundle.SectionNodes = []domain.SectionNodeInput{
+			{SectionID: "topic-root-b", NodeID: "node-topic-root-b", Role: "represents"},
+			{SectionID: "topic-move", NodeID: "node-topic-move", Role: "represents"},
+		}
+		bundle.Edges = []domain.EdgeInput{
+			{ID: "hierarchy-b", SrcID: "node-topic-root-b", DstID: "node-topic-move", Kind: "contains", Provenance: "source_authored"},
+			{ID: "relationship-two", SrcID: "node-topic-root-b", DstID: "node-topic-move", Kind: "related_to", Provenance: "source_authored", MetadataJSON: `{"xmind_relationship_id":"relationship-two","label":"second"}`},
+		}
+	} else {
+		rootA := domain.SectionInput{
+			ID: "topic-root-a", Title: "Root A", Content: "sheet A", SearchText: "Root A sheet A", ContentHash: "root-a-hash",
+			Structure: &domain.SectionStructureInput{SourceElementID: "xmind-root-a", ElementKind: "topic", Depth: 0, SiblingOrdinal: 0, OrderPath: []int{0}, DisplayNumber: "1"},
+		}
+		moving.DocumentID = "sheet-a"
+		moving.Structure.ParentSectionID = "topic-root-a"
+		bundle.Documents = []domain.WorkbookDocumentInput{
+			{Document: domain.DocumentInput{ID: "sheet-a", SourceID: sourceID, ExternalID: "sheet-a", Title: "Sheet A", ContentHash: "sheet-a-hash"}, Sections: []domain.SectionInput{rootA, moving}},
+			{Document: domain.DocumentInput{ID: "sheet-b", SourceID: sourceID, ExternalID: "sheet-b", Title: "Sheet B", ContentHash: "sheet-b-hash"}, Sections: []domain.SectionInput{rootB}},
+		}
+		bundle.Nodes = []domain.NodeInput{
+			{ID: "node-topic-root-a", Kind: "DocSection", Name: "Root A", CanonicalName: "root-a"},
+			{ID: "node-topic-move", Kind: "DocSection", Name: "1.manual title", CanonicalName: "manual-title"},
+			{ID: "node-topic-root-b", Kind: "DocSection", Name: "Root B", CanonicalName: "root-b"},
+		}
+		bundle.SectionNodes = []domain.SectionNodeInput{
+			{SectionID: "topic-root-a", NodeID: "node-topic-root-a", Role: "represents"},
+			{SectionID: "topic-move", NodeID: "node-topic-move", Role: "represents"},
+			{SectionID: "topic-root-b", NodeID: "node-topic-root-b", Role: "represents"},
+		}
+		bundle.Edges = []domain.EdgeInput{
+			{ID: "hierarchy-a", SrcID: "node-topic-root-a", DstID: "node-topic-move", Kind: "contains", Provenance: "source_authored"},
+			{ID: "relationship-one", SrcID: "node-topic-root-a", DstID: "node-topic-move", Kind: "related_to", Provenance: "source_authored", MetadataJSON: `{"xmind_relationship_id":"relationship-one","label":"first"}`},
+			{ID: "relationship-two", SrcID: "node-topic-root-a", DstID: "node-topic-move", Kind: "related_to", Provenance: "source_authored", MetadataJSON: `{"xmind_relationship_id":"relationship-two","label":"second"}`},
+		}
+	}
+	if includeMedia {
+		bundle.Blobs = append(bundle.Blobs, domain.MediaBlobInput{SHA256: imageDigest, SizeBytes: 42, SniffedMediaType: "image/png", StorageKey: "sha256/" + imageDigest})
+		bundle.MediaAssets = []domain.MediaAssetInput{{
+			ID: "asset-image", SourceID: sourceID, SnapshotID: bundle.Snapshot.ID, DocumentID: moving.DocumentID,
+			ExternalID: "image-1", BlobSHA256: imageDigest, Kind: "image", OriginalName: "diagram-filename.png",
+			MediaType: "image/png", SizeBytes: 42, Status: "available",
+		}}
+		bundle.MediaRefs = []domain.SectionMediaRefInput{{SectionID: "topic-move", AssetID: "asset-image", Role: "image", Ordinal: 0}}
+	}
+	return bundle
+}
+
+func largeWorkbookBundleFixture(sourceID string, count int) domain.WorkbookBundle {
+	digest := strings.Repeat("d", 64)
+	bundle := domain.WorkbookBundle{
+		SourceID: sourceID, WorkbookKey: "large-workbook",
+		Snapshot: domain.SourceSnapshotInput{ID: "snapshot-large", SourceID: sourceID, SourceHash: "large-hash", BlobSHA256: digest, FormatFamily: "classic_json"},
+		Blobs:    []domain.MediaBlobInput{{SHA256: digest, SizeBytes: 1, SniffedMediaType: "application/zip", StorageKey: "sha256/" + digest}},
+	}
+	document := domain.WorkbookDocumentInput{Document: domain.DocumentInput{ID: "sheet-large", SourceID: sourceID, ExternalID: "sheet-large", Title: "Large", ContentHash: "large"}}
+	for i := 0; i < count; i++ {
+		id := fmt.Sprintf("topic-%03d", i)
+		nodeID := "node-" + id
+		depth := 1
+		parentID := "topic-000"
+		orderPath := []int{0, i}
+		if i == 0 {
+			depth = 0
+			parentID = ""
+			orderPath = []int{0}
+		} else if i < 12 {
+			depth = i
+			parentID = fmt.Sprintf("topic-%03d", i-1)
+			orderPath = make([]int, i+1)
+		}
+		document.Sections = append(document.Sections, domain.SectionInput{
+			ID: id, Title: id, Content: "content " + id, SearchText: "content " + id, ContentHash: "hash-" + id,
+			Structure: &domain.SectionStructureInput{ParentSectionID: parentID, SourceElementID: "xmind-" + id, ElementKind: "topic", Depth: depth, SiblingOrdinal: i, OrderPath: orderPath},
+		})
+		bundle.Nodes = append(bundle.Nodes, domain.NodeInput{ID: nodeID, Kind: "DocSection", Name: id, CanonicalName: id})
+		bundle.SectionNodes = append(bundle.SectionNodes, domain.SectionNodeInput{SectionID: id, NodeID: nodeID, Role: "represents"})
+		if parentID != "" {
+			bundle.Edges = append(bundle.Edges, domain.EdgeInput{ID: "edge-" + id, SrcID: "node-" + parentID, DstID: nodeID, Kind: "contains", Provenance: "source_authored"})
+		}
+	}
+	bundle.Documents = []domain.WorkbookDocumentInput{document}
+	return bundle
 }

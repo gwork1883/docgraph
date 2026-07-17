@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/docgraph/docgraph/internal/blobstore"
 	"github.com/docgraph/docgraph/internal/config"
 	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/jobs"
@@ -15,10 +16,16 @@ import (
 	"github.com/docgraph/docgraph/internal/scheduler"
 	"github.com/docgraph/docgraph/internal/server"
 	"github.com/docgraph/docgraph/internal/storage"
+	syncsvc "github.com/docgraph/docgraph/internal/sync"
 	"github.com/docgraph/docgraph/internal/vectorstore"
 )
 
 const vectorBackendStartupTimeout = 10 * time.Second
+
+const (
+	blobGarbageCollectionInterval = time.Hour
+	blobGarbageCollectionGrace    = 24 * time.Hour
+)
 
 var (
 	openVectorBackend    = vectorstore.Open
@@ -56,6 +63,10 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 
 	if err := store.CheckSchema(ctx); err != nil {
 		return err
+	}
+	blobs, err := blobstore.New(cfg.Server.DataDir)
+	if err != nil {
+		return fmt.Errorf("initialize BlobStore: %w", err)
 	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
@@ -105,14 +116,69 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		Tokenizer:          cfg.VectorSearch.Embedding.Tokenizer,
 		ChunkStrategy:      cfg.VectorSearch.Embedding.ChunkStrategy,
 		GeneratorVersion:   generatorVersion,
+		SyncOptions: syncsvc.ServiceOptions{
+			DataDir:   cfg.Server.DataDir,
+			BlobStore: blobs,
+		},
 	}), logger)
 	runner.SetWorkerCount(cfg.Server.JobWorkers)
 	srv := server.NewWithAuthAndPrefixAndJobsAndEmbedding(addr, store, logger, cfg.Auth, cfg.Server.WebPrefix, runner, embedder, generatorVersion, limits.ChunkTargetTokens, cfg.VectorSearch.SearchWeight)
 	srv.SetEmbeddingChunkOptions(cfg.VectorSearch.Embedding.Tokenizer, cfg.VectorSearch.Embedding.ChunkStrategy)
 	srv.SetEmbeddingLimits(limits)
+	srv.SetBlobStore(blobs)
 	go runner.Run(ctx)
 	go scheduler.NewRunner(store, logger).Run(ctx)
+	go runBlobGarbageCollector(ctx, store, blobs, logger)
 	return srv.Run(ctx)
+}
+
+func runBlobGarbageCollector(ctx context.Context, store storage.Store, blobs *blobstore.Store, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	collect := func() {
+		mediaStore, ok := store.(storage.MediaStore)
+		if !ok || blobs == nil {
+			return
+		}
+		cutoff := time.Now().Add(-blobGarbageCollectionGrace)
+		result, err := blobs.CollectGarbage(ctx, cutoff, mediaStore.IsMediaBlobReferenced)
+		if err != nil {
+			if ctx.Err() == nil {
+				logger.Warn("Blob garbage collection deferred", "error", err)
+			}
+			return
+		}
+		cutoffText := cutoff.UTC().Format("2006-01-02 15:04:05")
+		for _, digest := range result.DeletedDigests {
+			if _, err := mediaStore.DeleteMediaBlobIfUnreferenced(ctx, digest, cutoffText); err != nil && ctx.Err() == nil {
+				logger.Warn("Blob metadata garbage collection deferred", "sha256", digest, "error", err)
+			}
+		}
+		if candidates, err := mediaStore.ListUnreferencedMediaBlobs(ctx, cutoffText, 1000); err == nil {
+			for _, candidate := range candidates {
+				if _, err := mediaStore.DeleteMediaBlobIfUnreferenced(ctx, candidate.SHA256, cutoffText); err != nil && ctx.Err() == nil {
+					logger.Warn("orphan Blob metadata cleanup deferred", "sha256", candidate.SHA256, "error", err)
+				}
+			}
+		} else if ctx.Err() == nil {
+			logger.Warn("orphan Blob metadata scan deferred", "error", err)
+		}
+		if _, err := blobs.CleanupStaging(cutoff); err != nil && ctx.Err() == nil {
+			logger.Warn("Blob staging cleanup deferred", "error", err)
+		}
+	}
+	collect()
+	ticker := time.NewTicker(blobGarbageCollectionInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			collect()
+		}
+	}
 }
 
 func Status(ctx context.Context, cfg config.Config) (storage.Status, error) {
@@ -138,7 +204,6 @@ func MCP(ctx context.Context, cfg config.Config, in io.Reader, out io.Writer) er
 	if err := store.CheckSchema(ctx); err != nil {
 		return err
 	}
-
 	embedder := embedding.NewNoOpEmbedder()
 	generatorVersion := cfg.VectorSearch.Embedding.GeneratorVersion
 	if cfg.VectorSearch.Enabled {
@@ -172,7 +237,9 @@ func MCP(ctx context.Context, cfg config.Config, in io.Reader, out io.Writer) er
 			}
 		}
 	}
-	return mcp.NewServerWithStoreAndEmbeddingAndPlan(query.NewService(store), store, embedder, generatorVersion, cfg.VectorSearch.SearchWeight, cfg.VectorSearch.Embedding.Tokenizer, cfg.VectorSearch.Embedding.ChunkStrategy, in, out).Run(ctx)
+	mcpServer := mcp.NewServerWithStoreAndEmbeddingAndPlan(query.NewService(store), store, embedder, generatorVersion, cfg.VectorSearch.SearchWeight, cfg.VectorSearch.Embedding.Tokenizer, cfg.VectorSearch.Embedding.ChunkStrategy, in, out)
+	mcpServer.SetAssetURIBasePath(cfg.Server.WebPrefix)
+	return mcpServer.Run(ctx)
 }
 
 func configureVectorSearch(ctx context.Context, _ storage.Store, cfg config.Config, logger *slog.Logger) (embedding.Embedder, vectorstore.Store) {

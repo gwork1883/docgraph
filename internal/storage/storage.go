@@ -75,6 +75,7 @@ type Store interface {
 	CompleteSyncJob(ctx context.Context, id string, result ResultPayload) error
 	FailSyncJob(ctx context.Context, id string, errText string) error
 	ListSyncJobs(ctx context.Context, sourceID string, limit int) ([]SyncJob, error)
+	ListLatestSyncJobs(ctx context.Context) ([]SyncJob, error)
 	DeleteSyncJob(ctx context.Context, sourceID string, jobID string) error
 	UpsertNode(ctx context.Context, node NodeInput) error
 	UpsertEdge(ctx context.Context, edge EdgeInput) error
@@ -106,15 +107,65 @@ type Store interface {
 	Close() error
 }
 
+// WorkbookStore is implemented by stores that can atomically replace a
+// connector-owned workbook aggregate. It intentionally remains separate from
+// Store so lightweight test and connector fakes do not need to implement it.
+type WorkbookStore interface {
+	ReplaceWorkbookBundle(ctx context.Context, bundle WorkbookBundle) (WorkbookReplaceResult, error)
+}
+
+// MediaStore exposes source snapshots and logical media metadata. Blob bytes
+// remain the responsibility of the central blob store.
+type MediaStore interface {
+	GetActiveSourceSnapshot(ctx context.Context, sourceID string) (SourceSnapshot, error)
+	GetMediaAsset(ctx context.Context, assetID string) (MediaAsset, error)
+	ListDocumentMediaAssets(ctx context.Context, documentID string, limit, offset int) ([]MediaAsset, error)
+	ListSectionMediaAssets(ctx context.Context, sectionIDs []string) (map[string][]MediaAssetSummary, error)
+	ListSourceFeatureInventory(ctx context.Context, sourceID string) ([]FeatureInventoryEntry, error)
+	IsMediaBlobReferenced(ctx context.Context, sha256 string) (bool, error)
+	ListUnreferencedMediaBlobs(ctx context.Context, olderThan string, limit int) ([]MediaBlob, error)
+	DeleteMediaBlobIfUnreferenced(ctx context.Context, sha256 string, olderThan string) (bool, error)
+}
+
+// SectionContextStore provides ordered hierarchy access independently from the
+// legacy bounded, flat document section listing.
+type SectionContextStore interface {
+	GetSectionContext(ctx context.Context, sectionID string, childLimit int) (SectionContext, error)
+	ListDocumentOutline(ctx context.Context, documentID string, opts OutlineOptions) (DocumentOutline, error)
+}
+
+// AuthoredRelationStore batch-loads source-authored semantic relations for
+// search hits without hydrating full Section context for every hit.
+type AuthoredRelationStore interface {
+	ListAuthoredRelationsForSections(ctx context.Context, sectionIDs []string, perSectionLimit int) (map[string][]RelatedNode, error)
+}
+
 type Status = sqlschema.Status
 
 type Source = domain.Source
 type ConfluenceCookieCredential = domain.ConfluenceCookieCredential
 type SyncJob = domain.SyncJob
 type ResultPayload = domain.ResultPayload
+type ConnectorDiagnostics = domain.ConnectorDiagnostics
 type BrokenLink = domain.BrokenLink
 type DocumentInput = domain.DocumentInput
 type SectionInput = domain.SectionInput
+type SectionStructureInput = domain.SectionStructureInput
+type SectionStructure = domain.SectionStructure
+type WorkbookDocumentInput = domain.WorkbookDocumentInput
+type WorkbookBundle = domain.WorkbookBundle
+type WorkbookReplaceResult = domain.WorkbookReplaceResult
+type MediaBlobInput = domain.MediaBlobInput
+type MediaBlob = domain.MediaBlob
+type SourceSnapshotInput = domain.SourceSnapshotInput
+type SourceSnapshot = domain.SourceSnapshot
+type MediaAssetInput = domain.MediaAssetInput
+type MediaAsset = domain.MediaAsset
+type MediaAssetSummary = domain.MediaAssetSummary
+type SectionMediaRefInput = domain.SectionMediaRefInput
+type SectionNodeInput = domain.SectionNodeInput
+type FeatureInventoryInput = domain.FeatureInventoryInput
+type FeatureInventoryEntry = domain.FeatureInventoryEntry
 type DocumentProfile = domain.DocumentProfile
 type DocumentProfileInput = domain.DocumentProfileInput
 type RetrievalProfileInput = domain.RetrievalProfileInput
@@ -132,6 +183,7 @@ type RelationMatch = domain.RelationMatch
 type SearchHit = domain.SearchHit
 type SearchOptions = domain.SearchOptions
 type SearchResult = domain.SearchResult
+type SearchMediaSummary = domain.SearchMediaSummary
 type SearchAttempt = domain.SearchAttempt
 type SectionEmbeddingInput = domain.SectionEmbeddingInput
 type EmbeddingChunkInput = domain.EmbeddingChunkInput
@@ -150,6 +202,10 @@ type SourceHealthWarning = domain.SourceHealthWarning
 type DocumentSummary = domain.DocumentSummary
 type DocumentDetail = domain.DocumentDetail
 type SectionSummary = domain.SectionSummary
+type SectionBreadcrumb = domain.SectionBreadcrumb
+type OutlineOptions = domain.OutlineOptions
+type DocumentOutline = domain.DocumentOutline
+type SectionContext = domain.SectionContext
 type EdgeSummary = domain.EdgeSummary
 type QueryObservationInput = domain.QueryObservationInput
 type SearchResultObservationInput = domain.SearchResultObservationInput

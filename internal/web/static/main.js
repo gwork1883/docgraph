@@ -9,6 +9,8 @@ const credentialsByID = new Map();
 const sourceArtifactPages = new Map();
 const ARTIFACT_PAGE_SIZE = 50;
 const SYNC_HISTORY_PAGE_SIZE = 20;
+const SEARCH_INLINE_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const MEDIA_FETCH_CONCURRENCY = 4;
 const AUTH_TOKEN_STORAGE_KEY = "docgraph.auth.token";
 const THEME_STORAGE_KEY = "docgraph.theme";
 const WEB_PREFIX = detectWebPrefix();
@@ -16,8 +18,16 @@ let syncHistoryOffset = 0;
 let syncSchedulesBySourceID = new Map();
 let activeSyncTab = "history";
 let activeDocumentID = "";
+let activeTopicID = "";
+let previousTopicRoute = "search";
 let activeProposalStatus = "pending";
 let appReady = false;
+let displayedRoute = "";
+const activeTopicObjectURLs = new Set();
+const activeSearchObjectURLs = new Set();
+let topicMediaGeneration = 0;
+let searchMediaGeneration = 0;
+let activeTopicChildrenState = null;
 
 /* ── Toast notification system ── */
 let toastContainer = null;
@@ -61,6 +71,7 @@ const sourceHelpKeys = {
   git: "source.dsn.help.git",
   confluence: "source.dsn.help.confluence",
   webdocs: "source.dsn.help.webdocs",
+  xmind: "source.dsn.help.xmind",
 };
 
 const sourceScheduleKeys = {
@@ -198,6 +209,8 @@ function bindEvents() {
   document.querySelector("#results").addEventListener("click", onSearchResultOpenClick);
   document.querySelector("#document-back-search")?.addEventListener("click", () => navigate("search"));
   document.querySelector("#document-detail")?.addEventListener("click", onDocumentDetailClick);
+  document.querySelector("#topic-back-search")?.addEventListener("click", () => navigate(previousTopicRoute || "search"));
+  document.querySelector("#topic-detail")?.addEventListener("click", onTopicDetailClick);
   document.querySelector("#stale-documents-refresh")?.addEventListener("click", () => loadStaleDocuments());
   document.querySelector("#stale-documents")?.addEventListener("click", onStaleDocumentsClick);
   document.querySelector("#relation-proposals-refresh")?.addEventListener("click", () => loadKnowledgeRelationProposals());
@@ -224,20 +237,37 @@ function syncRouteFromHash() {
   const route = parseHashRoute();
   if (route.name === "document") {
     activeDocumentID = route.value;
+  } else if (route.name === "topic") {
+    activeTopicID = route.value;
   }
   navigate(route.name || "dashboard", false);
 }
 
 function navigate(route, updateHash = true) {
-  const knownRoutes = new Set(["dashboard", "connectors", "sync-tasks", "credentials", "search", "document", "governance", "nodes"]);
+  const current = displayedRoute || currentRoute();
+  const knownRoutes = new Set(["dashboard", "connectors", "sync-tasks", "credentials", "search", "document", "topic", "governance", "nodes"]);
   const nextRoute = knownRoutes.has(route) ? route : "dashboard";
+  if (current === "topic" && nextRoute !== "topic") {
+    topicMediaGeneration++;
+    revokeObjectURLs(activeTopicObjectURLs);
+  }
+  if (current === "search" && nextRoute !== "search") {
+    searchMediaGeneration++;
+    revokeObjectURLs(activeSearchObjectURLs);
+  }
   document.querySelectorAll("[data-view]").forEach((view) => {
     view.classList.toggle("active", view.dataset.view === nextRoute);
   });
   document.querySelectorAll("[data-route]").forEach((button) => {
     button.classList.toggle("active", button.dataset.route === nextRoute);
   });
-  const nextHash = nextRoute === "document" && activeDocumentID ? `#document/${encodeURIComponent(activeDocumentID)}` : `#${nextRoute}`;
+  displayedRoute = nextRoute;
+  let nextHash = `#${nextRoute}`;
+  if (nextRoute === "document" && activeDocumentID) {
+    nextHash = `#document/${encodeURIComponent(activeDocumentID)}`;
+  } else if (nextRoute === "topic" && activeTopicID) {
+    nextHash = `#topic/${encodeURIComponent(activeTopicID)}`;
+  }
   if (updateHash && location.hash !== nextHash) {
     history.replaceState(null, "", nextHash);
   }
@@ -444,6 +474,9 @@ async function loadRouteData(route) {
   case "document":
     await loadDocumentDetail(activeDocumentID);
     break;
+  case "topic":
+    await loadTopicDetail(activeTopicID);
+    break;
   case "governance":
     await loadGovernanceTab(activeGovernanceTab());
     break;
@@ -496,6 +529,64 @@ async function request(path, options = {}) {
     throw new Error(body.error?.message || t("error.request_failed", { status: response.status }));
   }
   return body;
+}
+
+async function fetchAuthenticatedBlob(path) {
+  const response = await apiFetch(path);
+  if (!response.ok) {
+    let message = t("error.request_failed", { status: response.status });
+    try {
+      const body = await response.clone().json();
+      message = body.error?.message || message;
+    } catch {
+      // Binary endpoints may return an empty or plain-text error response.
+    }
+    const error = new Error(message);
+    error.auth = response.status === 401;
+    throw error;
+  }
+  return {
+    blob: await response.blob(),
+    filename: responseFilename(response.headers.get("Content-Disposition")),
+  };
+}
+
+function responseFilename(contentDisposition) {
+  const value = String(contentDisposition || "");
+  const encoded = value.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded.replace(/^"|"$/g, ""));
+    } catch {
+      return encoded;
+    }
+  }
+  return value.match(/filename="([^"]+)"/i)?.[1] || value.match(/filename=([^;]+)/i)?.[1]?.trim() || "";
+}
+
+function revokeObjectURLs(urls) {
+  urls.forEach((url) => URL.revokeObjectURL(url));
+  urls.clear();
+}
+
+async function authenticatedObjectURL(path, owner) {
+  const { blob } = await fetchAuthenticatedBlob(path);
+  const url = URL.createObjectURL(blob);
+  owner.add(url);
+  return url;
+}
+
+async function downloadAuthenticated(path, fallbackName = "download") {
+  const { blob, filename } = await fetchAuthenticatedBlob(path);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || fallbackName;
+  link.hidden = true;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function onAuthSubmit(event) {
@@ -576,6 +667,10 @@ function clearAuthToken() {
 }
 
 function showLogin(messageKey = "") {
+  topicMediaGeneration++;
+  searchMediaGeneration++;
+  revokeObjectURLs(activeTopicObjectURLs);
+  revokeObjectURLs(activeSearchObjectURLs);
   const gate = document.querySelector("#auth-gate");
   const shell = document.querySelector(".app-shell");
   if (gate) {
@@ -1055,7 +1150,7 @@ function formatSourceSyncStatus(source) {
 }
 
 async function onSourcesClick(event) {
-  const button = event.target.closest("button[data-edit], button[data-sync], button[data-embedding-ensure], button[data-sync-tasks-source], button[data-artifacts], button[data-artifact-page], button[data-delete], button[data-open-node], button[data-open-document], button[data-save-desc]");
+  const button = event.target.closest("button[data-edit], button[data-sync], button[data-embedding-ensure], button[data-sync-tasks-source], button[data-artifacts], button[data-artifact-page], button[data-delete], button[data-open-node], button[data-open-document], button[data-save-desc], button[data-download-snapshot]");
   if (!button) return;
 
   if (button.dataset.edit) {
@@ -1073,6 +1168,18 @@ async function onSourcesClick(event) {
 
   if (button.dataset.openDocument) {
     openDocumentByID(button.dataset.openDocument);
+    return;
+  }
+
+  if (button.dataset.downloadSnapshot) {
+    button.disabled = true;
+    try {
+      await downloadAuthenticated(`/api/sources/${encodeURIComponent(button.dataset.downloadSnapshot)}/snapshot`, "workbook.xmind");
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      button.disabled = false;
+    }
     return;
   }
 
@@ -1342,6 +1449,8 @@ function renderSyncJobRow(job) {
   const result = parsePayload(job.result_json);
   const progress = parsePayload(job.progress_json);
   const summary = { ...payload, ...result };
+  const connectorDiagnostics = parsePayload(summary.connector_diagnostics);
+  const connectorWarnings = Array.isArray(connectorDiagnostics.warnings) ? connectorDiagnostics.warnings : [];
   const brokenLinks = Array.isArray(summary.broken_links) ? summary.broken_links : [];
   const error = String(job.last_error || "").trim();
   const active = isActiveJobStatus(job.status);
@@ -1357,11 +1466,12 @@ function renderSyncJobRow(job) {
       </div>
       <small>${escapeHTML(sourceName)} · ${escapeHTML(job.id || "")}</small>
       <div class="job-meta">
-        ${renderJobMetrics(job, summary, progress, brokenLinks)}
+        ${renderJobMetrics(job, summary, progress, brokenLinks, connectorDiagnostics)}
         <span>${escapeHTML(t("sync.attempts"))}: ${escapeHTML(job.attempts ?? 0)}</span>
         ${progress.phase ? `<span>${escapeHTML(t("jobs.progress"))}: ${escapeHTML(formatJobProgress(progress))}</span>` : ""}
       </div>
       ${error ? `<p class="job-error">${escapeHTML(error)}</p>` : ""}
+      ${connectorWarnings.length ? `<div class="health-warning-list">${connectorWarnings.map((warning) => `<p>${escapeHTML(warning)}</p>`).join("")}</div>` : ""}
       ${brokenLinks.length ? renderBrokenLinks(brokenLinks) : ""}
       <div class="item-actions">
         <button type="button" data-sync-history-source="${escapeAttr(job.source_id || "")}">${escapeHTML(t("sync.filter_source"))}</button>
@@ -1371,7 +1481,7 @@ function renderSyncJobRow(job) {
   `;
 }
 
-function renderJobMetrics(job, summary, progress, brokenLinks) {
+function renderJobMetrics(job, summary, progress, brokenLinks, connectorDiagnostics = {}) {
   if (job.kind === "maintenance_embedding_ensure") {
     return `
       <span>${escapeHTML(t("jobs.embedding.embedded"))}: ${escapeHTML(summary.embedded_sections ?? progress.embedded_sections ?? 0)}</span>
@@ -1387,7 +1497,17 @@ function renderJobMetrics(job, summary, progress, brokenLinks) {
   return `
     <span>${escapeHTML(t("jobs.documents"))}: ${escapeHTML(summary.documents ?? 0)}</span>
     <span>${escapeHTML(t("jobs.broken_links"))}: ${escapeHTML(brokenLinks.length)}</span>
+    ${connectorDiagnostics.parse_status ? `<span>${escapeHTML(t("jobs.parse_status"))}: ${escapeHTML(formatParseStatus(connectorDiagnostics.parse_status))}</span>` : ""}
+    ${connectorDiagnostics.format_family ? `<span>${escapeHTML(t("jobs.format"))}: ${escapeHTML(connectorDiagnostics.format_family)}${connectorDiagnostics.format_version ? ` ${escapeHTML(connectorDiagnostics.format_version)}` : ""}</span>` : ""}
+    ${Number.isFinite(Number(connectorDiagnostics.topics)) ? `<span>${escapeHTML(t("jobs.topics"))}: ${escapeHTML(connectorDiagnostics.topics)}</span>` : ""}
+    ${Number.isFinite(Number(connectorDiagnostics.media_assets)) ? `<span>${escapeHTML(t("jobs.media_assets"))}: ${escapeHTML(connectorDiagnostics.media_assets)}</span>` : ""}
   `;
+}
+
+function formatParseStatus(status) {
+  const key = `jobs.parse_status.${String(status || "").trim()}`;
+  const label = t(key);
+  return label === key ? humanizeToken(status) : label;
 }
 
 function formatJobKind(kind) {
@@ -1589,6 +1709,9 @@ function formatJobStatus(status) {
 }
 
 function parsePayload(value) {
+  if (value && typeof value === "object") {
+    return value;
+  }
   try {
     const parsed = JSON.parse(value || "{}");
     return parsed && typeof parsed === "object" ? parsed : {};
@@ -1635,6 +1758,8 @@ function renderSourceArtifacts(body, page, limit) {
   const nodes = body.nodes || [];
   const edges = body.edges || [];
   const embeddingStatus = body.embedding_status || null;
+  const snapshot = body.active_snapshot || body.snapshot || health.active_snapshot || health.snapshot || null;
+  const featureInventory = body.feature_inventory || health.feature_inventory || null;
   const totalDocs = counts.documents ?? 0;
   const start = page * limit;
   const end = Math.min(start + documents.length, totalDocs);
@@ -1655,7 +1780,18 @@ function renderSourceArtifacts(body, page, limit) {
       <span>${escapeHTML(t("health.section_entities"))}: ${escapeHTML(counts.section_entities ?? 0)}</span>
       <span>${escapeHTML(t("status.nodes"))}: ${escapeHTML(counts.nodes ?? 0)}</span>
       <span>${escapeHTML(t("status.edges"))}: ${escapeHTML(counts.edges ?? 0)}</span>
+      <span>${escapeHTML(t("media.assets"))}: ${escapeHTML(counts.media_assets ?? 0)}</span>
+      <span>${escapeHTML(t("media.unavailable"))}: ${escapeHTML(counts.unavailable_media_assets ?? ((counts.missing_media_assets ?? 0) + (counts.rejected_media_assets ?? 0)))}</span>
+      <span>${escapeHTML(t("media.bytes"))}: ${escapeHTML(formatBytes(counts.referenced_media_bytes ?? 0))}</span>
     </div>
+    ${snapshot ? `
+      <div class="artifact-summary source-snapshot-summary">
+        <span>${escapeHTML(t("snapshot.current"))}: ${escapeHTML(snapshot.id || snapshot.snapshot_id || snapshot.sha256 || snapshot.source_hash || "")}</span>
+        <span>${escapeHTML(t("snapshot.size"))}: ${escapeHTML(formatBytes(snapshot.size_bytes ?? counts.snapshot_bytes ?? counts.snapshot_size_bytes ?? 0))}</span>
+        <button type="button" data-download-snapshot="${escapeAttr(sourceID)}">${escapeHTML(t("snapshot.download"))}</button>
+      </div>
+    ` : ""}
+    ${renderFeatureInventory(featureInventory)}
     ${renderEmbeddingArtifactSummary(sourceID, embeddingStatus)}
     ${renderSourceHealth(health)}
     ${paginationBar}
@@ -1734,6 +1870,9 @@ function renderSourceHealth(health) {
   const lowSections = health.low_content_sections || [];
   const staleFeedback = health.stale_feedback || [];
   const entityDiagnostics = health.entity_diagnostics || {};
+  const featureInventory = health.feature_inventory || null;
+  const snapshot = health.active_snapshot || health.snapshot || null;
+  const counts = health.counts || {};
   const healthClass = warnings.some((warning) => warning.severity === "error") ? "error" : warnings.length ? "warn" : "ok";
   return `
     <details class="source-health ${escapeAttr(healthClass)}" open>
@@ -1747,7 +1886,12 @@ function renderSourceHealth(health) {
         <span>${escapeHTML(t("health.zero_section_documents"))}: ${escapeHTML(zeroDocs.length)}</span>
         <span>${escapeHTML(t("health.low_content_sections"))}: ${escapeHTML(lowSections.length)}</span>
         <span>${escapeHTML(t("health.section_entities"))}: ${escapeHTML(entityDiagnostics.total ?? health.counts?.section_entities ?? 0)}</span>
+        <span>${escapeHTML(t("media.assets"))}: ${escapeHTML(counts.media_assets ?? 0)}</span>
+        <span>${escapeHTML(t("media.unavailable"))}: ${escapeHTML(counts.unavailable_media_assets ?? ((counts.missing_media_assets ?? 0) + (counts.rejected_media_assets ?? 0)))}</span>
+        <span>${escapeHTML(t("media.bytes"))}: ${escapeHTML(formatBytes(counts.referenced_media_bytes ?? 0))}</span>
       </div>
+      ${snapshot ? `<div class="source-health-grid"><span>${escapeHTML(t("snapshot.current"))}: ${escapeHTML(snapshot.id || snapshot.snapshot_id || snapshot.sha256 || snapshot.source_hash || "")}</span><span>${escapeHTML(t("snapshot.size"))}: ${escapeHTML(formatBytes(snapshot.size_bytes ?? counts.snapshot_bytes ?? counts.snapshot_size_bytes ?? 0))}</span></div>` : ""}
+      ${renderFeatureInventory(featureInventory)}
       ${warnings.length ? `<div class="health-warning-list">${warnings.map(renderHealthWarning).join("")}</div>` : `<p class="muted">${escapeHTML(t("health.no_warnings"))}</p>`}
       ${renderHealthDocumentList(t("health.zero_section_documents"), zeroDocs)}
       ${renderHealthSectionList(t("health.low_content_sections"), lowSections)}
@@ -1755,6 +1899,89 @@ function renderSourceHealth(health) {
       ${renderHealthStaleFeedback(staleFeedback)}
     </details>
   `;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const amount = bytes / Math.pow(1024, index);
+  return `${amount >= 10 || index === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[index]}`;
+}
+
+function renderFeatureInventory(inventory) {
+  const entries = normalizeFeatureInventory(inventory);
+  if (!entries.length) return "";
+  return `
+    <details class="feature-inventory" open>
+      <summary>${escapeHTML(t("feature_inventory.title"))} (${entries.reduce((sum, entry) => sum + entry.count, 0)})</summary>
+      <div class="feature-inventory-grid">
+        ${entries.map((entry) => `
+          <div class="feature-inventory-row ${escapeAttr(entry.state)}">
+            <strong>${escapeHTML(entry.feature)}</strong>
+            <span>${escapeHTML(t(`feature_inventory.state.${entry.state}`))}</span>
+            <span>${escapeHTML(entry.count)}</span>
+            ${entry.detail ? `<small>${escapeHTML(entry.detail)}</small>` : ""}
+          </div>
+        `).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function normalizeFeatureInventory(inventory) {
+  if (!inventory) return [];
+  const direct = Array.isArray(inventory)
+    ? inventory
+    : (inventory.entries || (Array.isArray(inventory.features) ? [...inventory.features, ...(inventory.resources || [])] : inventory.features));
+  if (Array.isArray(direct)) {
+    return direct.map((entry) => {
+      const metadata = parsePayload(entry.metadata_json);
+      const samplePaths = Array.isArray(metadata.sample_paths) ? metadata.sample_paths.filter(Boolean).slice(0, 3) : [];
+      const detailParts = [
+        metadata.reason_code,
+        entry.element_path || entry.detail || entry.reason || entry.reason_code || entry.location || entry.path,
+        samplePaths.join(", "),
+        metadata.details_truncated ? t("feature_inventory.samples_truncated") : "",
+      ].filter(Boolean);
+      return {
+        feature: String(entry.feature_key || entry.feature || entry.name || entry.type || entry.path || t("feature_inventory.unknown")),
+        state: normalizeFeatureState(entry.coverage_status || entry.state || entry.status),
+        count: Math.max(1, Number(entry.count || entry.occurrences || 1)),
+        detail: [...new Set(detailParts.map(String))].join(" · "),
+      };
+    });
+  }
+  const entries = [];
+  ["indexed", "preserved", "rejected", "unsupported"].forEach((state) => {
+    const group = inventory[state];
+    if (group == null) return;
+    if (Array.isArray(group)) {
+      group.forEach((item) => {
+        if (typeof item === "string") {
+          entries.push({ feature: item, state, count: 1, detail: "" });
+        } else {
+          entries.push({ feature: String(item.feature || item.name || item.type || item.path || t("feature_inventory.unknown")), state, count: Math.max(1, Number(item.count || 1)), detail: String(item.detail || item.reason || item.path || "") });
+        }
+      });
+    } else if (typeof group === "object") {
+      Object.entries(group).forEach(([feature, value]) => {
+        const count = typeof value === "number" ? value : Number(value?.count || 1);
+        const detail = typeof value === "object" ? String(value.detail || value.reason || value.path || "") : "";
+        entries.push({ feature, state, count: Math.max(0, count), detail });
+      });
+    } else {
+      entries.push({ feature: state, state, count: Math.max(0, Number(group || 0)), detail: "" });
+    }
+  });
+  return entries.filter((entry) => entry.count > 0);
+}
+
+function normalizeFeatureState(value) {
+  const state = String(value || "unsupported").toLowerCase().replaceAll("-", "_");
+  if (state === "preserved_only") return "preserved";
+  return ["indexed", "preserved", "rejected", "unsupported"].includes(state) ? state : "unsupported";
 }
 
 function renderSectionEntityRow(entity) {
@@ -1885,6 +2112,8 @@ function renderArtifactList(title, rows) {
 
 async function onSearchSubmit(event) {
   event.preventDefault();
+  const mediaGeneration = ++searchMediaGeneration;
+  revokeObjectURLs(activeSearchObjectURLs);
   const form = new FormData(event.currentTarget);
   const container = document.querySelector("#results");
   const summary = document.querySelector("#search-summary");
@@ -1897,6 +2126,7 @@ async function onSearchSubmit(event) {
       method: "POST",
       body: JSON.stringify({ query, limit }),
     });
+    if (mediaGeneration !== searchMediaGeneration || currentRoute() !== "search") return;
     if (!body.hits?.length) {
       summary.textContent = t("search.empty_for", { query });
       return;
@@ -1907,20 +2137,29 @@ async function onSearchSubmit(event) {
     body.hits.forEach((hit) => {
       const item = document.createElement("div");
       item.className = "search-result";
-      const title = hit.title || hit.heading_path || hit.document_title || hit.document_id;
+      const rawTitle = hit.title || hit.heading_path || hit.document_title || hit.document_id;
+      const title = [hit.display_number, rawTitle].filter(Boolean).join(" ");
       const url = hit.document_url || hit.document_id || "";
-      const path = [hit.document_title, hit.heading_path].filter(Boolean).join(" / ");
+      const ancestry = normalizeAncestry(hit.ancestry);
+      const path = [hit.document_title, ...(ancestry.length ? ancestry.map(topicEntryTitle) : [hit.heading_path])].filter(Boolean).join(" / ");
       const tags = hit.profile?.top_tags || [];
       const matchedFields = hit.query_match?.matched_fields || [];
       const matchedEntities = hit.matched_entities || [];
       const relationMatches = renderRelationMatches(hit.relation_matches || []);
       const scoreBreakdown = renderScoreBreakdown(hit.score_breakdown, hit.rank, hit.rrf_contribution);
       const evidence = renderEvidence(hit);
+      const media = renderSearchMediaAssets(hit.media_assets || []);
+      const authoredRelationCount = Number(hit.authored_relation_count || 0);
       item.innerHTML = `
-        <button class="result-title result-title-button" type="button" data-open-document="${escapeAttr(hit.document_id || "")}">${escapeHTML(title)}</button>
+        <button class="result-title result-title-button" type="button" ${hit.section_id ? `data-open-topic="${escapeAttr(hit.section_id)}"` : `data-open-document="${escapeAttr(hit.document_id || "")}"`}>${escapeHTML(title)}</button>
         <div class="result-url">${escapeHTML(url)}</div>
-        <div class="result-path">${escapeHTML(path || hit.document_id)}</div>
+        <details class="result-path" ${ancestry.length > 3 ? "" : "open"}><summary>${escapeHTML(t("topic.ancestry"))}</summary><span>${escapeHTML(path || hit.document_id)}</span></details>
         ${evidence}
+        <div class="result-tags">
+          ${hit.element_kind ? `<span>${escapeHTML(hit.element_kind)}</span>` : ""}
+          ${hit.node_id ? `<span>${escapeHTML(t("node.id"))}: ${escapeHTML(hit.node_id)}</span>` : ""}
+          ${authoredRelationCount ? `<span>${escapeHTML(t("topic.authored_relations"))}: ${escapeHTML(authoredRelationCount)}</span>` : ""}
+        </div>
         ${hit.desc ? `<p class="result-desc">${escapeHTML(hit.desc)}</p>` : ""}
         ${tags.length ? `<div class="result-tags">${tags.slice(0, 6).map((tag) => `<span>${escapeHTML(tag)}</span>`).join("")}</div>` : ""}
         ${matchedFields.length ? `<small class="result-match">${escapeHTML(t("search.matched_fields"))}: ${escapeHTML(matchedFields.join(", "))}</small>` : ""}
@@ -1928,6 +2167,7 @@ async function onSearchSubmit(event) {
         ${relationMatches}
         ${scoreBreakdown}
         <p class="result-snippet">${safeSnippetHTML(hit.snippet || hit.content || "")}</p>
+        ${media}
         <div class="result-actions">
           ${hit.document_url ? `<a class="secondary-link-button" href="${escapeAttr(hit.document_url)}" target="_blank" rel="noreferrer">${escapeHTML(t("document.open_source"))}</a>` : ""}
           <button type="button" data-feedback-canonical>${escapeHTML(t("feedback.canonical"))}</button>
@@ -1938,11 +2178,113 @@ async function onSearchSubmit(event) {
       item.querySelector("[data-feedback-stale]").dataset.documentId = hit.document_id || "";
       container.appendChild(item);
     });
+    await hydrateMediaImages(container, activeSearchObjectURLs, "[data-media-image-asset]", mediaGeneration);
   } catch (error) {
+    if (mediaGeneration !== searchMediaGeneration) return;
     summary.textContent = "";
     container.innerHTML = "";
     alert(error.message);
   }
+}
+
+function renderSearchMediaAssets(assets) {
+  if (!Array.isArray(assets) || !assets.length) return "";
+  const shown = assets.slice(0, 3);
+  const remaining = Math.max(0, assets.length - shown.length);
+  return `
+    <div class="search-media-strip">
+      ${shown.map((asset) => {
+        const id = mediaAssetID(asset);
+        const status = mediaAssetStatus(asset);
+		if (mediaIsSearchPreviewable(asset) && mediaCanLoad(asset) && id) {
+          return `<div class="search-media-thumb" data-media-image-asset="${escapeAttr(id)}"><span>${escapeHTML(t("media.loading"))}</span></div>`;
+        }
+        return `<div class="search-media-thumb media-placeholder ${escapeAttr(status)}"><strong>${escapeHTML(mediaAssetName(asset))}</strong><span>${escapeHTML(mediaStatusLabel(asset))}</span></div>`;
+      }).join("")}
+      ${remaining ? `<span class="search-media-remaining">+${escapeHTML(remaining)}</span>` : ""}
+    </div>
+  `;
+}
+
+async function hydrateMediaImages(root, owner, selector, generation) {
+	const targets = [...root.querySelectorAll(selector)];
+	const groups = new Map();
+	for (const target of targets) {
+		const assetID = target.dataset.mediaImageAsset || target.dataset.topicImageAsset;
+		if (!assetID) continue;
+		if (!groups.has(assetID)) groups.set(assetID, []);
+		groups.get(assetID).push(target);
+	}
+	const entries = [...groups.entries()];
+	let cursor = 0;
+	async function worker() {
+		while (cursor < entries.length) {
+			const [assetID, assetTargets] = entries[cursor++];
+		try {
+			const url = await authenticatedObjectURL(`/api/media-assets/${encodeURIComponent(assetID)}/content`, owner);
+			const routeChanged = (owner === activeTopicObjectURLs && currentRoute() !== "topic") || (owner === activeSearchObjectURLs && currentRoute() !== "search");
+			const generationChanged = (owner === activeTopicObjectURLs && generation !== topicMediaGeneration) || (owner === activeSearchObjectURLs && generation !== searchMediaGeneration);
+			const connectedTargets = assetTargets.filter((target) => target.isConnected);
+			if (!connectedTargets.length || routeChanged || generationChanged) {
+				URL.revokeObjectURL(url);
+				owner.delete(url);
+				continue;
+			}
+			for (const target of connectedTargets) {
+				const image = document.createElement("img");
+				image.src = url;
+				image.alt = target.dataset.mediaAlt || "";
+				image.loading = "lazy";
+				target.replaceChildren(image);
+			}
+		} catch (error) {
+			for (const target of assetTargets) {
+				target.classList.add("media-placeholder", "missing");
+				target.replaceChildren(document.createTextNode(error.message));
+			}
+		}
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(MEDIA_FETCH_CONCURRENCY, entries.length) }, () => worker()));
+}
+
+function mediaAssetID(asset) {
+  return String(asset?.id || asset?.asset_id || "").trim();
+}
+
+function mediaAssetName(asset) {
+  const metadata = mediaMetadata(asset);
+  return String(asset?.original_name || asset?.filename || asset?.name || asset?.external_id || metadata.original_name || metadata.filename || mediaAssetID(asset) || t("media.unnamed"));
+}
+
+function mediaAssetStatus(asset) {
+  return String(asset?.status || (asset?.blob_sha256 ? "preserved" : "missing")).toLowerCase().replaceAll("-", "_");
+}
+
+function mediaCanLoad(asset) {
+  const status = mediaAssetStatus(asset);
+  return Boolean(mediaAssetID(asset)) && !["missing", "rejected", "external", "unsupported", "preserved_only"].includes(status) && asset?.has_content !== false;
+}
+
+function mediaIsPreviewableImage(asset) {
+  const mediaType = String(asset?.media_type || asset?.sniffed_media_type || "").toLowerCase().split(";", 1)[0].trim();
+  return ["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp"].includes(mediaType);
+}
+
+function mediaIsSearchPreviewable(asset) {
+	const size = Number(asset?.size_bytes || asset?.size || 0);
+	return mediaIsPreviewableImage(asset) && size > 0 && size <= SEARCH_INLINE_PREVIEW_MAX_BYTES;
+}
+
+function mediaMetadata(asset) {
+  return parsePayload(asset?.metadata_json || asset?.metadata || "{}");
+}
+
+function mediaStatusLabel(asset) {
+  const status = mediaAssetStatus(asset);
+  const key = `media.status.${status}`;
+  const label = t(key);
+  return label === key ? humanizeToken(status) : label;
 }
 
 function renderHybridSearchMeta(body) {
@@ -2166,6 +2508,11 @@ async function onSearchFeedbackClick(event) {
 }
 
 function onSearchResultOpenClick(event) {
+  const topicButton = event.target.closest("button[data-open-topic]");
+  if (topicButton) {
+    openTopicByID(topicButton.dataset.openTopic, "search");
+    return;
+  }
   const button = event.target.closest("button[data-open-document]");
   if (!button) return;
   openDocumentByID(button.dataset.openDocument);
@@ -2175,6 +2522,368 @@ function openDocumentByID(id) {
   activeDocumentID = String(id || "").trim();
   if (!activeDocumentID) return;
   navigate("document");
+}
+
+function openTopicByID(id, fromRoute = "") {
+  activeTopicID = String(id || "").trim();
+  if (!activeTopicID) return;
+  const route = fromRoute || currentRoute();
+  if (route && route !== "topic") {
+    previousTopicRoute = route;
+  }
+  navigate("topic");
+}
+
+async function loadTopicDetail(sectionID) {
+  const container = document.querySelector("#topic-detail");
+  const subtitle = document.querySelector("#topic-detail-subtitle");
+  if (!container) return;
+	const mediaGeneration = ++topicMediaGeneration;
+	activeTopicChildrenState = null;
+  revokeObjectURLs(activeTopicObjectURLs);
+  sectionID = String(sectionID || "").trim();
+  if (!sectionID) {
+    container.innerHTML = `<p class="muted">${escapeHTML(t("topic.empty"))}</p>`;
+    if (subtitle) subtitle.textContent = "";
+    return;
+  }
+  container.innerHTML = `<p class="muted">${escapeHTML(t("topic.loading"))}</p>`;
+  try {
+		const detail = await request(`/api/sections/${encodeURIComponent(sectionID)}/context`);
+		if (mediaGeneration !== topicMediaGeneration || activeTopicID !== sectionID || currentRoute() !== "topic") return;
+		activeTopicChildrenState = normalizeTopicChildrenState(detail, sectionID);
+		detail.children = activeTopicChildrenState.sections;
+		detail.children_page = activeTopicChildrenState;
+    const section = topicRecord(detail.section);
+    const documentInfo = detail.document || {};
+    const source = detail.source || {};
+    if (subtitle) {
+      subtitle.textContent = [source.name || source.id, documentInfo.title || documentInfo.id, section.id || sectionID].filter(Boolean).join(" · ");
+    }
+    container.innerHTML = renderTopicDetail(detail);
+    await hydrateMediaImages(container, activeTopicObjectURLs, "[data-topic-image-asset]", mediaGeneration);
+  } catch (error) {
+    if (mediaGeneration !== topicMediaGeneration) return;
+    container.innerHTML = "";
+    if (subtitle) subtitle.textContent = "";
+    alert(error.message);
+  }
+}
+
+function renderTopicDetail(detail) {
+  const section = topicRecord(detail.section);
+  const documentInfo = detail.document || {};
+  const source = detail.source || {};
+  const structure = detail.structure || section.structure || {};
+  const ancestors = normalizeAncestry(detail.ancestors);
+	const children = Array.isArray(detail.children) ? detail.children : [];
+	const childrenPage = detail.children_page || {};
+  const assets = Array.isArray(detail.media_assets) ? detail.media_assets : [];
+  const relations = Array.isArray(detail.authored_relations) ? detail.authored_relations : [];
+  const displayNumber = String(structure.display_number || section.display_number || "").trim();
+  const rawTitle = String(section.raw_title || section.title || "").trim();
+  const displayTitle = [displayNumber, rawTitle].filter(Boolean).join(" ") || section.id || t("topic.untitled");
+  const metadata = topicMetadata(section, structure);
+  const sourceID = source.id || section.source_id || documentInfo.source_id || detail.snapshot?.source_id || "";
+  return `
+    ${renderTopicBreadcrumb(ancestors, section)}
+    <header class="topic-header">
+      <div>
+        <span class="topic-kind">${escapeHTML(structure.element_kind || section.element_kind || "Topic")}</span>
+        <h3>${escapeHTML(displayTitle)}</h3>
+        ${displayNumber && rawTitle ? `<p class="muted">${escapeHTML(t("topic.raw_title"))}: ${escapeHTML(rawTitle)}</p>` : ""}
+      </div>
+      <div class="topic-header-actions">
+        ${sourceID && detail.snapshot ? `<button type="button" data-download-snapshot="${escapeAttr(sourceID)}">${escapeHTML(t("snapshot.download"))}</button>` : ""}
+      </div>
+    </header>
+    <div class="topic-summary-grid">
+      <div><span>${escapeHTML(t("topic.sheet"))}</span><strong>${escapeHTML(documentInfo.title || documentInfo.external_id || documentInfo.id || "")}</strong></div>
+      <div><span>${escapeHTML(t("topic.depth"))}</span><strong>${escapeHTML(structure.depth ?? "")}</strong></div>
+      <div><span>${escapeHTML(t("topic.sibling_order"))}</span><strong>${escapeHTML(structure.sibling_ordinal ?? structure.ordinal ?? "")}</strong></div>
+      <div><span>${escapeHTML(t("topic.media"))}</span><strong>${escapeHTML(assets.length)}</strong></div>
+      <div><span>${escapeHTML(t("topic.authored_relations"))}</span><strong>${escapeHTML(relations.length)}</strong></div>
+    </div>
+    ${section.content ? `<section class="topic-section"><h4>${escapeHTML(t("topic.notes"))}</h4><div class="topic-notes">${renderSourceText(section.content)}</div></section>` : ""}
+    ${renderTopicMetadata(metadata)}
+    ${renderTopicMedia(assets)}
+		${renderTopicChildren(children, childrenPage)}
+    ${renderTopicRelations(relations, section.id)}
+    ${renderFeatureInventory(detail.feature_inventory)}
+    <details class="topic-section topic-provenance" open>
+      <summary>${escapeHTML(t("topic.provenance"))}</summary>
+      <div class="document-meta-list">
+        <small>${escapeHTML(t("topic.topic_id"))}: ${escapeHTML(structure.source_element_id || section.source_element_id || section.id || "")}</small>
+        <small>${escapeHTML(t("document.field.id"))}: ${escapeHTML(section.id || "")}</small>
+        <small>${escapeHTML(t("node.id"))}: ${escapeHTML(section.node_id || "")}</small>
+        <small>${escapeHTML(t("topic.sheet_id"))}: ${escapeHTML(documentInfo.external_id || documentInfo.id || "")}</small>
+        <small>${escapeHTML(t("topic.order_path"))}: ${escapeHTML(formatOrderPath(structure.order_path || structure.order_path_json))}</small>
+        <small>${escapeHTML(t("snapshot.current"))}: ${escapeHTML(detail.snapshot?.id || detail.snapshot?.snapshot_id || detail.snapshot?.sha256 || detail.snapshot?.source_hash || "")}</small>
+      </div>
+    </details>
+  `;
+}
+
+function topicRecord(value) {
+  const section = value?.section || value || {};
+  if (section.id || !section.section_id) return section;
+  return { ...section, id: section.section_id };
+}
+
+function normalizeAncestry(value) {
+  return Array.isArray(value) ? value.map(topicRecord) : [];
+}
+
+function topicEntryTitle(value) {
+  const entry = topicRecord(value);
+  const structure = value?.structure || entry.structure || {};
+  const title = entry.raw_title || entry.title || entry.heading_path || entry.id || "";
+  const number = structure.display_number || entry.display_number || "";
+  return [number, title].filter(Boolean).join(" ");
+}
+
+function renderTopicBreadcrumb(ancestors, section) {
+  const entries = [...ancestors, section].filter((entry) => entry?.id || topicEntryTitle(entry));
+  if (!entries.length) return "";
+  return `
+    <nav class="topic-breadcrumb" aria-label="${escapeAttr(t("topic.ancestry"))}">
+      ${entries.map((entry, index) => {
+        const current = index === entries.length - 1;
+        const title = topicEntryTitle(entry);
+        return `${index ? `<span aria-hidden="true">›</span>` : ""}${!current && entry.id ? `<button type="button" data-open-topic="${escapeAttr(entry.id)}">${escapeHTML(title)}</button>` : `<strong>${escapeHTML(title)}</strong>`}`;
+      }).join("")}
+    </nav>
+  `;
+}
+
+function topicMetadata(section, structure) {
+  const raw = parsePayload(section.metadata_json || section.metadata || "{}");
+  const presentation = parsePayload(structure.presentation_json || structure.presentation || "{}");
+  return {
+    labels: section.labels || raw.labels || [],
+    markers: section.markers || raw.markers || [],
+    task: section.task || section.tasks || raw.task || raw.tasks || null,
+    links: section.links || raw.links || [],
+    numbering: section.numbering || raw.numbering || presentation.numbering || null,
+    position: section.position || raw.position || presentation.position || null,
+  };
+}
+
+function renderTopicMetadata(metadata) {
+  const rows = [
+    [t("topic.labels"), metadata.labels],
+    [t("topic.markers"), metadata.markers],
+    [t("topic.tasks"), metadata.task],
+    [t("topic.links"), metadata.links],
+    [t("topic.numbering"), metadata.numbering],
+    [t("topic.position"), metadata.position],
+  ].filter(([, value]) => hasDisplayValue(value));
+  if (!rows.length) return "";
+  return `
+    <section class="topic-section">
+      <h4>${escapeHTML(t("topic.metadata"))}</h4>
+      <div class="topic-metadata-grid">
+        ${rows.map(([label, value]) => `<div><span>${escapeHTML(label)}</span><strong>${escapeHTML(formatMetadataValue(value))}</strong></div>`).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function hasDisplayValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return value !== null && value !== undefined && String(value).trim() !== "";
+}
+
+function formatMetadataValue(value) {
+  if (Array.isArray(value)) return value.map((item) => formatMetadataValue(item)).filter(Boolean).join(", ");
+  if (value && typeof value === "object") {
+    return Object.entries(value).map(([key, item]) => `${humanizeToken(key)}: ${formatMetadataValue(item)}`).join(" · ");
+  }
+  return String(value ?? "");
+}
+
+function renderSourceText(value) {
+  return String(value || "").split(/\n{2,}/).map((paragraph) => `<p>${escapeHTML(paragraph).replaceAll("\n", "<br>")}</p>`).join("");
+}
+
+function renderTopicChildren(children, page = {}) {
+	const hasMore = page.has_more === true || page.hasMore === true;
+	const loadedLabel = `${children.length}${hasMore ? "+" : ""}`;
+	return `
+		<section class="topic-section" data-topic-children-section>
+			<h4>${escapeHTML(t("topic.children"))} (${escapeHTML(loadedLabel)})</h4>
+			${children.length ? `<div class="topic-child-list">${children.map((child) => {
+				const section = topicRecord(child);
+				const structure = child.structure || section.structure || {};
+				return `<button type="button" data-open-topic="${escapeAttr(section.id || child.section_id || "")}"><span>${escapeHTML(topicEntryTitle(child))}</span><small>${escapeHTML(structure.element_kind || section.element_kind || "Topic")}</small></button>`;
+			}).join("")}</div>` : `<p class="muted">${escapeHTML(t("topic.children_empty"))}</p>`}
+			${hasMore ? `<button type="button" data-load-topic-children>${escapeHTML(t("topic.children_load_more"))}</button>` : ""}
+		</section>
+	`;
+}
+
+function normalizeTopicChildrenState(detail, parentSectionID) {
+	const page = detail?.children_page || {};
+	const sections = Array.isArray(page.sections) ? page.sections : (Array.isArray(detail?.children) ? detail.children : []);
+	return {
+		document_id: String(page.document_id || detail?.document?.id || detail?.section?.document_id || ""),
+		parent_section_id: String(page.parent_section_id || parentSectionID || ""),
+		sections: mergeUniqueTopicChildren([], sections),
+		limit: Number(page.limit) > 0 ? Number(page.limit) : 100,
+		offset: Number(page.offset) >= 0 ? Number(page.offset) : 0,
+		has_more: page.has_more === true || page.hasMore === true,
+	};
+}
+
+function mergeTopicChildrenPage(state, page) {
+	if (!state) return normalizeTopicChildrenState({ children_page: page }, page?.parent_section_id || "");
+	const documentID = String(page?.document_id || state.document_id || "");
+	const parentSectionID = String(page?.parent_section_id || state.parent_section_id || "");
+	if (documentID !== state.document_id || parentSectionID !== state.parent_section_id) return state;
+	return {
+		...state,
+		sections: mergeUniqueTopicChildren(state.sections, Array.isArray(page?.sections) ? page.sections : []),
+		limit: Number(page?.limit) > 0 ? Number(page.limit) : state.limit,
+		offset: Number(page?.offset) >= 0 ? Number(page.offset) : state.offset,
+		has_more: page?.has_more === true || page?.hasMore === true,
+	};
+}
+
+function mergeUniqueTopicChildren(existing, incoming) {
+	const merged = [];
+	const seen = new Set();
+	for (const child of [...(existing || []), ...(incoming || [])]) {
+		const id = String(topicRecord(child).id || "");
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		merged.push(child);
+	}
+	return merged;
+}
+
+async function loadMoreTopicChildren(button) {
+	const state = activeTopicChildrenState;
+	if (!state?.has_more || !state.document_id || !state.parent_section_id) return;
+	const generation = topicMediaGeneration;
+	button.disabled = true;
+	try {
+		const params = new URLSearchParams({
+			parent_section_id: state.parent_section_id,
+			limit: String(state.limit || 100),
+			offset: String(state.sections.length),
+		});
+		const page = await request(`/api/documents/${encodeURIComponent(state.document_id)}/outline?${params}`);
+		if (generation !== topicMediaGeneration || activeTopicID !== state.parent_section_id || currentRoute() !== "topic") return;
+		activeTopicChildrenState = mergeTopicChildrenPage(state, page);
+		const section = button.closest("[data-topic-children-section]");
+		if (section) section.outerHTML = renderTopicChildren(activeTopicChildrenState.sections, activeTopicChildrenState);
+	} catch (error) {
+		alert(error.message);
+	} finally {
+		button.disabled = false;
+	}
+}
+
+function renderTopicMedia(assets) {
+  if (!assets.length) return `<section class="topic-section"><h4>${escapeHTML(t("topic.media"))} (0)</h4><p class="muted">${escapeHTML(t("media.empty"))}</p></section>`;
+  return `
+    <section class="topic-section">
+      <h4>${escapeHTML(t("topic.media"))} (${assets.length})</h4>
+      <div class="topic-media-gallery">
+        ${assets.map((asset) => {
+          const id = mediaAssetID(asset);
+          const status = mediaAssetStatus(asset);
+          const name = mediaAssetName(asset);
+          const metadata = mediaMetadata(asset);
+          const diagnostic = asset.diagnostic || asset.reason || asset.original_uri || asset.uri || metadata.diagnostic || metadata.reason || metadata.original_uri || metadata.uri || "";
+          const caption = asset.caption || asset.alt || metadata.caption || metadata.alt || "";
+          const canLoad = mediaCanLoad(asset);
+          return `
+            <article class="topic-media-card ${escapeAttr(status)}">
+              ${mediaIsPreviewableImage(asset) && canLoad ? `<div class="topic-image" data-topic-image-asset="${escapeAttr(id)}" data-media-alt="${escapeAttr(caption || name)}"><span>${escapeHTML(t("media.loading"))}</span></div>` : `<div class="topic-media-placeholder"><strong>${escapeHTML(mediaStatusLabel(asset))}</strong><span>${escapeHTML(asset.media_type || asset.kind || "")}</span></div>`}
+              <div class="topic-media-info">
+                <strong>${escapeHTML(name)}</strong>
+                <small>${escapeHTML(mediaStatusLabel(asset))}${asset.size_bytes ? ` · ${escapeHTML(formatBytes(asset.size_bytes))}` : ""}</small>
+                ${caption ? `<p>${escapeHTML(caption)}</p>` : ""}
+                ${diagnostic ? `<p class="warn-text">${escapeHTML(diagnostic)}</p>` : ""}
+                ${canLoad ? `<button type="button" data-download-media="${escapeAttr(id)}" data-media-filename="${escapeAttr(name)}">${escapeHTML(t(mediaIsPreviewableImage(asset) ? "media.open" : "media.download"))}</button>` : ""}
+              </div>
+            </article>
+          `;
+        }).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderTopicRelations(relations, currentSectionID) {
+  return `
+    <section class="topic-section">
+      <h4>${escapeHTML(t("topic.authored_relations"))} (${relations.length})</h4>
+      ${relations.length ? `<div class="topic-relation-list">${relations.map((relation) => {
+        const edge = relation.edge || relation;
+        const edgeMetadata = parsePayload(edge.metadata_json || edge.metadata || "{}");
+        const nodeMetadata = parsePayload(relation.node?.metadata_json || "{}");
+        const direction = relation.direction || edge.direction || "both";
+        const targetID = relation.target_section_id || relation.other_section_id || nodeMetadata.section_id || (edge.src_section_id === currentSectionID ? edge.dst_section_id : edge.src_section_id) || "";
+        const targetTitle = relation.target_title || relation.other_title || relation.node?.name || targetID;
+        const arrows = [edge.start_arrow || edgeMetadata.start_arrow, edge.end_arrow || edgeMetadata.end_arrow].filter(Boolean).join(" / ");
+        return `
+          <article class="topic-relation-row">
+            <div><strong>${escapeHTML(edge.label || edgeMetadata.label || edge.kind || "related_to")}</strong><small>${escapeHTML(direction)} · ${escapeHTML(edge.provenance || "source_authored")}${arrows ? ` · ${escapeHTML(arrows)}` : ""}</small></div>
+            <span>${escapeHTML(targetTitle)}</span>
+            ${targetID ? `<button type="button" data-open-topic="${escapeAttr(targetID)}">${escapeHTML(t("topic.open_related"))}</button>` : ""}
+          </article>
+        `;
+      }).join("")}</div>` : `<p class="muted">${escapeHTML(t("topic.relations_empty"))}</p>`}
+    </section>
+  `;
+}
+
+function formatOrderPath(value) {
+  if (Array.isArray(value)) return `[${value.join(", ")}]`;
+  if (typeof value === "string") {
+    const parsed = parsePayload(value);
+    if (Array.isArray(parsed)) return `[${parsed.join(", ")}]`;
+    return value;
+  }
+  return value == null ? "" : formatMetadataValue(value);
+}
+
+async function onTopicDetailClick(event) {
+  const topicButton = event.target.closest("button[data-open-topic]");
+	if (topicButton) {
+    openTopicByID(topicButton.dataset.openTopic, previousTopicRoute);
+    return;
+	}
+	const loadChildrenButton = event.target.closest("button[data-load-topic-children]");
+	if (loadChildrenButton) {
+		await loadMoreTopicChildren(loadChildrenButton);
+		return;
+	}
+  const mediaButton = event.target.closest("button[data-download-media]");
+  if (mediaButton) {
+    mediaButton.disabled = true;
+    try {
+      await downloadAuthenticated(`/api/media-assets/${encodeURIComponent(mediaButton.dataset.downloadMedia)}/content`, mediaButton.dataset.mediaFilename || "attachment");
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      mediaButton.disabled = false;
+    }
+    return;
+  }
+  const snapshotButton = event.target.closest("button[data-download-snapshot]");
+  if (!snapshotButton) return;
+  snapshotButton.disabled = true;
+  try {
+    await downloadAuthenticated(`/api/sources/${encodeURIComponent(snapshotButton.dataset.downloadSnapshot)}/snapshot`, "workbook.xmind");
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    snapshotButton.disabled = false;
+  }
 }
 
 async function loadDocumentDetail(documentID) {
@@ -2920,4 +3629,22 @@ function safeSnippetHTML(value) {
     .replaceAll("&lt;/mark&gt;", "</mark>");
 }
 
-init();
+globalThis.DocGraphWebModel = Object.freeze({
+  apiFetch,
+  buildSourceConfig,
+  fetchAuthenticatedBlob,
+  formatOrderPath,
+	mediaAssetStatus,
+	mediaIsPreviewableImage,
+	mediaIsSearchPreviewable,
+	mergeTopicChildrenPage,
+	normalizeTopicChildrenState,
+  normalizeFeatureInventory,
+  responseFilename,
+  revokeObjectURLs,
+  topicRecord,
+});
+
+if (!globalThis.__DOCGRAPH_WEB_TEST__) {
+  init();
+}

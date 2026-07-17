@@ -42,6 +42,7 @@ type EmbeddingOptions struct {
 	Tokenizer          string
 	ChunkStrategy      string
 	GeneratorVersion   string
+	SyncOptions        syncsvc.ServiceOptions
 }
 
 func NewDefaultRegistryWithEmbedding(store storage.Store, embedder embedding.Embedder, opts EmbeddingOptions) *Registry {
@@ -52,7 +53,7 @@ func NewDefaultRegistryWithEmbedding(store storage.Store, embedder embedding.Emb
 	}
 	limits := resolvedLimitsFromOptions(opts)
 	registry.Register("sync_source", func(ctx context.Context, job storage.Job) error {
-		_, err := syncsvc.NewService(store).RunSyncJob(ctx, job)
+		_, err := syncsvc.NewServiceWithOptions(store, opts.SyncOptions).RunSyncJob(ctx, job)
 		if err != nil {
 			return err
 		}

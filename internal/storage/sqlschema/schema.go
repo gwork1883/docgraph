@@ -1,6 +1,6 @@
 package sqlschema
 
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 7
 
 type Status struct {
 	StorageDSN string `json:"storage_dsn"`
@@ -71,11 +71,25 @@ create table if not exists sections (
   heading_path text not null default '',
   title text not null default '',
   content text not null default '',
+  search_text text not null default '',
   content_hash text not null,
   ordinal integer not null default 0,
   metadata_json text not null default '{}',
   created_at text not null default current_timestamp,
   updated_at text not null default current_timestamp
+);
+
+create table if not exists section_structures (
+  section_id text primary key references sections(id) on delete cascade,
+  document_id text not null references documents(id) on delete cascade,
+  parent_section_id text references sections(id) on delete cascade,
+  source_element_id text not null,
+  element_kind text not null,
+  depth integer not null,
+  sibling_ordinal integer not null,
+  order_path_json text not null default '[]' check(json_valid(order_path_json)),
+  display_number text not null default '',
+  presentation_json text not null default '{}' check(json_valid(presentation_json))
 );
 
 create table if not exists document_profiles (
@@ -152,6 +166,8 @@ create table if not exists nodes (
   canonical_name text not null,
   metadata_json text not null default '{}',
   confidence real not null default 1.0,
+  owner_source_id text references sources(id) on delete cascade,
+  owner_scope text not null default '',
   created_at text not null default current_timestamp,
   updated_at text not null default current_timestamp
 );
@@ -166,8 +182,93 @@ create table if not exists edges (
   evidence_section_id text references sections(id) on delete set null,
   source_revision text not null default '',
   metadata_json text not null default '{}',
+  owner_source_id text references sources(id) on delete cascade,
+  owner_scope text not null default '',
   created_at text not null default current_timestamp,
   updated_at text not null default current_timestamp
+);
+
+-- Graph ownership is intentionally separate from graph membership. A node or
+-- edge may be visible from more than one source, while owner_source_id remains
+-- the exclusive lifecycle owner used by workbook reconciliation.
+create table if not exists source_nodes (
+  source_id text not null references sources(id) on delete cascade,
+  node_id text not null references nodes(id) on delete cascade,
+  ref_mask integer not null default 0,
+  primary key(source_id, node_id)
+) without rowid;
+
+create table if not exists document_nodes (
+  document_id text not null references documents(id) on delete cascade,
+  node_id text not null references nodes(id) on delete cascade,
+  primary key(document_id, node_id)
+) without rowid;
+
+create table if not exists source_edges (
+  source_id text not null references sources(id) on delete cascade,
+  edge_id text not null references edges(id) on delete cascade,
+  ref_mask integer not null default 0,
+  primary key(source_id, edge_id)
+) without rowid;
+
+create table if not exists media_blobs (
+  sha256 text primary key,
+  size_bytes integer not null,
+  sniffed_media_type text not null,
+  storage_key text not null,
+  created_at text not null default current_timestamp
+);
+
+create table if not exists source_snapshots (
+  id text primary key,
+  source_id text not null references sources(id) on delete cascade,
+  source_hash text not null,
+  blob_sha256 text not null references media_blobs(sha256),
+  format_family text not null,
+  format_version text not null default '',
+  semantic_hash text not null default '',
+  media_manifest_hash text not null default '',
+  metadata_json text not null default '{}',
+  active integer not null default 0,
+  created_at text not null default current_timestamp,
+  unique(source_id, source_hash)
+);
+
+create table if not exists media_assets (
+  id text primary key,
+  source_id text not null references sources(id) on delete cascade,
+  snapshot_id text not null references source_snapshots(id) on delete cascade,
+  document_id text not null references documents(id) on delete cascade,
+  external_id text not null,
+  blob_sha256 text references media_blobs(sha256),
+  kind text not null,
+  original_name text not null default '',
+  media_type text not null default '',
+  size_bytes integer not null default 0,
+  status text not null,
+  metadata_json text not null default '{}',
+  created_at text not null default current_timestamp,
+  updated_at text not null default current_timestamp,
+  unique(document_id, external_id)
+);
+
+create table if not exists section_media_refs (
+  section_id text not null references sections(id) on delete cascade,
+  asset_id text not null references media_assets(id) on delete cascade,
+  role text not null,
+  ordinal integer not null,
+  metadata_json text not null default '{}',
+  primary key(section_id, asset_id, role, ordinal)
+);
+
+create table if not exists source_feature_inventory (
+  id text primary key,
+  snapshot_id text not null references source_snapshots(id) on delete cascade,
+  feature_key text not null,
+  coverage_status text not null check(coverage_status in ('indexed', 'preserved', 'rejected', 'unsupported')),
+  element_path text not null default '',
+  count integer not null default 1,
+  metadata_json text not null default '{}'
 );
 
 create table if not exists aliases (
@@ -264,6 +365,14 @@ create virtual table if not exists fts_section_tokens_trigram using fts5(
   tokenize='trigram'
 );
 
+create virtual table if not exists fts_section_shortgrams using fts5(
+  title_grams,
+  section_heading_grams,
+  content_grams,
+  section_id unindexed,
+  document_id unindexed
+);
+
 create virtual table if not exists fts_nodes using fts5(
   kind,
   name,
@@ -272,12 +381,66 @@ create virtual table if not exists fts_nodes using fts5(
   node_id unindexed
 );
 
+create virtual table if not exists fts_nodes_trigram using fts5(
+  id,
+  kind,
+  name,
+  canonical_name,
+  metadata_json,
+  node_id unindexed,
+  tokenize='trigram'
+);
+
+create virtual table if not exists fts_nodes_shortgrams using fts5(
+  id_grams,
+  kind_grams,
+  name_grams,
+  canonical_name_grams,
+  node_id unindexed
+);
+
+create virtual table if not exists fts_document_profiles using fts5(
+  desc_tokens,
+  profile_tokens,
+  document_id unindexed
+);
+
+create virtual table if not exists fts_document_profiles_trigram using fts5(
+  desc_tokens,
+  profile_tokens,
+  document_id unindexed,
+  tokenize='trigram'
+);
+
+create virtual table if not exists fts_section_entities using fts5(
+  canonical_text,
+  raw_text,
+  path,
+  operation,
+  entity_id unindexed
+);
+
+create virtual table if not exists fts_section_entities_trigram using fts5(
+  canonical_text,
+  raw_text,
+  path,
+  operation,
+  entity_id unindexed,
+  tokenize='trigram'
+);
+
 create index if not exists idx_documents_source on documents(source_id);
 create index if not exists idx_sections_document on sections(document_id);
+create index if not exists idx_section_structures_parent_order on section_structures(document_id, parent_section_id, sibling_ordinal);
+create index if not exists idx_section_structures_source_element on section_structures(source_element_id);
 create index if not exists idx_document_profiles_generated_hash on document_profiles(generated_from_hash);
 create index if not exists idx_section_entities_document on section_entities(document_id, kind, canonical_text);
 create index if not exists idx_section_entities_section on section_entities(section_id, kind, canonical_text);
 create index if not exists idx_section_entities_path on section_entities(kind, method, path, confidence);
+create index if not exists idx_section_entities_canonical_nocase on section_entities(canonical_text collate nocase);
+create index if not exists idx_section_entities_path_nocase on section_entities(path collate nocase);
+create index if not exists idx_section_entities_operation_nocase on section_entities(operation collate nocase);
+create index if not exists idx_section_entities_method_path_nocase on section_entities((method || ' ' || path) collate nocase);
 create index if not exists idx_relation_proposals_status_created on knowledge_relation_proposals(status, created_at);
 create index if not exists idx_relation_proposals_from on knowledge_relation_proposals(from_document_id, status);
 create index if not exists idx_relation_proposals_to on knowledge_relation_proposals(to_document_id, status);
@@ -285,8 +448,20 @@ create index if not exists idx_knowledge_relations_from on knowledge_relations(f
 create index if not exists idx_knowledge_relations_to on knowledge_relations(to_document_id, relation_type, disabled_at);
 create index if not exists idx_knowledge_relations_type on knowledge_relations(relation_type, disabled_at);
 create index if not exists idx_nodes_kind_name on nodes(kind, canonical_name);
+create index if not exists idx_nodes_name_nocase on nodes(name collate nocase);
+create index if not exists idx_nodes_canonical_nocase on nodes(canonical_name collate nocase);
 create index if not exists idx_edges_src_kind on edges(src_id, kind);
 create index if not exists idx_edges_dst_kind on edges(dst_id, kind);
+create index if not exists idx_edges_evidence_section on edges(evidence_section_id);
+create index if not exists idx_source_nodes_node on source_nodes(node_id);
+create index if not exists idx_document_nodes_node on document_nodes(node_id);
+create index if not exists idx_source_edges_edge on source_edges(edge_id);
+create unique index if not exists idx_source_snapshots_active on source_snapshots(source_id) where active = 1;
+create index if not exists idx_source_snapshots_blob on source_snapshots(blob_sha256);
+create index if not exists idx_media_assets_source_document on media_assets(source_id, document_id);
+create index if not exists idx_media_assets_blob on media_assets(blob_sha256);
+create index if not exists idx_section_media_refs_asset on section_media_refs(asset_id);
+create index if not exists idx_feature_inventory_snapshot_status on source_feature_inventory(snapshot_id, coverage_status, feature_key);
 create index if not exists idx_jobs_status_run_after on jobs(status, run_after);
 create index if not exists idx_feedback_target on feedback_events(target_kind, target_id, feedback_kind);
 create index if not exists idx_query_events_hash_created on query_events(query_hash, created_at);

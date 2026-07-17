@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docgraph/docgraph/internal/blobstore"
 	"github.com/docgraph/docgraph/internal/config"
 	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/ids"
@@ -874,12 +875,16 @@ func TestJobHandlersSupportPaginationAndSourceJobTotals(t *testing.T) {
 		t.Fatalf("CreateSource returned error: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := store.CreateJob(ctx, storage.JobInput{
+		job, err := store.CreateJob(ctx, storage.JobInput{
 			Kind:        "sync_source",
 			SourceID:    "src_jobs_page",
 			PayloadJSON: fmt.Sprintf(`{"source_id":"src_jobs_page","index":%d}`, i),
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatalf("CreateJob %d returned error: %v", i, err)
+		}
+		if err := store.FailJob(ctx, job.ID, fmt.Sprintf("fixture %d", i)); err != nil {
+			t.Fatalf("FailJob %d returned error: %v", i, err)
 		}
 	}
 
@@ -974,6 +979,82 @@ func TestSyncScheduleHandlersCRUDSourceSchedule(t *testing.T) {
 	if scheduleBody.Schedule.Enabled || scheduleBody.Schedule.SyncSchedule != "" {
 		t.Fatalf("deleted schedule = %+v, want disabled manual schedule", scheduleBody.Schedule)
 	}
+}
+
+func TestListSyncSchedulesLoadsLatestJobsInOneBatch(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "docgraph.db")
+	baseStore, err := storage.Open(ctx, "sqlite://"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer baseStore.Close()
+	if err := baseStore.Migrate(ctx); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+	for _, source := range []storage.Source{
+		{ID: "src_schedule_batch_a", Kind: "local", Name: "Batch A", DSN: t.TempDir(), SyncSchedule: "hourly"},
+		{ID: "src_schedule_batch_b", Kind: "local", Name: "Batch B", DSN: t.TempDir(), SyncSchedule: "daily"},
+	} {
+		if _, err := baseStore.CreateSource(ctx, source); err != nil {
+			t.Fatalf("CreateSource %s returned error: %v", source.ID, err)
+		}
+	}
+	latestA, err := baseStore.CreateSyncJobIfIdle(ctx, "src_schedule_batch_a")
+	if err != nil {
+		t.Fatalf("CreateSyncJobIfIdle returned error: %v", err)
+	}
+	if err := baseStore.CompleteSyncJob(ctx, latestA.ID, storage.ResultPayload{Documents: 1}); err != nil {
+		t.Fatalf("CompleteSyncJob returned error: %v", err)
+	}
+
+	countingStore := &syncJobCountingStore{Store: baseStore}
+	srv := New("127.0.0.1:0", countingStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler, err := srv.routes()
+	if err != nil {
+		t.Fatalf("build routes: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sync-schedules", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list schedules status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if countingStore.listLatestCalls != 1 || countingStore.listCalls != 0 {
+		t.Fatalf("sync job reads = latest:%d list:%d, want one batch latest and no per-source lists", countingStore.listLatestCalls, countingStore.listCalls)
+	}
+	var body struct {
+		Schedules []syncScheduleResponse `json:"schedules"`
+	}
+	decodeJSON(t, rr, &body)
+	if len(body.Schedules) != 2 {
+		t.Fatalf("schedules = %+v, want two", body.Schedules)
+	}
+	bySource := make(map[string]syncScheduleResponse, len(body.Schedules))
+	for _, schedule := range body.Schedules {
+		bySource[schedule.SourceID] = schedule
+	}
+	if bySource["src_schedule_batch_a"].LastJob == nil || bySource["src_schedule_batch_a"].LastJob.ID != latestA.ID {
+		t.Fatalf("source A schedule = %+v, want latest job %s", bySource["src_schedule_batch_a"], latestA.ID)
+	}
+	if bySource["src_schedule_batch_b"].LastJob != nil {
+		t.Fatalf("source B schedule = %+v, want no latest job", bySource["src_schedule_batch_b"])
+	}
+}
+
+type syncJobCountingStore struct {
+	storage.Store
+	listCalls       int
+	listLatestCalls int
+}
+
+func (s *syncJobCountingStore) ListSyncJobs(ctx context.Context, sourceID string, limit int) ([]storage.SyncJob, error) {
+	s.listCalls++
+	return s.Store.ListSyncJobs(ctx, sourceID, limit)
+}
+
+func (s *syncJobCountingStore) ListLatestSyncJobs(ctx context.Context) ([]storage.SyncJob, error) {
+	s.listLatestCalls++
+	return s.Store.ListLatestSyncJobs(ctx)
 }
 
 func TestSourceHandlersRejectInvalidSyncSchedule(t *testing.T) {
@@ -1822,6 +1903,414 @@ func TestNodeHandlersValidateRequests(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("invalid related limit status = %d, want %d; body: %s", rr.Code, http.StatusBadRequest, rr.Body.String())
 	}
+}
+
+func TestXMindRESTEndpointsWithSQLiteV5AndBlobStore(t *testing.T) {
+	fixture := newXMindRESTFixture(t)
+	defer fixture.cleanup()
+
+	t.Run("token auth protects XMind evidence", func(t *testing.T) {
+		rr := xmindRESTRequest(t, fixture.handler, "/api/media-assets/asset-png-opaque/content", "", "")
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthorized media status = %d, want %d; body: %s", rr.Code, http.StatusUnauthorized, rr.Body.String())
+		}
+		rr = xmindRESTRequest(t, fixture.handler, "/api/sections/topic-target", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("authorized section status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+	})
+
+	t.Run("streamable HTTP MCP resolves selected asset URI without binary content", func(t *testing.T) {
+		body := strings.NewReader(`{"jsonrpc":"2.0","id":"asset-http","method":"tools/call","params":{"name":"doc_get_asset_uri","arguments":{"id":"asset-png-opaque"}}}`)
+		req := httptest.NewRequest(http.MethodPost, "/mcp", body)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("Authorization", "Bearer "+fixture.token)
+		rr := httptest.NewRecorder()
+		fixture.handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("MCP asset status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var response struct {
+			Error  any `json:"error"`
+			Result struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"result"`
+		}
+		decodeJSON(t, rr, &response)
+		if response.Error != nil || len(response.Result.Content) != 1 || response.Result.Content[0].Type != "text" {
+			t.Fatalf("MCP asset response = %+v", response)
+		}
+		var payload struct {
+			DownloadURI string `json:"download_uri"`
+			MIMEType    string `json:"mime_type"`
+		}
+		if err := json.Unmarshal([]byte(response.Result.Content[0].Text), &payload); err != nil {
+			t.Fatalf("decode MCP asset URI payload: %v", err)
+		}
+		if payload.DownloadURI != "/api/media-assets/asset-png-opaque/content" || payload.MIMEType != "image/png" {
+			t.Fatalf("MCP asset URI payload = %+v", payload)
+		}
+	})
+
+	t.Run("exact section and context expose structure media and authored relations", func(t *testing.T) {
+		rr := xmindRESTRequest(t, fixture.handler, "/api/sections/topic-target", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("exact section status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var section storage.SectionContent
+		decodeJSON(t, rr, &section)
+		if section.SectionID != "topic-target" || section.NodeID != "node-topic-target" || section.Title != "Target Topic" || section.Structure == nil || section.Structure.ParentSectionID != "topic-root" || section.Structure.Depth != 1 || section.Structure.SiblingOrdinal != 1 || len(section.Structure.OrderPath) != 2 {
+			t.Fatalf("exact section = %+v", section)
+		}
+		if len(section.MediaAssets) != 2 {
+			t.Fatalf("exact section media = %+v, want 2", section.MediaAssets)
+		}
+
+		rr = xmindRESTRequest(t, fixture.handler, "/api/sections/topic-target/context?child_limit=5", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("section context status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var result struct {
+			Section           storage.SectionContent          `json:"section"`
+			Structure         *storage.SectionStructure       `json:"structure"`
+			Ancestors         []storage.SectionSummary        `json:"ancestors"`
+			Children          []storage.SectionSummary        `json:"children"`
+			ChildrenPage      storage.DocumentOutline         `json:"children_page"`
+			AuthoredRelations []storage.RelatedNode           `json:"authored_relations"`
+			MediaAssets       []storage.MediaAssetSummary     `json:"media_assets"`
+			Snapshot          *storage.SourceSnapshot         `json:"snapshot"`
+			FeatureInventory  []storage.FeatureInventoryEntry `json:"feature_inventory"`
+		}
+		decodeJSON(t, rr, &result)
+		if result.Section.SectionID != "topic-target" || result.Structure == nil || len(result.Ancestors) != 1 || result.Ancestors[0].ID != "topic-root" || result.ChildrenPage.ParentSectionID != "topic-target" || result.ChildrenPage.Offset != 0 || result.ChildrenPage.HasMore || len(result.MediaAssets) != 2 || result.Snapshot == nil || result.Snapshot.ID != "snapshot-rest-xmind" || len(result.FeatureInventory) == 0 {
+			t.Fatalf("section context = %+v", result)
+		}
+		foundRelated := false
+		for _, relation := range result.AuthoredRelations {
+			if relation.Edge.ID == "relationship-rest" && relation.Edge.Kind == "related_to" && relation.Edge.Provenance == "source_authored" {
+				foundRelated = true
+			}
+		}
+		if !foundRelated {
+			t.Fatalf("authored relation missing from context: %+v", result.AuthoredRelations)
+		}
+
+		rr = xmindRESTRequest(t, fixture.handler, "/api/sections/topic-root/context?child_limit=2&subtree_depth=1&subtree_limit=2&relation_limit=1", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("bounded subtree context status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var bounded struct {
+			Subtree           []storage.SectionSummary `json:"subtree"`
+			SubtreeTruncated  bool                     `json:"subtree_truncated"`
+			AuthoredRelations []storage.RelatedNode    `json:"authored_relations"`
+			ChildrenPage      storage.DocumentOutline  `json:"children_page"`
+		}
+		decodeJSON(t, rr, &bounded)
+		if len(bounded.Subtree) != 2 || !bounded.SubtreeTruncated || len(bounded.AuthoredRelations) > 1 || bounded.ChildrenPage.ParentSectionID != "topic-root" || !bounded.ChildrenPage.HasMore {
+			t.Fatalf("bounded subtree context = %+v", bounded)
+		}
+	})
+
+	t.Run("search preserves legacy full media detail and reports totals", func(t *testing.T) {
+		body, err := json.Marshal(map[string]any{
+			"query":                  "target notes",
+			"limit":                  10,
+			"use_relation_expansion": false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/search", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-DocGraph-Token", fixture.token)
+		rr := httptest.NewRecorder()
+		fixture.handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("search status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var result storage.SearchResult
+		decodeJSON(t, rr, &result)
+		var hit *storage.SearchHit
+		for i := range result.Hits {
+			if result.Hits[i].SectionID == "topic-target" {
+				hit = &result.Hits[i]
+				break
+			}
+		}
+		if hit == nil || len(hit.MediaAssets) != 2 || hit.MediaAssetsTotal != 2 || hit.MediaAssetsTruncated {
+			t.Fatalf("search media hit = %+v", hit)
+		}
+		if hit.MediaAssets[0].MetadataJSON != `{"xmind_resource":"resources/evidence.png"}` {
+			t.Fatalf("legacy REST search media metadata = %+v, want full detail", hit.MediaAssets[0])
+		}
+		if result.MediaSummary == nil || result.MediaSummary.Total != 2 || result.MediaSummary.Returned != 2 || result.MediaSummary.Truncated || result.MediaSummary.Detail != "full" {
+			t.Fatalf("REST search media summary = %+v", result.MediaSummary)
+		}
+	})
+
+	t.Run("outline lazily paginates ordered direct children", func(t *testing.T) {
+		rr := xmindRESTRequest(t, fixture.handler, "/api/documents/sheet-rest/outline?limit=1", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("root outline status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var roots storage.DocumentOutline
+		decodeJSON(t, rr, &roots)
+		if len(roots.Sections) != 1 || roots.Sections[0].ID != "topic-root" || roots.Sections[0].Depth != 0 || roots.HasMore {
+			t.Fatalf("root outline = %+v", roots)
+		}
+
+		rr = xmindRESTRequest(t, fixture.handler, "/api/documents/sheet-rest/outline?parent_section_id=topic-root&limit=2&offset=0", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("first child page status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var first storage.DocumentOutline
+		decodeJSON(t, rr, &first)
+		if len(first.Sections) != 2 || first.Sections[0].ID != "topic-alpha" || first.Sections[1].ID != "topic-target" || !first.HasMore {
+			t.Fatalf("first child page = %+v", first)
+		}
+
+		rr = xmindRESTRequest(t, fixture.handler, "/api/documents/sheet-rest/outline?parent_section_id=topic-root&limit=2&offset=2", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("second child page status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var second storage.DocumentOutline
+		decodeJSON(t, rr, &second)
+		if len(second.Sections) != 1 || second.Sections[0].ID != "topic-tail" || second.HasMore || second.Offset != 2 {
+			t.Fatalf("second child page = %+v", second)
+		}
+	})
+
+	t.Run("document media and opaque asset metadata", func(t *testing.T) {
+		rr := xmindRESTRequest(t, fixture.handler, "/api/documents/sheet-rest/media-assets?limit=10&offset=0", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("document media status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var listed struct {
+			DocumentID  string               `json:"document_id"`
+			MediaAssets []storage.MediaAsset `json:"media_assets"`
+			Limit       int                  `json:"limit"`
+			Offset      int                  `json:"offset"`
+		}
+		decodeJSON(t, rr, &listed)
+		if listed.DocumentID != "sheet-rest" || len(listed.MediaAssets) != 3 || listed.Limit != 10 || listed.Offset != 0 {
+			t.Fatalf("document media = %+v", listed)
+		}
+
+		rr = xmindRESTRequest(t, fixture.handler, "/api/media-assets/asset-png-opaque", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("asset metadata status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		var asset storage.MediaAsset
+		decodeJSON(t, rr, &asset)
+		if asset.ID != "asset-png-opaque" || asset.DocumentID != "sheet-rest" || asset.BlobSHA256 != fixture.pngBlob.SHA256 || asset.OriginalName != "evidence.png" || asset.Status != "available" {
+			t.Fatalf("asset metadata = %+v", asset)
+		}
+	})
+
+	t.Run("raster content supports authenticated Range and security headers", func(t *testing.T) {
+		rr := xmindRESTRequest(t, fixture.handler, "/api/media-assets/asset-png-opaque/content", fixture.token, "bytes=2-7")
+		if rr.Code != http.StatusPartialContent {
+			t.Fatalf("PNG Range status = %d, want %d; body: %q", rr.Code, http.StatusPartialContent, rr.Body.Bytes())
+		}
+		if rr.Header().Get("ETag") != `"`+fixture.pngBlob.SHA256+`"` || rr.Header().Get("X-Content-Type-Options") != "nosniff" || rr.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" || !strings.HasPrefix(rr.Header().Get("Content-Disposition"), "inline") || rr.Header().Get("Content-Range") == "" {
+			t.Fatalf("PNG response headers = %+v", rr.Header())
+		}
+		if !bytes.Equal(rr.Body.Bytes(), fixture.pngBytes[2:8]) {
+			t.Fatalf("PNG Range body = %v, want %v", rr.Body.Bytes(), fixture.pngBytes[2:8])
+		}
+	})
+
+	t.Run("SVG and PDF are attachment-only", func(t *testing.T) {
+		for _, assetID := range []string{"asset-svg-opaque", "asset-pdf-opaque"} {
+			rr := xmindRESTRequest(t, fixture.handler, "/api/media-assets/"+assetID+"/content", fixture.token, "")
+			if rr.Code != http.StatusOK {
+				t.Fatalf("%s content status = %d; body: %s", assetID, rr.Code, rr.Body.String())
+			}
+			if !strings.HasPrefix(rr.Header().Get("Content-Disposition"), "attachment") || rr.Header().Get("X-Content-Type-Options") != "nosniff" || rr.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" {
+				t.Fatalf("%s unsafe disposition/headers = %+v", assetID, rr.Header())
+			}
+		}
+	})
+
+	t.Run("active snapshot is authenticated immutable attachment", func(t *testing.T) {
+		rr := xmindRESTRequest(t, fixture.handler, "/api/sources/source-rest-xmind/snapshot", fixture.token, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("snapshot status = %d; body: %s", rr.Code, rr.Body.String())
+		}
+		if !bytes.Equal(rr.Body.Bytes(), fixture.snapshotBytes) || rr.Header().Get("ETag") != `"`+fixture.snapshotBlob.SHA256+`"` || !strings.HasPrefix(rr.Header().Get("Content-Disposition"), "attachment") || rr.Header().Get("Content-Type") != "application/octet-stream" || rr.Header().Get("X-Content-Type-Options") != "nosniff" || rr.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" {
+			t.Fatalf("snapshot body/headers mismatch: headers=%+v body=%q", rr.Header(), rr.Body.Bytes())
+		}
+	})
+
+	t.Run("asset ID is opaque and cannot address arbitrary paths", func(t *testing.T) {
+		escapedPath := strings.ReplaceAll(fixture.arbitraryPath, "/", "%2F")
+		rr := xmindRESTRequest(t, fixture.handler, "/api/media-assets/"+escapedPath+"/content", fixture.token, "")
+		if rr.Code < 400 || rr.Code >= 500 {
+			t.Fatalf("arbitrary path status = %d, want 4xx; body: %s", rr.Code, rr.Body.String())
+		}
+		if strings.Contains(rr.Body.String(), fixture.arbitrarySecret) {
+			t.Fatalf("arbitrary filesystem content leaked: %q", rr.Body.String())
+		}
+	})
+}
+
+type xmindRESTFixture struct {
+	handler         http.Handler
+	token           string
+	cleanup         func()
+	snapshotBlob    blobstore.Blob
+	pngBlob         blobstore.Blob
+	snapshotBytes   []byte
+	pngBytes        []byte
+	arbitraryPath   string
+	arbitrarySecret string
+}
+
+func newXMindRESTFixture(t *testing.T) xmindRESTFixture {
+	t.Helper()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "docgraph-v5.db")
+	store, err := storage.Open(ctx, "sqlite://"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatalf("open SQLite v5 store: %v", err)
+	}
+	cleanupOnError := true
+	defer func() {
+		if cleanupOnError {
+			_ = store.Close()
+		}
+	}()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate SQLite v5 store: %v", err)
+	}
+	if err := store.CheckSchema(ctx); err != nil {
+		t.Fatalf("check SQLite v5 schema: %v", err)
+	}
+	blobs, err := blobstore.New(dataDir)
+	if err != nil {
+		t.Fatalf("create BlobStore: %v", err)
+	}
+	put := func(name string, content []byte) blobstore.Blob {
+		t.Helper()
+		blob, err := blobs.Put(ctx, "rest-contract-"+name, bytes.NewReader(content), int64(len(content)+1))
+		if err != nil {
+			t.Fatalf("put %s Blob: %v", name, err)
+		}
+		return blob
+	}
+	snapshotBytes := []byte("PK\x03\x04DocGraph XMind snapshot contract")
+	pngBytes := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R', 1, 2, 3, 4, 5, 6, 7, 8}
+	svgBytes := []byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`)
+	pdfBytes := []byte("%PDF-1.7\ncontract evidence\n%%EOF")
+	snapshotBlob := put("snapshot", snapshotBytes)
+	pngBlob := put("png", pngBytes)
+	svgBlob := put("svg", svgBytes)
+	pdfBlob := put("pdf", pdfBytes)
+
+	if _, err := store.CreateSource(ctx, storage.Source{ID: "source-rest-xmind", Kind: "xmind", Name: "Secure Map", DSN: "/srv/maps/secure.xmind"}); err != nil {
+		t.Fatalf("create XMind source: %v", err)
+	}
+	sections := []storage.SectionInput{
+		{ID: "topic-root", Title: "Root Topic", Content: "root", SearchText: "root", ContentHash: "hash-root", Ordinal: 0, Structure: &storage.SectionStructureInput{SourceElementID: "xmind-root", ElementKind: "topic", Depth: 0, SiblingOrdinal: 0, OrderPath: []int{0}, DisplayNumber: "1"}},
+		{ID: "topic-alpha", Title: "Alpha Topic", Content: "alpha", SearchText: "alpha", ContentHash: "hash-alpha", Ordinal: 0, Structure: &storage.SectionStructureInput{ParentSectionID: "topic-root", SourceElementID: "xmind-alpha", ElementKind: "topic", Depth: 1, SiblingOrdinal: 0, OrderPath: []int{0, 0}, DisplayNumber: "1.1"}},
+		{ID: "topic-target", Title: "Target Topic", Content: "target notes", SearchText: "target notes evidence.png", ContentHash: "hash-target", Ordinal: 1, MetadataJSON: `{"labels":["evidence"]}`, Structure: &storage.SectionStructureInput{ParentSectionID: "topic-root", SourceElementID: "xmind-target", ElementKind: "topic", Depth: 1, SiblingOrdinal: 1, OrderPath: []int{0, 1}, DisplayNumber: "1.2", PresentationJSON: `{"numbering":{"format":"arabic"}}`}},
+		{ID: "topic-tail", Title: "Tail Topic", Content: "tail", SearchText: "tail", ContentHash: "hash-tail", Ordinal: 2, Structure: &storage.SectionStructureInput{ParentSectionID: "topic-root", SourceElementID: "xmind-tail", ElementKind: "topic", Depth: 1, SiblingOrdinal: 2, OrderPath: []int{0, 2}, DisplayNumber: "1.3"}},
+	}
+	nodes := make([]storage.NodeInput, 0, len(sections))
+	sectionNodes := make([]storage.SectionNodeInput, 0, len(sections))
+	for _, section := range sections {
+		nodeID := "node-" + section.ID
+		nodes = append(nodes, storage.NodeInput{ID: nodeID, Kind: "DocSection", Name: section.Title, CanonicalName: strings.ToLower(section.Title)})
+		sectionNodes = append(sectionNodes, storage.SectionNodeInput{SectionID: section.ID, NodeID: nodeID, Role: "represents"})
+	}
+	bundle := storage.WorkbookBundle{
+		SourceID:    "source-rest-xmind",
+		WorkbookKey: "rest-workbook",
+		Snapshot: storage.SourceSnapshotInput{
+			ID: "snapshot-rest-xmind", SourceID: "source-rest-xmind", SourceHash: snapshotBlob.SHA256,
+			BlobSHA256: snapshotBlob.SHA256, FormatFamily: "classic_json", FormatVersion: "candidate",
+			SemanticHash: "semantic-rest", MediaManifestHash: "media-rest",
+		},
+		Documents:    []storage.WorkbookDocumentInput{{Document: storage.DocumentInput{ID: "sheet-rest", SourceID: "source-rest-xmind", ExternalID: "sheet-rest", Title: "REST Sheet", ContentHash: "sheet-rest-hash"}, Sections: sections}},
+		Nodes:        nodes,
+		SectionNodes: sectionNodes,
+		Edges: []storage.EdgeInput{
+			{ID: "contains-alpha", SrcID: "node-topic-root", DstID: "node-topic-alpha", Kind: "contains", Provenance: "source_authored"},
+			{ID: "contains-target", SrcID: "node-topic-root", DstID: "node-topic-target", Kind: "contains", Provenance: "source_authored"},
+			{ID: "contains-tail", SrcID: "node-topic-root", DstID: "node-topic-tail", Kind: "contains", Provenance: "source_authored"},
+			{ID: "relationship-rest", SrcID: "node-topic-target", DstID: "node-topic-alpha", Kind: "related_to", Provenance: "source_authored", MetadataJSON: `{"xmind_relationship_id":"relationship-rest","label":"evidence"}`},
+		},
+		Blobs: []storage.MediaBlobInput{
+			mediaBlobInput(snapshotBlob), mediaBlobInput(pngBlob), mediaBlobInput(svgBlob), mediaBlobInput(pdfBlob),
+		},
+		MediaAssets: []storage.MediaAssetInput{
+			{ID: "asset-png-opaque", DocumentID: "sheet-rest", ExternalID: "image-png", BlobSHA256: pngBlob.SHA256, Kind: "image", OriginalName: "evidence.png", MediaType: "image/png", SizeBytes: pngBlob.Size, Status: "available", MetadataJSON: `{"xmind_resource":"resources/evidence.png"}`},
+			{ID: "asset-svg-opaque", DocumentID: "sheet-rest", ExternalID: "image-svg", BlobSHA256: svgBlob.SHA256, Kind: "image", OriginalName: "active.svg", MediaType: "image/svg+xml", SizeBytes: svgBlob.Size, Status: "available"},
+			{ID: "asset-pdf-opaque", DocumentID: "sheet-rest", ExternalID: "attachment-pdf", BlobSHA256: pdfBlob.SHA256, Kind: "attachment", OriginalName: "evidence.pdf", MediaType: "application/pdf", SizeBytes: pdfBlob.Size, Status: "available"},
+		},
+		MediaRefs: []storage.SectionMediaRefInput{
+			{SectionID: "topic-target", AssetID: "asset-png-opaque", Role: "image", Ordinal: 0},
+			{SectionID: "topic-target", AssetID: "asset-svg-opaque", Role: "image", Ordinal: 1},
+			{SectionID: "topic-alpha", AssetID: "asset-pdf-opaque", Role: "attachment", Ordinal: 0},
+		},
+		FeatureInventory: []storage.FeatureInventoryInput{
+			{FeatureKey: "topic", CoverageStatus: "indexed", ElementPath: "/sheet-rest", Count: 4},
+			{FeatureKey: "image", CoverageStatus: "preserved", ElementPath: "/sheet-rest/topic-target", Count: 2},
+		},
+	}
+	workbookStore, ok := store.(storage.WorkbookStore)
+	if !ok {
+		t.Fatal("SQLite store does not implement WorkbookStore")
+	}
+	if _, err := workbookStore.ReplaceWorkbookBundle(ctx, bundle); err != nil {
+		t.Fatalf("seed XMind workbook bundle: %v", err)
+	}
+
+	arbitrarySecret := "must-not-be-readable-through-media-api"
+	arbitraryPath := filepath.Join(dataDir, "arbitrary-secret.txt")
+	if err := os.WriteFile(arbitraryPath, []byte(arbitrarySecret), 0o600); err != nil {
+		t.Fatalf("write arbitrary path sentinel: %v", err)
+	}
+	token := "xmind-rest-test-token"
+	srv := NewWithAuthAndPrefix("127.0.0.1:0", store, slog.New(slog.NewTextHandler(io.Discard, nil)), config.AuthConfig{Mode: "token", Token: token}, "")
+	srv.SetBlobStore(blobs)
+	handler, err := srv.routes()
+	if err != nil {
+		t.Fatalf("build XMind REST routes: %v", err)
+	}
+	cleanupOnError = false
+	return xmindRESTFixture{
+		handler: handler, token: token, snapshotBlob: snapshotBlob, pngBlob: pngBlob,
+		snapshotBytes: snapshotBytes, pngBytes: pngBytes, arbitraryPath: arbitraryPath, arbitrarySecret: arbitrarySecret,
+		cleanup: func() {
+			if err := store.Close(); err != nil {
+				t.Fatalf("close XMind REST store: %v", err)
+			}
+		},
+	}
+}
+
+func mediaBlobInput(blob blobstore.Blob) storage.MediaBlobInput {
+	return storage.MediaBlobInput{SHA256: blob.SHA256, SizeBytes: blob.Size, SniffedMediaType: blob.MediaType, StorageKey: blob.StorageKey}
+}
+
+func xmindRESTRequest(t *testing.T, handler http.Handler, requestPath, token, byteRange string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, requestPath, nil)
+	if token != "" {
+		req.Header.Set("X-DocGraph-Token", token)
+	}
+	if byteRange != "" {
+		req.Header.Set("Range", byteRange)
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	return rr
 }
 
 func newTestHandler(t *testing.T) (http.Handler, func()) {

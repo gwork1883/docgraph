@@ -146,20 +146,52 @@ func TestToolsList(t *testing.T) {
 					t.Fatalf("doc_search properties missing %q: %#v", name, properties)
 				}
 			}
+			for name, maximum := range map[string]float64{
+				"max_media_assets_per_result": maxMCPMediaPerResult,
+				"max_media_assets_total":      maxMCPMediaTotal,
+			} {
+				schema, ok := properties[name].(map[string]any)
+				if !ok || schema["maximum"] != maximum {
+					t.Fatalf("doc_search %s schema = %#v, want maximum %v", name, properties[name], maximum)
+				}
+			}
+			mediaDetail, ok := properties["media_detail"].(map[string]any)
+			if !ok || !jsonArrayContains(mediaDetail["enum"].([]any), "none") || !jsonArrayContains(mediaDetail["enum"].([]any), "compact") {
+				t.Fatalf("doc_search media_detail schema = %#v", properties["media_detail"])
+			}
 			for _, name := range []string{"use_vector_search", "vector_weight", "chunk_size", "batch_size"} {
 				if _, ok := properties[name]; ok {
 					t.Fatalf("doc_search exposes internal vector parameter %q: %#v", name, properties)
 				}
 			}
 		}
+		if tool.Name == "doc_get_asset_uri" {
+			if tool.Annotations["readOnlyHint"] != true || tool.Annotations["openWorldHint"] != false {
+				t.Fatalf("doc_get_asset_uri annotations = %#v", tool.Annotations)
+			}
+			properties, ok := tool.InputSchema["properties"].(map[string]any)
+			if !ok {
+				t.Fatalf("doc_get_asset_uri properties = %#v", tool.InputSchema["properties"])
+			}
+			if len(properties) != 1 || properties["id"] == nil {
+				t.Fatalf("doc_get_asset_uri properties = %#v, want id only", properties)
+			}
+			required, ok := tool.InputSchema["required"].([]any)
+			if !ok || !jsonArrayContains(required, "id") {
+				t.Fatalf("doc_get_asset_uri required = %#v, want id", tool.InputSchema["required"])
+			}
+		}
 	}
-	for _, name := range []string{"doc_search", "doc_get_section", "doc_get_node", "doc_related", "doc_impact"} {
+	for _, name := range []string{"doc_search", "doc_get_section", "doc_get_asset_uri", "doc_get_node", "doc_related", "doc_impact"} {
 		if !gotNames[name] {
 			t.Fatalf("tools/list missing %q in %+v", name, result.Tools)
 		}
 	}
 	if gotNames["doc_context"] {
 		t.Fatalf("tools/list includes disabled doc_context in %+v", result.Tools)
+	}
+	if gotNames["doc_get_asset"] {
+		t.Fatalf("tools/list includes legacy doc_get_asset in %+v", result.Tools)
 	}
 }
 
@@ -336,6 +368,148 @@ func TestDocSearchToolReturnsExplicitReferenceSummary(t *testing.T) {
 	}
 	if payload.SuggestedReads.ImplicitSymbolLinks == nil || payload.SuggestedReads.CuratedRelations == nil || payload.SuggestedReads.StructuralNeighbors == nil {
 		t.Fatalf("suggested_reads = %+v, want separate non-explicit fields", payload.SuggestedReads)
+	}
+}
+
+func TestDocSearchAndGetSectionExposeTopicEvidence(t *testing.T) {
+	store := newTestStore(t)
+	seedMCPTopicWorkbook(t, store)
+	queryService := query.NewService(store)
+	responses := runTestServerWithStore(t, queryService, store,
+		`{"jsonrpc":"2.0","id":"topic-search","method":"tools/call","params":{"name":"doc_search","arguments":{"query":"mcp-topic-evidence","max_results":5,"max_sections_per_document":5}}}`,
+		`{"jsonrpc":"2.0","id":"topic-section","method":"tools/call","params":{"name":"doc_get_section","arguments":{"id":"mcp-topic-child"}}}`,
+		`{"jsonrpc":"2.0","id":"topic-section-limited-assets","method":"tools/call","params":{"name":"doc_get_section","arguments":{"id":"mcp-topic-child","max_assets":2}}}`,
+		`{"jsonrpc":"2.0","id":"topic-search-hard-limit","method":"tools/call","params":{"name":"doc_search","arguments":{"query":"mcp-topic-evidence","max_results":5,"max_sections_per_document":5,"max_media_assets_per_result":999,"max_media_assets_total":999,"media_detail":"full"}}}`,
+	)
+
+	searchResponse := requireResponse(t, responses, 0, `"topic-search"`)
+	requireNoRPCError(t, searchResponse)
+	var searchPayload struct {
+		Hits           []storage.SearchHit         `json:"hits"`
+		MediaSummary   *storage.SearchMediaSummary `json:"media_summary"`
+		SuggestedReads struct {
+			CuratedRelations  []domain.SuggestedRead `json:"curated_relations"`
+			AuthoredRelations []domain.SuggestedRead `json:"authored_relations"`
+		} `json:"suggested_reads"`
+	}
+	unmarshalToolText(t, searchResponse, &searchPayload)
+	hit := findMCPSearchHit(searchPayload.Hits, "mcp-topic-child")
+	if hit == nil || hit.NodeID != "node-mcp-topic-child" || hit.ElementKind != "topic" || hit.DisplayNumber != "1.1" {
+		t.Fatalf("topic search hit = %+v", hit)
+	}
+	if len(hit.MediaAssets) != defaultMCPMediaPerResult || hit.MediaAssets[0].ID != "mcp-asset-diagram" || hit.MediaAssetsTotal != 12 || !hit.MediaAssetsTruncated {
+		t.Fatalf("topic search media = %+v", hit.MediaAssets)
+	}
+	for _, asset := range hit.MediaAssets {
+		if asset.MetadataJSON != "" || asset.ReferenceMetadataJSON != "" {
+			t.Fatalf("topic search leaked raw media metadata: %+v", asset)
+		}
+	}
+	if hit.EvidenceKind != "media_metadata" {
+		t.Fatalf("topic search evidence kind = %q, want media_metadata from omitted media metadata", hit.EvidenceKind)
+	}
+	if searchPayload.MediaSummary == nil || searchPayload.MediaSummary.Total != 12 || searchPayload.MediaSummary.Returned != defaultMCPMediaPerResult || !searchPayload.MediaSummary.Truncated || searchPayload.MediaSummary.PerResultLimit != defaultMCPMediaPerResult || searchPayload.MediaSummary.TotalLimit != defaultMCPMediaTotal || searchPayload.MediaSummary.Detail != "compact" {
+		t.Fatalf("default MCP media summary = %+v", searchPayload.MediaSummary)
+	}
+	if len(searchPayload.SuggestedReads.AuthoredRelations) != 1 || len(searchPayload.SuggestedReads.AuthoredRelations) > 5 {
+		t.Fatalf("authored suggestions = %+v", searchPayload.SuggestedReads.AuthoredRelations)
+	}
+	if len(searchPayload.SuggestedReads.CuratedRelations) != 0 {
+		t.Fatalf("curated suggestions = %+v, want source-authored relation separate", searchPayload.SuggestedReads.CuratedRelations)
+	}
+
+	sectionResponse := requireResponse(t, responses, 1, `"topic-section"`)
+	requireNoRPCError(t, sectionResponse)
+	var section sectionToolResult
+	unmarshalToolText(t, sectionResponse, &section)
+	if section.SectionID != "mcp-topic-child" || section.NodeID != "node-mcp-topic-child" || section.ElementKind != "topic" || section.DisplayNumber != "1.1" {
+		t.Fatalf("doc_get_section topic identity = %+v", section)
+	}
+	if len(section.Ancestry) != 1 || section.Ancestry[0].ID != "mcp-topic-root" || len(section.MediaAssets) != 12 {
+		t.Fatalf("doc_get_section context = ancestry:%+v media:%+v", section.Ancestry, section.MediaAssets)
+	}
+	if section.MediaAssetsTotal != 12 || section.MediaAssetsTruncated {
+		t.Fatalf("doc_get_section media budget = total:%d truncated:%v", section.MediaAssetsTotal, section.MediaAssetsTruncated)
+	}
+	for _, asset := range section.MediaAssets {
+		if asset.MetadataJSON != "" || asset.ReferenceMetadataJSON != "" {
+			t.Fatalf("doc_get_section leaked connector media metadata: %+v", asset)
+		}
+	}
+	if len(section.AuthoredRelations) == 0 || len(section.AuthoredRelations) > maxMCPSectionAuthoredRelations {
+		t.Fatalf("doc_get_section authored relations = %+v", section.AuthoredRelations)
+	}
+	if section.Snapshot == nil || section.Snapshot.ID != "mcp-snapshot-topic" || section.Source == nil || section.Source.ID != "mcp-source-topic" {
+		t.Fatalf("doc_get_section provenance envelope = snapshot:%+v source:%+v", section.Snapshot, section.Source)
+	}
+	if section.Provenance.SourceElementID != "mcp-xmind-child" || section.Provenance.FormatFamily != "classic_json" {
+		t.Fatalf("doc_get_section provenance = %+v", section.Provenance)
+	}
+
+	limitedSectionResponse := requireResponse(t, responses, 2, `"topic-section-limited-assets"`)
+	requireNoRPCError(t, limitedSectionResponse)
+	var limitedSection sectionToolResult
+	unmarshalToolText(t, limitedSectionResponse, &limitedSection)
+	if len(limitedSection.MediaAssets) != 2 || limitedSection.MediaAssetsTotal != 12 || !limitedSection.MediaAssetsTruncated {
+		t.Fatalf("limited doc_get_section media = returned:%d total:%d truncated:%v", len(limitedSection.MediaAssets), limitedSection.MediaAssetsTotal, limitedSection.MediaAssetsTruncated)
+	}
+
+	hardLimitResponse := requireResponse(t, responses, 3, `"topic-search-hard-limit"`)
+	requireNoRPCError(t, hardLimitResponse)
+	var hardLimitPayload struct {
+		Hits         []storage.SearchHit         `json:"hits"`
+		MediaSummary *storage.SearchMediaSummary `json:"media_summary"`
+	}
+	unmarshalToolText(t, hardLimitResponse, &hardLimitPayload)
+	hardLimitHit := findMCPSearchHit(hardLimitPayload.Hits, "mcp-topic-child")
+	if hardLimitHit == nil || len(hardLimitHit.MediaAssets) != maxMCPMediaPerResult || hardLimitHit.MediaAssetsTotal != 12 || !hardLimitHit.MediaAssetsTruncated {
+		t.Fatalf("hard-limited MCP search hit = %+v", hardLimitHit)
+	}
+	for _, asset := range hardLimitHit.MediaAssets {
+		if asset.MetadataJSON != "" || asset.ReferenceMetadataJSON != "" {
+			t.Fatalf("hard-limited MCP search leaked raw media metadata: %+v", asset)
+		}
+	}
+	if hardLimitPayload.MediaSummary == nil || hardLimitPayload.MediaSummary.PerResultLimit != maxMCPMediaPerResult || hardLimitPayload.MediaSummary.TotalLimit != maxMCPMediaTotal || hardLimitPayload.MediaSummary.Returned != maxMCPMediaPerResult || hardLimitPayload.MediaSummary.Detail != "compact" {
+		t.Fatalf("hard-limited MCP media summary = %+v", hardLimitPayload.MediaSummary)
+	}
+}
+
+func TestDocGetAssetURIReturnsMetadataWithoutBinaryContent(t *testing.T) {
+	store := newTestStore(t)
+	seedMCPTopicWorkbook(t, store)
+	responses := runTestServerWithStore(t, query.NewService(store), store,
+		`{"jsonrpc":"2.0","id":"asset-uri","method":"tools/call","params":{"name":"doc_get_asset_uri","arguments":{"id":"mcp-asset-diagram"}}}`,
+		`{"jsonrpc":"2.0","id":"asset-uri-unavailable","method":"tools/call","params":{"name":"doc_get_asset_uri","arguments":{"id":"mcp-asset-extra-01"}}}`,
+	)
+	for index, id := range []string{`"asset-uri"`} {
+		response := requireResponse(t, responses, index, id)
+		requireNoRPCError(t, response)
+		var payload struct {
+			AssetID     string `json:"asset_id"`
+			DownloadURI string `json:"download_uri"`
+			MIMEType    string `json:"mime_type"`
+			Kind        string `json:"kind"`
+			Auth        string `json:"auth"`
+		}
+		unmarshalToolText(t, response, &payload)
+		if payload.AssetID != "mcp-asset-diagram" || payload.DownloadURI != "/api/media-assets/mcp-asset-diagram/content" || payload.MIMEType != "image/png" || payload.Kind != "image" || payload.Auth != "same_as_docgraph" {
+			t.Fatalf("doc_get_asset_uri payload = %+v", payload)
+		}
+		encoded, _ := json.Marshal(response.Result)
+		if strings.Contains(string(encoded), "blob_sha256") || strings.Contains(string(encoded), `"opaque"`) || strings.Contains(string(encoded), `"data"`) || strings.Contains(string(encoded), `"blob"`) {
+			t.Fatalf("doc_get_asset_uri leaked binary or internal metadata: %s", encoded)
+		}
+	}
+	unavailable := requireResponse(t, responses, 1, `"asset-uri-unavailable"`)
+	if unavailable.Error == nil || !strings.Contains(unavailable.Error.Message, "has no preserved content") {
+		t.Fatalf("unavailable asset URI response = %+v", unavailable)
+	}
+
+	handler := NewHandler(query.NewService(store), store)
+	handler.SetAssetURIBasePath("/docgraph/")
+	if got := handler.assetContentURI("asset/with space"); got != "/docgraph/api/media-assets/asset%2Fwith%20space/content" {
+		t.Fatalf("prefixed asset URI = %q", got)
 	}
 }
 
@@ -812,6 +986,72 @@ func seedMCPExplicitReferenceDocument(t *testing.T, store storage.Store) {
 		},
 	}); err != nil {
 		t.Fatalf("replace explicit reference document: %v", err)
+	}
+}
+
+func seedMCPTopicWorkbook(t *testing.T, store storage.Store) {
+	seedMCPTopicWorkbookWithImage(t, store, strings.Repeat("d", 64), 42, "image/png")
+}
+
+func seedMCPTopicWorkbookWithImage(t *testing.T, store storage.Store, imageDigest string, imageSize int64, imageMediaType string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := store.CreateSource(ctx, domain.Source{ID: "mcp-source-topic", Kind: "xmind", Name: "MCP Architecture", DSN: "/maps/mcp.xmind"}); err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("c", 64)
+	bundle := domain.WorkbookBundle{
+		SourceID:    "mcp-source-topic",
+		WorkbookKey: "mcp-workbook",
+		Snapshot: domain.SourceSnapshotInput{
+			ID: "mcp-snapshot-topic", SourceID: "mcp-source-topic", SourceHash: "mcp-snapshot-hash", BlobSHA256: digest,
+			FormatFamily: "classic_json", FormatVersion: "1",
+		},
+		Blobs: []domain.MediaBlobInput{
+			{SHA256: digest, SizeBytes: 100, SniffedMediaType: "application/zip", StorageKey: "sha256/" + digest},
+			{SHA256: imageDigest, SizeBytes: imageSize, SniffedMediaType: imageMediaType, StorageKey: "sha256/" + imageDigest},
+		},
+		Documents: []domain.WorkbookDocumentInput{{
+			Document: domain.DocumentInput{ID: "mcp-sheet-topic", SourceID: "mcp-source-topic", ExternalID: "mcp-sheet-topic", Title: "MCP Architecture", ContentHash: "mcp-sheet-hash"},
+			Sections: []domain.SectionInput{
+				{ID: "mcp-topic-root", Title: "Root", Content: "root context", SearchText: "root context", ContentHash: "mcp-root-hash", Structure: &domain.SectionStructureInput{SourceElementID: "mcp-xmind-root", ElementKind: "topic", Depth: 0, SiblingOrdinal: 0, OrderPath: []int{0}, DisplayNumber: "1"}},
+				{ID: "mcp-topic-child", Title: "Child", Content: "mcp-topic-evidence details", SearchText: "mcp-topic-evidence details diagram.png", ContentHash: "mcp-child-hash", Structure: &domain.SectionStructureInput{ParentSectionID: "mcp-topic-root", SourceElementID: "mcp-xmind-child", ElementKind: "topic", Depth: 1, SiblingOrdinal: 0, OrderPath: []int{0, 0}, DisplayNumber: "1.1"}},
+			},
+		}},
+		Nodes: []domain.NodeInput{
+			{ID: "node-mcp-topic-root", Kind: "DocSection", Name: "Root", CanonicalName: "mcp-root", MetadataJSON: `{"section_id":"mcp-topic-root","document_id":"mcp-sheet-topic"}`},
+			{ID: "node-mcp-topic-child", Kind: "DocSection", Name: "Child", CanonicalName: "mcp-child", MetadataJSON: `{"section_id":"mcp-topic-child","document_id":"mcp-sheet-topic"}`},
+		},
+		SectionNodes: []domain.SectionNodeInput{
+			{SectionID: "mcp-topic-root", NodeID: "node-mcp-topic-root", Role: "represents"},
+			{SectionID: "mcp-topic-child", NodeID: "node-mcp-topic-child", Role: "represents"},
+		},
+		Edges: []domain.EdgeInput{
+			{ID: "mcp-edge-hierarchy", SrcID: "node-mcp-topic-root", DstID: "node-mcp-topic-child", Kind: "contains", Provenance: "source_authored"},
+			{ID: "mcp-edge-related", SrcID: "node-mcp-topic-child", DstID: "node-mcp-topic-root", Kind: "related_to", Provenance: "source_authored", Confidence: 0.9, MetadataJSON: `{"label":"review"}`},
+		},
+		MediaAssets: []domain.MediaAssetInput{{ID: "mcp-asset-diagram", SourceID: "mcp-source-topic", SnapshotID: "mcp-snapshot-topic", DocumentID: "mcp-sheet-topic", ExternalID: "diagram", BlobSHA256: imageDigest, Kind: "image", OriginalName: "diagram.png", MediaType: imageMediaType, SizeBytes: imageSize, Status: "available", MetadataJSON: `{"opaque":"first"}`}},
+		MediaRefs:   []domain.SectionMediaRefInput{{SectionID: "mcp-topic-child", AssetID: "mcp-asset-diagram", Role: "image", Ordinal: 0}},
+	}
+	for i := 1; i < 12; i++ {
+		metadata := fmt.Sprintf(`{"opaque":"asset-%d"}`, i)
+		if i == 11 {
+			metadata = `{"opaque":"mcp-topic-evidence"}`
+		}
+		assetID := fmt.Sprintf("mcp-asset-extra-%02d", i)
+		bundle.MediaAssets = append(bundle.MediaAssets, domain.MediaAssetInput{
+			ID: assetID, SourceID: "mcp-source-topic", SnapshotID: "mcp-snapshot-topic", DocumentID: "mcp-sheet-topic",
+			ExternalID: fmt.Sprintf("extra-%02d", i), Kind: "image", OriginalName: fmt.Sprintf("extra-%02d.png", i),
+			MediaType: "image/png", Status: "external", MetadataJSON: metadata,
+		})
+		bundle.MediaRefs = append(bundle.MediaRefs, domain.SectionMediaRefInput{SectionID: "mcp-topic-child", AssetID: assetID, Role: "image", Ordinal: i})
+	}
+	workbookStore, ok := store.(storage.WorkbookStore)
+	if !ok {
+		t.Fatal("store does not implement WorkbookStore")
+	}
+	if _, err := workbookStore.ReplaceWorkbookBundle(ctx, bundle); err != nil {
+		t.Fatal(err)
 	}
 }
 

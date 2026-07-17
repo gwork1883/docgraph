@@ -41,7 +41,7 @@ Search 页面提供混合本地检索，结合文档 section、检索 profile �
 - 单个 Go 可执行文件，内置 Web UI。
 - 本地 SQLite + FTS5，不依赖外部数据库。可选 pgvector 实现混合向量搜索。
 - 支持 local、git、static、html、sftp、confluence、openapi、webdocs 等来源。
-- 支持 `doc_search`、`doc_get_node`、`doc_get_section`、`doc_related`、`doc_impact` MCP 工具；旧版 `doc_context` 调用仍兼容，但不再主动暴露。
+- 支持 `doc_search`、`doc_get_node`、`doc_get_section`、`doc_get_asset_uri`、`doc_related`、`doc_impact` MCP 工具；旧版 `doc_context` 调用仍兼容，但不再主动暴露。
 - 支持本地知识图谱节点/边、同步任务历史和反馈标注。
 - 混合向量搜索 + RRF 融合排序：FTS5 文本检索与 pgvector 向量相似度检索融合，按查询意图（entity/conceptual/general）自动调节权重。
 - 嵌入管线：可配置 OpenAI 兼容 embedding provider，支持 auto/sentence/fixed 分块策略，带版本追踪和过期检测。
@@ -64,7 +64,7 @@ DocGraph 的搜索面向文档消费和 agent 上下文获取，不只是普通�
 - 检索 profile 会确定性生成标签、关键短语、别名、API 引用、技术术语和 section 分布信号，同时把人工维护的文档描述与同步生成的元数据分开。
 - 作者写的显式交叉引用（如"参见：[配置指南](../config.md)"）会被解析并作为推荐阅读返回，和知识图谱关系并列展示。
 - 排序会综合 canonical 状态、标题和 heading 命中、词项覆盖、profile 命中、精确匹配、向量相似度和已批准的知识关系。
-- MCP 工具默认先返回有边界的搜索摘要，agent 需要时再按 section 拉取全文，避免一次性塞入过多本地上下文。
+- MCP 工具遵循渐进式 `doc_search → doc_get_section → doc_get_asset_uri`：搜索和 section 只返回紧凑的 connector 资产 ID 与 MIME type，只有 URI tool 返回鉴权下载路径，MCP 响应不内嵌二进制内容。
 
 ## 工作原理
 
@@ -160,7 +160,7 @@ stdio 模式：
 ./bin/docgraph mcp --data ./.docgraph
 ```
 
-Streamable HTTP 在 `docgraph serve` 运行时可用。完整配置参考 [docs/mcp-setup.md](docs/mcp-setup.md)。
+Streamable HTTP 在 `docgraph serve` 运行时可用。启用 `auth.mode: token` 后，`/mcp` 与旧版 `/mcp/sse` 和 REST API 一样，需要 Bearer token 或 `X-DocGraph-Token`。完整配置参考 [docs/mcp-setup.md](docs/mcp-setup.md)。
 
 ## 运行时依赖
 

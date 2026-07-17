@@ -49,9 +49,22 @@ func (r *Runner) RunOnce(ctx context.Context) {
 		r.logger.Warn("list sources for scheduled sync failed", "error", err)
 		return
 	}
+	latestJobs, err := r.store.ListLatestSyncJobs(ctx)
+	if err != nil {
+		r.logger.Warn("list latest sync jobs for scheduler failed", "error", err)
+		return
+	}
+	latestJobsBySourceID := make(map[string]storage.SyncJob, len(latestJobs))
+	for _, job := range latestJobs {
+		latestJobsBySourceID[job.SourceID] = job
+	}
 	now := r.now()
 	for _, source := range sources {
-		due, err := r.due(ctx, source, now)
+		var latestJob *storage.SyncJob
+		if job, ok := latestJobsBySourceID[source.ID]; ok {
+			latestJob = &job
+		}
+		due, err := r.due(source, latestJob, now)
 		if err != nil {
 			r.logger.Warn("evaluate source sync schedule failed", "source_id", source.ID, "error", err)
 			continue
@@ -65,7 +78,7 @@ func (r *Runner) RunOnce(ctx context.Context) {
 	}
 }
 
-func (r *Runner) due(ctx context.Context, source storage.Source, now time.Time) (bool, error) {
+func (r *Runner) due(source storage.Source, latestJob *storage.SyncJob, now time.Time) (bool, error) {
 	if strings.TrimSpace(source.SyncStatus) == "paused" {
 		return false, nil
 	}
@@ -73,19 +86,15 @@ func (r *Runner) due(ctx context.Context, source storage.Source, now time.Time) 
 	if err != nil || !enabled {
 		return false, err
 	}
-	jobs, err := r.store.ListSyncJobs(ctx, source.ID, 1)
-	if err != nil {
-		return false, err
-	}
-	if len(jobs) == 0 {
+	if latestJob == nil {
 		return true, nil
 	}
-	if jobs[0].Status == "queued" || jobs[0].Status == "running" || jobs[0].Status == "canceling" {
+	if latestJob.Status == "queued" || latestJob.Status == "running" || latestJob.Status == "canceling" {
 		return false, nil
 	}
-	last, ok := parseJobTime(jobs[0].UpdatedAt)
+	last, ok := parseJobTime(latestJob.UpdatedAt)
 	if !ok {
-		last, ok = parseJobTime(jobs[0].CreatedAt)
+		last, ok = parseJobTime(latestJob.CreatedAt)
 	}
 	if !ok {
 		return true, nil

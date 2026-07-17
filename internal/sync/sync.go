@@ -31,18 +31,20 @@ import (
 
 type Service struct {
 	store storage.Store
+	xmind xmindRuntime
 }
 
 func NewService(store storage.Store) *Service {
-	return &Service{store: store}
+	return NewServiceWithOptions(store, ServiceOptions{})
 }
 
 type Result struct {
-	SourceID          string                    `json:"source_id"`
-	Documents         int                       `json:"documents"`
-	JobID             string                    `json:"job_id,omitempty"`
-	EntityDiagnostics storage.EntityDiagnostics `json:"entity_diagnostics,omitempty"`
-	BrokenLinks       []storage.BrokenLink      `json:"broken_links,omitempty"`
+	SourceID             string                        `json:"source_id"`
+	Documents            int                           `json:"documents"`
+	JobID                string                        `json:"job_id,omitempty"`
+	EntityDiagnostics    storage.EntityDiagnostics     `json:"entity_diagnostics,omitempty"`
+	BrokenLinks          []storage.BrokenLink          `json:"broken_links,omitempty"`
+	ConnectorDiagnostics *storage.ConnectorDiagnostics `json:"connector_diagnostics,omitempty"`
 }
 
 type SectionEntityBackfillOptions struct {
@@ -94,7 +96,7 @@ func (s *Service) SyncSource(ctx context.Context, id string) (Result, error) {
 	if err := s.attachEntityDiagnostics(ctx, source.ID, &result); err != nil {
 		return Result{}, err
 	}
-	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, EntityDiagnostics: result.EntityDiagnostics, BrokenLinks: result.BrokenLinks}); err != nil {
+	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, EntityDiagnostics: result.EntityDiagnostics, BrokenLinks: result.BrokenLinks, ConnectorDiagnostics: result.ConnectorDiagnostics}); err != nil {
 		return Result{}, err
 	}
 	if source.SyncStatus == "paused" {
@@ -134,7 +136,7 @@ func (s *Service) RunSyncJob(ctx context.Context, job storage.Job) (Result, erro
 	if err := s.attachEntityDiagnostics(ctx, source.ID, &result); err != nil {
 		return Result{}, err
 	}
-	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, EntityDiagnostics: result.EntityDiagnostics, BrokenLinks: result.BrokenLinks}); err != nil {
+	if err := s.store.CompleteSyncJob(ctx, job.ID, storage.ResultPayload{Documents: result.Documents, EntityDiagnostics: result.EntityDiagnostics, BrokenLinks: result.BrokenLinks, ConnectorDiagnostics: result.ConnectorDiagnostics}); err != nil {
 		return Result{}, err
 	}
 	if source.SyncStatus == "paused" {
@@ -170,6 +172,8 @@ func (s *Service) syncSource(ctx context.Context, source storage.Source, jobID s
 		return s.syncConfluence(ctx, source)
 	case "openapi":
 		return s.syncOpenAPI(ctx, source)
+	case "xmind":
+		return s.syncXMind(ctx, source, jobID)
 	default:
 		return Result{}, fmt.Errorf("sync is not supported for source kind %q", source.Kind)
 	}

@@ -1349,12 +1349,31 @@ func (s *Server) handleGetSourceEmbeddingStatus(w http.ResponseWriter, r *http.R
 	if override := strings.TrimSpace(r.URL.Query().Get("generator_version")); override != "" {
 		generatorVersion = override
 	}
-	status, err := s.store.GetSourceEmbeddingStatus(r.Context(), sourceID, model, generatorVersion, s.embeddingTokenizer, s.embeddingChunkStrategy, s.embeddingLimits.ChunkTargetTokens)
+	status, err := s.getSourceEmbeddingStatus(r.Context(), sourceID, model, generatorVersion)
 	if err != nil {
 		writeSourceArtifactError(w, sourceID, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) getSourceEmbeddingStatus(ctx context.Context, sourceID string, model string, generatorVersion string) (storage.EmbeddingStatus, error) {
+	capability, err := s.store.GetSourceEmbeddingStatus(ctx, sourceID, model, generatorVersion, s.embeddingTokenizer, s.embeddingChunkStrategy, s.embeddingLimits.ChunkTargetTokens)
+	if err != nil || !capability.Enabled {
+		return capability, err
+	}
+	return embedding.AuditSourceEmbeddingStatus(ctx, s.store, sourceID, model, embedding.EnsureOptions{
+		SourceID:           sourceID,
+		ContextTokens:      s.embeddingLimits.ContextTokens,
+		ChunkTargetTokens:  s.embeddingLimits.ChunkTargetTokens,
+		ChunkOverlapTokens: s.embeddingLimits.ChunkOverlapTokens,
+		MaxBatchTokens:     s.embeddingLimits.MaxBatchTokens,
+		BatchSize:          s.embeddingLimits.BatchSize,
+		Limits:             s.embeddingLimits,
+		Tokenizer:          s.embeddingTokenizer,
+		ChunkStrategy:      s.embeddingChunkStrategy,
+		GeneratorVersion:   generatorVersion,
+	})
 }
 
 func (s *Server) queryEmbedding(ctx context.Context, queryText string, intents []string, enabled bool) ([]float32, string, error) {
@@ -1795,7 +1814,7 @@ func (s *Server) handleListSourceArtifacts(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if status, err := s.store.GetSourceEmbeddingStatus(r.Context(), id, s.embeddingModel(), s.embeddingGeneratorVersion, s.embeddingTokenizer, s.embeddingChunkStrategy, s.embeddingLimits.ChunkTargetTokens); err == nil {
+	if status, err := s.getSourceEmbeddingStatus(r.Context(), id, s.embeddingModel(), s.embeddingGeneratorVersion); err == nil {
 		artifacts.EmbeddingStatus = &status
 	}
 	writeJSON(w, http.StatusOK, artifacts)

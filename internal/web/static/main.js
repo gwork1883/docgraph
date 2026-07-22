@@ -850,7 +850,7 @@ async function loadSourceEmbeddingStatuses(sources) {
     try {
       const status = await request(`/api/sources/${encodeURIComponent(source.id)}/embedding-status`);
       target.textContent = formatEmbeddingStatus(source.id, status);
-      target.classList.toggle("warn", status.status === "disabled" || (status.status === "indexing" && !activeEmbeddingSourceIDs.has(source.id)));
+      target.classList.toggle("warn", status.status === "disabled" || embeddingCleanupRequired(status) || Number(status.pending_sections || 0) > 0 || Number(status.stale_sections || 0) > 0 || (status.status === "indexing" && !activeEmbeddingSourceIDs.has(source.id)));
     } catch (error) {
       target.textContent = t("source.vector_status_error");
       target.classList.add("warn");
@@ -864,21 +864,39 @@ function formatEmbeddingStatus(sourceID, status) {
     return `${label}: ${t("source.vector_disabled")}`;
   }
   const total = Number(status.total_sections || 0);
-  const embedded = Number(status.embedded_sections || 0);
+  const ready = embeddingReadySections(status);
   const stale = Number(status.stale_sections || 0);
   const pending = Number(status.pending_sections || 0);
+  const orphan = Number(status.orphan_sections || 0);
   const state = embeddingStateLabel(sourceID, status);
-  return `${label}: ${state} ${embedded}/${total} (${pending} pending, ${stale} stale)`;
+  return `${label}: ${state} ${ready}/${total} (${pending} ${t("source.vector_pending")}, ${stale} ${t("source.vector_stale")}, ${orphan} ${t("source.vector_orphan")})`;
+}
+
+function embeddingReadySections(status) {
+  return Number(status?.ready_sections ?? status?.embedded_sections ?? 0);
+}
+
+function embeddingExpectedChunks(status) {
+  return Number(status?.expected_chunks ?? status?.total_chunks ?? 0);
+}
+
+function embeddingReadyChunks(status) {
+  return Number(status?.ready_chunks ?? status?.embedded_chunks ?? 0);
+}
+
+function embeddingCleanupRequired(status) {
+  return Boolean(status?.cleanup_required) || status?.status === "cleanup_required" || Number(status?.orphan_sections || 0) > 0 || Number(status?.orphan_chunks || 0) > 0;
 }
 
 function embeddingStateLabel(sourceID, status) {
   if (!status?.enabled) return t("source.vector_disabled");
   if (activeEmbeddingSourceIDs.has(sourceID)) return t("source.vector_indexing");
-  if (status.status === "ready") return t("source.vector_ready");
   const pending = Number(status.pending_sections || 0);
   const stale = Number(status.stale_sections || 0);
   if (pending > 0 && stale > 0) return t("source.vector_pending_stale");
   if (pending > 0) return t("source.vector_pending");
+  if (status.status === "indexing") return t("source.vector_indexing");
+  if (embeddingCleanupRequired(status)) return t("source.vector_cleanup_required");
   if (stale > 0) return t("source.vector_stale");
   return t("source.vector_ready");
 }
@@ -1837,22 +1855,27 @@ function renderSourceArtifacts(body, page, limit) {
 function renderEmbeddingArtifactSummary(sourceID, status) {
   if (!status) return "";
   const total = Number(status.total_sections || 0);
-  const embedded = Number(status.embedded_sections || 0);
+  const ready = embeddingReadySections(status);
   const pending = Number(status.pending_sections || 0);
   const stale = Number(status.stale_sections || 0);
-  const totalChunks = Number(status.total_chunks || 0);
-  const embeddedChunks = Number(status.embedded_chunks || 0);
+  const orphan = Number(status.orphan_sections || 0);
+  const expectedChunks = embeddingExpectedChunks(status);
+  const readyChunks = embeddingReadyChunks(status);
   const pendingChunks = Number(status.pending_chunks || 0);
   const staleChunks = Number(status.stale_chunks || 0);
+  const orphanChunks = Number(status.orphan_chunks || 0);
   return `
     <div class="artifact-summary">
       <span>${escapeHTML(t("artifacts.embedding_status"))}: ${escapeHTML(embeddingStateLabel(sourceID, status))}</span>
-      <span>${escapeHTML(t("source.vector_ready"))}: ${escapeHTML(`${embedded}/${total}`)}</span>
+      <span>${escapeHTML(t("source.vector_ready"))}: ${escapeHTML(`${ready}/${total}`)}</span>
       <span>${escapeHTML(t("source.vector_pending"))}: ${escapeHTML(pending)}</span>
       <span>${escapeHTML(t("source.vector_stale"))}: ${escapeHTML(stale)}</span>
-      <span>${escapeHTML(t("artifacts.embedding_chunks"))}: ${escapeHTML(`${embeddedChunks}/${totalChunks}`)}</span>
+      <span>${escapeHTML(t("source.vector_orphan"))}: ${escapeHTML(orphan)}</span>
+      ${embeddingCleanupRequired(status) ? `<span>${escapeHTML(t("artifacts.embedding_cleanup_required"))}</span>` : ""}
+      <span>${escapeHTML(t("artifacts.embedding_chunks"))}: ${escapeHTML(`${readyChunks}/${expectedChunks}`)}</span>
       <span>${escapeHTML(t("artifacts.embedding_chunk_pending"))}: ${escapeHTML(pendingChunks)}</span>
       <span>${escapeHTML(t("artifacts.embedding_chunk_stale"))}: ${escapeHTML(staleChunks)}</span>
+      <span>${escapeHTML(t("artifacts.embedding_chunk_orphan"))}: ${escapeHTML(orphanChunks)}</span>
       ${status.model ? `<span>${escapeHTML(t("artifacts.embedding_model"))}: ${escapeHTML(status.model)}</span>` : ""}
       ${status.tokenizer ? `<span>${escapeHTML(t("artifacts.embedding_tokenizer"))}: ${escapeHTML(status.tokenizer)}</span>` : ""}
       ${status.chunk_strategy ? `<span>${escapeHTML(t("artifacts.embedding_strategy"))}: ${escapeHTML(status.chunk_strategy)}</span>` : ""}
@@ -3632,7 +3655,13 @@ function safeSnippetHTML(value) {
 globalThis.DocGraphWebModel = Object.freeze({
   apiFetch,
   buildSourceConfig,
+  embeddingCleanupRequired,
+  embeddingExpectedChunks,
+  embeddingReadyChunks,
+  embeddingReadySections,
+  embeddingStateLabel,
   fetchAuthenticatedBlob,
+  formatEmbeddingStatus,
   formatOrderPath,
 	mediaAssetStatus,
 	mediaIsPreviewableImage,

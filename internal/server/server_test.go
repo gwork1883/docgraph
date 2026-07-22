@@ -81,8 +81,19 @@ func TestSourceEmbeddingStatusHandler(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("embedding status code = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &fields); err != nil {
+		t.Fatalf("decode embedding status fields: %v", err)
+	}
+	for _, key := range []string{"ready_sections", "orphan_sections", "expected_chunks", "ready_chunks", "orphan_chunks", "cleanup_required", "embedded_sections", "embedded_chunks"} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("embedding status response missing %q: %s", key, rr.Body.String())
+		}
+	}
 	var status storage.EmbeddingStatus
-	decodeJSON(t, rr, &status)
+	if err := json.Unmarshal(rr.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode embedding status: %v", err)
+	}
 	if status.Enabled || status.Status != "disabled" || status.Reason != "vector_db_not_configured" || status.TotalSections != 2 || status.EmbeddedSections != 0 || status.PendingSections != 2 || status.StaleSections != 0 {
 		t.Fatalf("embedding status = %+v, want disabled with total=2 pending=2", status)
 	}

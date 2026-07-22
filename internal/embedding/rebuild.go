@@ -3,6 +3,7 @@ package embedding
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/docgraph/docgraph/internal/config"
 	"github.com/docgraph/docgraph/internal/domain"
+	"github.com/docgraph/docgraph/internal/embeddingchunk"
 	"github.com/docgraph/docgraph/internal/storage"
 )
 
@@ -42,14 +44,20 @@ type EnsureProgress struct {
 }
 
 type EnsureResult struct {
-	ScannedSections  int
-	EmbeddedSections int
-	SkippedSections  int
-	DeferredSections int
-	ScannedChunks    int
-	EmbeddedChunks   int
-	SkippedChunks    int
-	DeferredChunks   int
+	ScannedSections         int
+	EmbeddedSections        int
+	SkippedSections         int
+	DeferredSections        int
+	ScannedChunks           int
+	EmbeddedChunks          int
+	SkippedChunks           int
+	DeferredChunks          int
+	DetectedPendingSections int
+	DetectedStaleSections   int
+	DetectedOrphanSections  int
+	DetectedOrphanChunks    int
+	DeletedOrphanSections   int
+	DeletedOrphanChunks     int64
 }
 
 func Ensure(ctx context.Context, store storage.Store, embedder Embedder, opts EnsureOptions) (EnsureResult, error) {
@@ -76,11 +84,23 @@ func Ensure(ctx context.Context, store storage.Store, embedder Embedder, opts En
 	chunker = chunker.Normalized()
 	maxBatchTokens := limits.MaxBatchTokens
 
-	existing, err := existingChunkHashes(ctx, store, embedder.Model())
+	inventory, err := loadEmbeddingInventory(ctx, store, opts.SourceID, embedder.Model())
 	if err != nil {
 		return EnsureResult{}, err
 	}
+	existingBySection := groupEmbeddingChunkHashesBySection(inventory.ByChunkID)
+	_, strategyInfo, err := embeddingchunk.ResolveChunkStrategy(opts.ChunkStrategy)
+	if err != nil {
+		return EnsureResult{}, err
+	}
+	plan := EmbeddingPlan{
+		Model:            embedder.Model(),
+		GeneratorVersion: generatorVersion,
+		Tokenizer:        measurer.Name(),
+		ChunkStrategy:    strategyInfo.Name,
+	}
 	result := EnsureResult{}
+	current := make([]ExpectedSectionEmbedding, 0)
 	offset := 0
 	for {
 		sections, err := store.ListSectionsForEmbedding(ctx, opts.SourceID, batchSize, offset)
@@ -88,7 +108,7 @@ func Ensure(ctx context.Context, store storage.Store, embedder Embedder, opts En
 			return result, err
 		}
 		if len(sections) == 0 {
-			return result, nil
+			break
 		}
 		result.ScannedSections += len(sections)
 		pending := make([]domain.EmbeddingChunkInput, 0)
@@ -98,20 +118,18 @@ func Ensure(ctx context.Context, store storage.Store, embedder Embedder, opts En
 			if err != nil {
 				return result, err
 			}
+			current = append(current, ExpectedSectionEmbedding{Section: section, Chunks: chunks})
 			result.ScannedChunks += len(chunks)
-			current := true
-			for _, chunk := range chunks {
-				hash := existing[chunk.ChunkID]
-				if !embeddingChunkHashCurrent(hash, chunk, section, embedder.Model(), generatorVersion) &&
-					!retrySplitChunksCurrent(existing, chunk, section, embedder.Model(), generatorVersion) {
-					current = false
-					break
-				}
-			}
-			if current && len(chunks) > 0 {
+			evaluation := EvaluateSectionEmbedding(section, chunks, existingBySection[section.SectionID], plan)
+			if evaluation.State == SectionEmbeddingReady {
 				result.SkippedSections++
 				result.SkippedChunks += len(chunks)
 				continue
+			}
+			if evaluation.State == SectionEmbeddingStale {
+				result.DetectedStaleSections++
+			} else {
+				result.DetectedPendingSections++
 			}
 			pendingSections[section.SectionID] = true
 			deleteTokenizer, deleteStrategy := "", ""
@@ -184,6 +202,19 @@ func Ensure(ctx context.Context, store storage.Store, embedder Embedder, opts En
 			}
 		}
 	}
+
+	reconciliation := EvaluateEmbeddingReconciliation(current, inventory.Hashes, plan)
+	result.DetectedOrphanSections = len(reconciliation.OrphanSectionIDs)
+	result.DetectedOrphanChunks = reconciliation.OrphanChunkCount
+	if inventory.Reconciler != nil && len(reconciliation.OrphanSectionIDs) > 0 {
+		deletedSections, deletedChunks, err := sweepOrphanEmbeddingChunks(ctx, inventory.Reconciler, current, inventory.Hashes)
+		result.DeletedOrphanSections = deletedSections
+		result.DeletedOrphanChunks = deletedChunks
+		if err != nil {
+			return result, err
+		}
+	}
+	return result, nil
 }
 
 func normalizeEnsureLimits(opts EnsureOptions) ResolvedEmbeddingLimits {
@@ -203,22 +234,43 @@ func configFromEnsureOptions(opts EnsureOptions) config.EmbeddingConfig {
 	}
 }
 
-func existingChunkHashes(ctx context.Context, store storage.Store, model string) (map[string]domain.EmbeddingChunkHash, error) {
-	result := map[string]domain.EmbeddingChunkHash{}
-	offset := 0
-	for {
-		hashes, err := store.ListEmbeddingChunkHashes(ctx, model, 500, offset)
-		if err != nil {
-			return nil, err
-		}
-		if len(hashes) == 0 {
-			return result, nil
-		}
-		for _, hash := range hashes {
-			result[hash.ChunkID] = hash
-		}
-		offset += len(hashes)
+func sweepOrphanEmbeddingChunks(ctx context.Context, reconciler storage.SourceEmbeddingReconcileStore, current []ExpectedSectionEmbedding, inventory []domain.EmbeddingChunkHash) (int, int64, error) {
+	currentSectionIDs := make(map[string]bool, len(current))
+	for _, item := range current {
+		currentSectionIDs[item.Section.SectionID] = true
 	}
+	orphanIDsBySource := map[string]map[string]bool{}
+	for _, hash := range inventory {
+		if currentSectionIDs[hash.SectionID] {
+			continue
+		}
+		sourceID := strings.TrimSpace(hash.SourceID)
+		if sourceID == "" {
+			return 0, 0, fmt.Errorf("orphan embedding chunk %s has no source id", hash.ChunkID)
+		}
+		if orphanIDsBySource[sourceID] == nil {
+			orphanIDsBySource[sourceID] = map[string]bool{}
+		}
+		orphanIDsBySource[sourceID][hash.SectionID] = true
+	}
+
+	sourceIDs := make([]string, 0, len(orphanIDsBySource))
+	for sourceID := range orphanIDsBySource {
+		sourceIDs = append(sourceIDs, sourceID)
+	}
+	sort.Strings(sourceIDs)
+	deletedSections := 0
+	var deletedChunks int64
+	for _, sourceID := range sourceIDs {
+		sectionIDs := sortedStringSet(orphanIDsBySource[sourceID])
+		deleted, err := reconciler.DeleteEmbeddingChunksBySectionIDs(ctx, sourceID, sectionIDs)
+		deletedChunks += deleted
+		if err != nil {
+			return deletedSections, deletedChunks, fmt.Errorf("delete orphan embedding chunks for source %s: %w", sourceID, err)
+		}
+		deletedSections += len(sectionIDs)
+	}
+	return deletedSections, deletedChunks, nil
 }
 
 func sectionIDsForChunks(chunks []domain.EmbeddingChunkInput) map[string]bool {
@@ -244,6 +296,11 @@ func embeddingChunkHashCurrent(hash domain.EmbeddingChunkHash, chunk EmbeddingCh
 }
 
 func retrySplitChunksCurrent(existing map[string]domain.EmbeddingChunkHash, chunk EmbeddingChunk, section domain.EmbeddingSection, model string, generatorVersion string) bool {
+	_, ok := retrySplitChunkIDsCurrent(existing, chunk, section, model, generatorVersion)
+	return ok
+}
+
+func retrySplitChunkIDsCurrent(existing map[string]domain.EmbeddingChunkHash, chunk EmbeddingChunk, section domain.EmbeddingSection, model string, generatorVersion string) ([]string, bool) {
 	pending := domain.EmbeddingChunkInput{
 		ChunkID:            chunk.ChunkID,
 		SectionID:          chunk.SectionID,
@@ -262,8 +319,9 @@ func retrySplitChunksCurrent(existing map[string]domain.EmbeddingChunkHash, chun
 	}
 	split := splitPendingChunkForRetry(pending)
 	if len(split) == 0 {
-		return false
+		return nil, false
 	}
+	chunkIDs := make([]string, 0, len(split))
 	for _, part := range split {
 		hash := existing[part.ChunkID]
 		if hash.ChunkID == "" ||
@@ -275,10 +333,11 @@ func retrySplitChunksCurrent(existing map[string]domain.EmbeddingChunkHash, chun
 			hash.Tokenizer != part.Tokenizer ||
 			hash.ChunkStrategy != part.ChunkStrategy ||
 			hash.GeneratorVersion != generatorVersion {
-			return false
+			return nil, false
 		}
+		chunkIDs = append(chunkIDs, part.ChunkID)
 	}
-	return true
+	return chunkIDs, true
 }
 
 type embedAndStoreResult struct {

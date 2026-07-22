@@ -186,6 +186,132 @@ func TestGenericJobLifecycleAndLease(t *testing.T) {
 	}
 }
 
+func TestClaimDueJobSerializesSyncAndEmbeddingEnsurePerSource(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		firstKind  string
+		secondKind string
+	}{
+		{name: "sync blocks ensure", firstKind: "sync_source", secondKind: "maintenance_embedding_ensure"},
+		{name: "ensure blocks sync", firstKind: "maintenance_embedding_ensure", secondKind: "sync_source"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sourceID := "src-serialized-" + strings.ReplaceAll(tc.name, " ", "-")
+			first, err := store.CreateJob(ctx, domain.JobInput{Kind: tc.firstKind, SourceID: sourceID})
+			if err != nil {
+				t.Fatalf("CreateJob first returned error: %v", err)
+			}
+			claimed, err := store.ClaimDueJob(ctx, "worker-first", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute)
+			if err != nil {
+				t.Fatalf("ClaimDueJob first returned error: %v", err)
+			}
+			if claimed.ID != first.ID || claimed.Kind != tc.firstKind {
+				t.Fatalf("claimed first = %+v, want %s", claimed, tc.firstKind)
+			}
+
+			second, err := store.CreateJob(ctx, domain.JobInput{Kind: tc.secondKind, SourceID: sourceID})
+			if err != nil {
+				t.Fatalf("CreateJob second returned error: %v", err)
+			}
+			if _, err := store.ClaimDueJob(ctx, "worker-blocked", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("ClaimDueJob while %s runs error = %v, want sql.ErrNoRows", tc.firstKind, err)
+			}
+
+			if err := store.CompleteJob(ctx, first.ID, `{}`); err != nil {
+				t.Fatalf("CompleteJob first returned error: %v", err)
+			}
+			claimed, err = store.ClaimDueJob(ctx, "worker-second", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute)
+			if err != nil {
+				t.Fatalf("ClaimDueJob second returned error: %v", err)
+			}
+			if claimed.ID != second.ID || claimed.Kind != tc.secondKind {
+				t.Fatalf("claimed second = %+v, want %s", claimed, tc.secondKind)
+			}
+			if err := store.CompleteJob(ctx, second.ID, `{}`); err != nil {
+				t.Fatalf("CompleteJob second returned error: %v", err)
+			}
+		})
+	}
+
+	t.Run("different sources remain concurrent", func(t *testing.T) {
+		ensureA, err := store.CreateJob(ctx, domain.JobInput{Kind: "maintenance_embedding_ensure", SourceID: "src-concurrent-a"})
+		if err != nil {
+			t.Fatalf("CreateJob ensure A returned error: %v", err)
+		}
+		claimedA, err := store.ClaimDueJob(ctx, "worker-concurrent-a", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute)
+		if err != nil || claimedA.ID != ensureA.ID {
+			t.Fatalf("claimed A = %+v, err=%v", claimedA, err)
+		}
+		syncB, err := store.CreateJob(ctx, domain.JobInput{Kind: "sync_source", SourceID: "src-concurrent-b"})
+		if err != nil {
+			t.Fatalf("CreateJob sync B returned error: %v", err)
+		}
+		claimedB, err := store.ClaimDueJob(ctx, "worker-concurrent-b", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute)
+		if err != nil || claimedB.ID != syncB.ID {
+			t.Fatalf("claimed B = %+v, err=%v; different sources should run concurrently", claimedB, err)
+		}
+		if err := store.CompleteJob(ctx, ensureA.ID, `{}`); err != nil {
+			t.Fatalf("CompleteJob ensure A returned error: %v", err)
+		}
+		if err := store.CompleteJob(ctx, syncB.ID, `{}`); err != nil {
+			t.Fatalf("CompleteJob sync B returned error: %v", err)
+		}
+	})
+
+	t.Run("global ensure and source sync block each other", func(t *testing.T) {
+		globalEnsure, err := store.CreateJob(ctx, domain.JobInput{Kind: "maintenance_embedding_ensure"})
+		if err != nil {
+			t.Fatalf("CreateJob global ensure returned error: %v", err)
+		}
+		claimed, err := store.ClaimDueJob(ctx, "worker-global", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute)
+		if err != nil || claimed.ID != globalEnsure.ID {
+			t.Fatalf("claimed global ensure = %+v, err=%v", claimed, err)
+		}
+		sourceSync, err := store.CreateJob(ctx, domain.JobInput{Kind: "sync_source", SourceID: "src-global-block"})
+		if err != nil {
+			t.Fatalf("CreateJob source sync returned error: %v", err)
+		}
+		if _, err := store.ClaimDueJob(ctx, "worker-source-blocked", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("ClaimDueJob with global ensure running error = %v, want sql.ErrNoRows", err)
+		}
+		if err := store.CompleteJob(ctx, globalEnsure.ID, `{}`); err != nil {
+			t.Fatalf("CompleteJob global ensure returned error: %v", err)
+		}
+		claimed, err = store.ClaimDueJob(ctx, "worker-source", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute)
+		if err != nil || claimed.ID != sourceSync.ID {
+			t.Fatalf("claimed source sync = %+v, err=%v", claimed, err)
+		}
+
+		globalEnsure, err = store.CreateJob(ctx, domain.JobInput{Kind: "maintenance_embedding_ensure"})
+		if err != nil {
+			t.Fatalf("CreateJob second global ensure returned error: %v", err)
+		}
+		if _, err := store.ClaimDueJob(ctx, "worker-global-blocked", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("ClaimDueJob with source sync running error = %v, want sql.ErrNoRows", err)
+		}
+		if err := store.CompleteJob(ctx, sourceSync.ID, `{}`); err != nil {
+			t.Fatalf("CompleteJob source sync returned error: %v", err)
+		}
+		claimed, err = store.ClaimDueJob(ctx, "worker-global-after-source", []string{"sync_source", "maintenance_embedding_ensure"}, time.Minute)
+		if err != nil || claimed.ID != globalEnsure.ID {
+			t.Fatalf("claimed second global ensure = %+v, err=%v", claimed, err)
+		}
+		if err := store.CompleteJob(ctx, globalEnsure.ID, `{}`); err != nil {
+			t.Fatalf("CompleteJob second global ensure returned error: %v", err)
+		}
+	})
+}
+
 func TestCreateEmbeddingEnsureJobIfIdleDedupesActiveScopes(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
@@ -226,8 +352,25 @@ func TestCreateEmbeddingEnsureJobIfIdleDedupesActiveScopes(t *testing.T) {
 	if err := store.CompleteJob(ctx, globalJob.ID, `{}`); err != nil {
 		t.Fatalf("CompleteJob global returned error: %v", err)
 	}
-	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "other-source"); err != nil {
+	otherEnsure, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "other-source")
+	if err != nil {
 		t.Fatalf("CreateEmbeddingEnsureJobIfIdle after global completed returned error: %v", err)
+	}
+	if _, err := store.CreateSyncJobIfIdle(ctx, "other-source"); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("CreateSyncJobIfIdle while source ensure active error = %v, want ErrSyncInProgress", err)
+	}
+	if err := store.CompleteJob(ctx, otherEnsure.ID, `{}`); err != nil {
+		t.Fatalf("CompleteJob source ensure returned error: %v", err)
+	}
+	syncJob, err := store.CreateSyncJobIfIdle(ctx, "other-source")
+	if err != nil {
+		t.Fatalf("CreateSyncJobIfIdle after source ensure completed returned error: %v", err)
+	}
+	if _, err := store.CreateEmbeddingEnsureJobIfIdle(ctx, "other-source"); !errors.Is(err, domain.ErrSyncInProgress) {
+		t.Fatalf("CreateEmbeddingEnsureJobIfIdle while source sync active error = %v, want ErrSyncInProgress", err)
+	}
+	if err := store.CompleteJob(ctx, syncJob.ID, `{}`); err != nil {
+		t.Fatalf("CompleteJob source sync returned error: %v", err)
 	}
 }
 
@@ -3919,6 +4062,9 @@ func TestSourceEmbeddingStatusCountsCoverageAndPendingSections(t *testing.T) {
 	// 4 total sections, 3 have embeddings in the vector backend → 3 embedded, 1 pending
 	if status.TotalSections != 4 || status.EmbeddedSections != 3 || status.PendingSections != 1 {
 		t.Fatalf("status = %+v, want total=4 embedded=3 pending=1", status)
+	}
+	if status.ReadySections != status.EmbeddedSections || status.ExpectedChunks != status.TotalChunks || status.ReadyChunks != status.EmbeddedChunks {
+		t.Fatalf("compatibility aliases do not match legacy coverage: %+v", status)
 	}
 	if status.Status != "indexing" {
 		t.Fatalf("status.Status = %q, want indexing", status.Status)

@@ -22,6 +22,21 @@ type PGVectorStore struct {
 	pool *pgxpool.Pool
 }
 
+var _ SourceEmbeddingReconciler = (*PGVectorStore)(nil)
+
+const (
+	sourceEmbeddingDeleteBatchSize = 500
+	embeddingChunkInventorySelect  = `
+select chunk_id, section_id, document_id, source_id, chunk_ordinal, model, section_content_hash, chunk_text_hash, tokenizer, chunk_strategy, generator_version, generated_at::text
+from embedding_chunks
+`
+	deleteEmbeddingChunksBySectionIDsQuery = `
+delete from embedding_chunks
+where source_id = $1
+  and section_id = any($2::text[])
+`
+)
+
 func domainChunkID(sectionID string, ordinal int, model string, generatorVersion string, tokenizer string, chunkStrategy string, textHash string) string {
 	value := fmt.Sprintf("%s\n%d\n%s\n%s\n%s\n%s\n%s", strings.TrimSpace(sectionID), ordinal, strings.TrimSpace(model), strings.TrimSpace(generatorVersion), strings.TrimSpace(tokenizer), strings.TrimSpace(chunkStrategy), strings.TrimSpace(textHash))
 	sum := sha256.Sum256([]byte(value))
@@ -539,6 +554,106 @@ limit $2 offset $3
 		hashes = append(hashes, item)
 	}
 	return hashes, rows.Err()
+}
+
+func (s *PGVectorStore) ListEmbeddingChunkInventory(ctx context.Context, opts EmbeddingInventoryOptions) ([]domain.EmbeddingChunkHash, error) {
+	opts = normalizeEmbeddingInventoryOptions(opts)
+	query, args := embeddingChunkInventoryQuery(opts)
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query embedding chunk inventory for source %s: %w", opts.SourceID, err)
+	}
+	defer rows.Close()
+	hashes := make([]domain.EmbeddingChunkHash, 0)
+	for rows.Next() {
+		var item domain.EmbeddingChunkHash
+		if err := rows.Scan(&item.ChunkID, &item.SectionID, &item.DocumentID, &item.SourceID, &item.ChunkOrdinal, &item.Model, &item.SectionContentHash, &item.ChunkTextHash, &item.Tokenizer, &item.ChunkStrategy, &item.GeneratorVersion, &item.GeneratedAt); err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read embedding chunk inventory for source %s: %w", opts.SourceID, err)
+	}
+	return hashes, nil
+}
+
+func normalizeEmbeddingInventoryOptions(opts EmbeddingInventoryOptions) EmbeddingInventoryOptions {
+	opts.SourceID = strings.TrimSpace(opts.SourceID)
+	opts.Model = strings.TrimSpace(opts.Model)
+	opts.GeneratorVersion = strings.TrimSpace(opts.GeneratorVersion)
+	opts.Tokenizer = strings.TrimSpace(opts.Tokenizer)
+	opts.ChunkStrategy = strings.TrimSpace(opts.ChunkStrategy)
+	if opts.IncludeAllPlans {
+		opts.Model = ""
+		opts.GeneratorVersion = ""
+		opts.Tokenizer = ""
+		opts.ChunkStrategy = ""
+	}
+	if opts.Limit <= 0 || opts.Limit > 1000 {
+		opts.Limit = 200
+	}
+	if opts.Offset < 0 {
+		opts.Offset = 0
+	}
+	return opts
+}
+
+func embeddingChunkInventoryQuery(opts EmbeddingInventoryOptions) (string, []any) {
+	filters := make([]string, 0, 5)
+	args := make([]any, 0, 7)
+	addFilter := func(column string, value string) {
+		if value == "" {
+			return
+		}
+		args = append(args, value)
+		filters = append(filters, fmt.Sprintf("%s = $%d", column, len(args)))
+	}
+	addFilter("source_id", opts.SourceID)
+	addFilter("model", opts.Model)
+	addFilter("generator_version", opts.GeneratorVersion)
+	addFilter("tokenizer", opts.Tokenizer)
+	addFilter("chunk_strategy", opts.ChunkStrategy)
+
+	query := embeddingChunkInventorySelect
+	if len(filters) > 0 {
+		query += "where " + strings.Join(filters, " and ") + "\n"
+	}
+	args = append(args, opts.Limit, opts.Offset)
+	query += fmt.Sprintf("order by section_id asc, chunk_ordinal asc, chunk_id asc\nlimit $%d offset $%d\n", len(args)-1, len(args))
+	return query, args
+}
+
+func (s *PGVectorStore) DeleteEmbeddingChunksBySectionIDs(ctx context.Context, sourceID string, sectionIDs []string) (int64, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return 0, fmt.Errorf("source id is required")
+	}
+	sectionIDs = uniqueEmbeddingSectionIDs(sectionIDs)
+	var deleted int64
+	for start := 0; start < len(sectionIDs); start += sourceEmbeddingDeleteBatchSize {
+		end := min(start+sourceEmbeddingDeleteBatchSize, len(sectionIDs))
+		tag, err := s.pool.Exec(ctx, deleteEmbeddingChunksBySectionIDsQuery, sourceID, sectionIDs[start:end])
+		if err != nil {
+			return deleted, fmt.Errorf("delete embedding chunks for source %s batch %d: %w", sourceID, start/sourceEmbeddingDeleteBatchSize, err)
+		}
+		deleted += tag.RowsAffected()
+	}
+	return deleted, nil
+}
+
+func uniqueEmbeddingSectionIDs(sectionIDs []string) []string {
+	unique := make([]string, 0, len(sectionIDs))
+	seen := make(map[string]bool, len(sectionIDs))
+	for _, sectionID := range sectionIDs {
+		sectionID = strings.TrimSpace(sectionID)
+		if sectionID == "" || seen[sectionID] {
+			continue
+		}
+		seen[sectionID] = true
+		unique = append(unique, sectionID)
+	}
+	return unique
 }
 
 func (s *PGVectorStore) GetEmbeddingCoverage(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) (domain.EmbeddingCoverage, error) {

@@ -4113,14 +4113,35 @@ func (s *Store) ClaimDueJob(ctx context.Context, workerID string, kinds []string
 	}
 	var id string
 	query := fmt.Sprintf(`
-select id
-from jobs
-where kind in (%s)
+select candidate.id
+from jobs candidate
+where candidate.kind in (%s)
   and (
-    (status = 'queued' and run_after <= current_timestamp)
-    or (status = 'running' and locked_until is not null and locked_until <= current_timestamp)
+	(candidate.status = 'queued' and candidate.run_after <= current_timestamp)
+	or (candidate.status = 'running' and candidate.locked_until is not null and candidate.locked_until <= current_timestamp)
+	  )
+  and not (
+	candidate.kind in ('sync_source', 'maintenance_embedding_ensure')
+	and exists (
+	  select 1
+	  from jobs active
+	  where active.id <> candidate.id
+	    and active.kind in ('sync_source', 'maintenance_embedding_ensure')
+	    and (
+	      trim(candidate.source_id) = ''
+	      or trim(active.source_id) = ''
+	      or active.source_id = candidate.source_id
+	    )
+	    and (
+	      active.status = 'canceling'
+	      or (
+	        active.status = 'running'
+	        and (active.locked_until is null or active.locked_until > current_timestamp)
+	      )
+	    )
+	)
   )
-order by run_after asc, rowid asc
+order by candidate.run_after asc, candidate.rowid asc
 limit 1
 `, placeholders)
 	if err := tx.QueryRowContext(ctx, query, args...).Scan(&id); err != nil {
@@ -4384,16 +4405,18 @@ func (s *Store) CreateEmbeddingEnsureJobIfIdle(ctx context.Context, sourceID str
 
 	var running string
 	args := []any{}
-	scopeClause := "1 = 1"
+	scopeClause := "kind in ('maintenance_embedding_ensure', 'sync_source')"
 	if sourceID != "" {
-		scopeClause = "(source_id = '' or source_id = ?)"
-		args = append(args, sourceID)
+		scopeClause = `(
+  (kind = 'maintenance_embedding_ensure' and (source_id = '' or source_id = ?))
+  or (kind = 'sync_source' and source_id = ?)
+)`
+		args = append(args, sourceID, sourceID)
 	}
 	query := `
 select id
 from jobs
-where kind = 'maintenance_embedding_ensure'
-  and status in ('queued', 'running', 'canceling')
+where status in ('queued', 'running', 'canceling')
   and ` + scopeClause + `
 order by rowid desc
 limit 1
@@ -4451,10 +4474,17 @@ func (s *Store) CreateSyncJobIfIdle(ctx context.Context, sourceID string) (domai
 	payload := syncJobPayload(sourceID, domain.ResultPayload{})
 	result, err := s.db.ExecContext(ctx, `
 insert into jobs (id, kind, status, source_id, payload_json, progress_json, result_json)
-values (?, 'sync_source', 'queued', ?, ?, '{}', '{}')
+select ?, 'sync_source', 'queued', ?, ?, '{}', '{}'
+where not exists (
+  select 1
+  from jobs
+  where kind = 'maintenance_embedding_ensure'
+    and status in ('queued', 'running', 'canceling')
+    and (source_id = '' or source_id = ?)
+)
 	on conflict(source_id) where kind = 'sync_source' and status in ('queued', 'running', 'canceling')
 do nothing
-`, jobID, sourceID, payload)
+`, jobID, sourceID, payload, sourceID)
 	if err != nil {
 		return domain.SyncJob{}, err
 	}
@@ -5636,6 +5666,30 @@ func (s *Store) ListEmbeddingChunkHashes(ctx context.Context, model string, limi
 	return nil, nil
 }
 
+func (s *Store) SupportsSourceEmbeddingReconciliation() bool {
+	if s == nil || s.vectorBackend == nil {
+		return false
+	}
+	_, ok := s.vectorBackend.(vectorstore.SourceEmbeddingReconciler)
+	return ok
+}
+
+func (s *Store) ListEmbeddingChunkInventory(ctx context.Context, opts vectorstore.EmbeddingInventoryOptions) ([]domain.EmbeddingChunkHash, error) {
+	reconciler, ok := s.vectorBackend.(vectorstore.SourceEmbeddingReconciler)
+	if !ok {
+		return nil, fmt.Errorf("vector backend does not support source embedding reconciliation")
+	}
+	return reconciler.ListEmbeddingChunkInventory(ctx, opts)
+}
+
+func (s *Store) DeleteEmbeddingChunksBySectionIDs(ctx context.Context, sourceID string, sectionIDs []string) (int64, error) {
+	reconciler, ok := s.vectorBackend.(vectorstore.SourceEmbeddingReconciler)
+	if !ok {
+		return 0, fmt.Errorf("vector backend does not support source embedding reconciliation")
+	}
+	return reconciler.DeleteEmbeddingChunksBySectionIDs(ctx, sourceID, sectionIDs)
+}
+
 func (s *Store) GetSourceEmbeddingStatus(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string, chunkTargetTokens int) (domain.EmbeddingStatus, error) {
 	sourceID = strings.TrimSpace(sourceID)
 	model = strings.TrimSpace(model)
@@ -5684,6 +5738,9 @@ where documents.source_id = ?
 	status.EmbeddedSections = coverage.EmbeddedSections
 	status.EmbeddedChunks = coverage.EmbeddedChunks
 	status.TotalChunks = coverage.EmbeddedChunks // best known count; pending chunks unknown until they're built
+	status.ReadySections = status.EmbeddedSections
+	status.ExpectedChunks = status.TotalChunks
+	status.ReadyChunks = status.EmbeddedChunks
 	status.PendingSections = status.TotalSections - status.EmbeddedSections
 	if status.PendingSections < 0 {
 		status.PendingSections = 0

@@ -113,7 +113,7 @@ func NewDefaultRegistryWithEmbedding(store storage.Store, embedder embedding.Emb
 				return retryErr
 			}
 		}
-		return store.CompleteJob(ctx, job.ID, fmt.Sprintf(`{"source_id":%q,"embedded_sections":%d,"skipped_sections":%d,"deferred_sections":%d,"scanned_sections":%d,"embedded_chunks":%d,"skipped_chunks":%d,"deferred_chunks":%d,"scanned_chunks":%d,"total_sections":%d,"tokenizer":%q,"chunk_strategy":%q,"generator_version":%q,"retry_job_id":%q}`, sourceID, result.EmbeddedSections, result.SkippedSections, result.DeferredSections, result.ScannedSections, result.EmbeddedChunks, result.SkippedChunks, result.DeferredChunks, result.ScannedChunks, totalSections, opts.Tokenizer, opts.ChunkStrategy, generatorVersion, retryJobID))
+		return store.CompleteJob(ctx, job.ID, fmt.Sprintf(`{"source_id":%q,"embedded_sections":%d,"skipped_sections":%d,"deferred_sections":%d,"scanned_sections":%d,"embedded_chunks":%d,"skipped_chunks":%d,"deferred_chunks":%d,"scanned_chunks":%d,"detected_pending_sections":%d,"detected_stale_sections":%d,"detected_orphan_sections":%d,"detected_orphan_chunks":%d,"deleted_orphan_sections":%d,"deleted_orphan_chunks":%d,"total_sections":%d,"tokenizer":%q,"chunk_strategy":%q,"generator_version":%q,"retry_job_id":%q}`, sourceID, result.EmbeddedSections, result.SkippedSections, result.DeferredSections, result.ScannedSections, result.EmbeddedChunks, result.SkippedChunks, result.DeferredChunks, result.ScannedChunks, result.DetectedPendingSections, result.DetectedStaleSections, result.DetectedOrphanSections, result.DetectedOrphanChunks, result.DeletedOrphanSections, result.DeletedOrphanChunks, totalSections, opts.Tokenizer, opts.ChunkStrategy, generatorVersion, retryJobID))
 	})
 	return registry
 }

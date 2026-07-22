@@ -107,6 +107,17 @@ type Store interface {
 	Close() error
 }
 
+// SourceEmbeddingReconcileStore is an optional capability implemented by
+// stores whose vector backend can enumerate and delete derived chunks within a
+// source boundary. Embedding maintenance must check availability before using
+// the destructive methods so lightweight test and alternate backends keep a
+// safe read-only fallback.
+type SourceEmbeddingReconcileStore interface {
+	SupportsSourceEmbeddingReconciliation() bool
+	ListEmbeddingChunkInventory(ctx context.Context, opts vectorstore.EmbeddingInventoryOptions) ([]EmbeddingChunkHash, error)
+	DeleteEmbeddingChunksBySectionIDs(ctx context.Context, sourceID string, sectionIDs []string) (int64, error)
+}
+
 // WorkbookStore is implemented by stores that can atomically replace a
 // connector-owned workbook aggregate. It intentionally remains separate from
 // Store so lightweight test and connector fakes do not need to implement it.

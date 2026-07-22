@@ -23,6 +23,26 @@ type Store interface {
 	Close() error
 }
 
+// SourceEmbeddingReconciler exposes inventory and source-scoped cleanup without
+// making reconciliation support mandatory for every Store implementation.
+// Callers should discover it with a type assertion. An empty inventory SourceID
+// requests global pagination; deletion always requires a non-empty source ID.
+type SourceEmbeddingReconciler interface {
+	ListEmbeddingChunkInventory(ctx context.Context, opts EmbeddingInventoryOptions) ([]domain.EmbeddingChunkHash, error)
+	DeleteEmbeddingChunksBySectionIDs(ctx context.Context, sourceID string, sectionIDs []string) (deleted int64, err error)
+}
+
+type EmbeddingInventoryOptions struct {
+	SourceID         string
+	Model            string
+	GeneratorVersion string
+	Tokenizer        string
+	ChunkStrategy    string
+	IncludeAllPlans  bool
+	Limit            int
+	Offset           int
+}
+
 type EmbeddingPlanFilter struct {
 	GeneratorVersion string
 	Tokenizer        string

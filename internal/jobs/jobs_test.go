@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/docgraph/docgraph/internal/domain"
+	"github.com/docgraph/docgraph/internal/embedding"
 	"github.com/docgraph/docgraph/internal/storage/sqlite"
 	"github.com/docgraph/docgraph/internal/vectorstore"
 )
@@ -64,7 +65,8 @@ func TestEmbeddingEnsureJobRecordsProgressResultAndSkipsCurrentEmbeddings(t *tes
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate returned error: %v", err)
 	}
-	store.SetVectorBackend(newJobsFakeVectorBackend())
+	backend := newJobsFakeVectorBackend()
+	store.SetVectorBackend(backend)
 	source, err := store.CreateSource(ctx, domain.Source{ID: "source-embedding-job", Kind: "local", Name: "Docs", DSN: "file:///docs"})
 	if err != nil {
 		t.Fatalf("CreateSource returned error: %v", err)
@@ -74,6 +76,18 @@ func TestEmbeddingEnsureJobRecordsProgressResultAndSkipsCurrentEmbeddings(t *tes
 		{ID: "section-embedding-job-2", Content: "second section", ContentHash: "hash-section-2"},
 	}); err != nil {
 		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	backend.hashes["orphan-chunk"] = domain.EmbeddingChunkHash{
+		ChunkID:            "orphan-chunk",
+		SectionID:          "deleted-section",
+		DocumentID:         "deleted-document",
+		SourceID:           source.ID,
+		Model:              "legacy-model",
+		SectionContentHash: "deleted-hash",
+		ChunkTextHash:      "deleted-text-hash",
+		Tokenizer:          "legacy-tokenizer",
+		ChunkStrategy:      "legacy-strategy",
+		GeneratorVersion:   "legacy-generator",
 	}
 	job, err := store.CreateJob(ctx, domain.JobInput{
 		Kind:     "maintenance_embedding_ensure",
@@ -99,10 +113,13 @@ func TestEmbeddingEnsureJobRecordsProgressResultAndSkipsCurrentEmbeddings(t *tes
 			t.Fatalf("ProgressJSON = %q, want %s", handled.ProgressJSON, want)
 		}
 	}
-	for _, want := range []string{`"embedded_sections":2`, `"total_sections":2`, `"generator_version":"generator-v1"`} {
+	for _, want := range []string{`"embedded_sections":2`, `"detected_orphan_sections":1`, `"detected_orphan_chunks":1`, `"deleted_orphan_sections":1`, `"deleted_orphan_chunks":1`, `"total_sections":2`, `"generator_version":"generator-v1"`} {
 		if !strings.Contains(handled.ResultJSON, want) {
 			t.Fatalf("ResultJSON = %q, want %s", handled.ResultJSON, want)
 		}
+	}
+	if _, exists := backend.hashes["orphan-chunk"]; exists {
+		t.Fatal("orphan chunk still exists after embedding ensure")
 	}
 
 	secondJob, err := store.CreateJob(ctx, domain.JobInput{
@@ -126,6 +143,150 @@ func TestEmbeddingEnsureJobRecordsProgressResultAndSkipsCurrentEmbeddings(t *tes
 		if !strings.Contains(secondHandled.ResultJSON, want) {
 			t.Fatalf("second ResultJSON = %q, want %s", secondHandled.ResultJSON, want)
 		}
+	}
+}
+
+func TestEmbeddingReconciliationCleansOrphansAfterSectionRewrite(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	backend := newJobsFakeVectorBackend()
+	store.SetVectorBackend(backend)
+	source, err := store.CreateSource(ctx, domain.Source{ID: "source-section-rewrite", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	document := domain.DocumentInput{ID: "doc-section-rewrite", SourceID: source.ID, ExternalID: "rewrite.md", Title: "Rewrite", ContentHash: "hash-v1"}
+	if err := store.ReplaceDocument(ctx, document, []domain.SectionInput{
+		{ID: "a", Content: "section a", ContentHash: "hash-a", Ordinal: 0},
+		{ID: "b", Content: "section b", ContentHash: "hash-b", Ordinal: 1},
+		{ID: "c", Content: "section c", ContentHash: "hash-c", Ordinal: 2},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument initial returned error: %v", err)
+	}
+	opts := embedding.EnsureOptions{
+		SourceID:          source.ID,
+		BatchSize:         2,
+		ChunkTargetTokens: 1200,
+		GeneratorVersion:  "generator-v1",
+	}
+	embedder := jobsFakeEmbedder{model: "test-embedding"}
+	if _, err := embedding.Ensure(ctx, store, embedder, opts); err != nil {
+		t.Fatalf("Ensure initial returned error: %v", err)
+	}
+
+	document.ContentHash = "hash-v2"
+	if err := store.ReplaceDocument(ctx, document, []domain.SectionInput{
+		{ID: "c", Content: "section c", ContentHash: "hash-c", Ordinal: 0},
+		{ID: "d", Content: "section d", ContentHash: "hash-d", Ordinal: 1},
+		{ID: "e", Content: "section e", ContentHash: "hash-e", Ordinal: 2},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument rewritten returned error: %v", err)
+	}
+
+	before, err := embedding.AuditSourceEmbeddingStatus(ctx, store, source.ID, embedder.Model(), opts)
+	if err != nil {
+		t.Fatalf("AuditSourceEmbeddingStatus before cleanup returned error: %v", err)
+	}
+	if before.TotalSections != 3 || before.ReadySections != 1 || before.PendingSections != 2 || before.StaleSections != 0 || before.OrphanSections != 2 || before.OrphanChunks != 2 || !before.CleanupRequired || before.Status != "indexing" {
+		t.Fatalf("status before cleanup = %+v, want ready=1 pending=2 orphan=2", before)
+	}
+
+	result, err := embedding.Ensure(ctx, store, embedder, opts)
+	if err != nil {
+		t.Fatalf("Ensure rewritten returned error: %v", err)
+	}
+	if result.EmbeddedSections != 2 || result.SkippedSections != 1 || result.DetectedPendingSections != 2 || result.DetectedOrphanSections != 2 || result.DetectedOrphanChunks != 2 || result.DeletedOrphanSections != 2 || result.DeletedOrphanChunks != 2 {
+		t.Fatalf("Ensure rewritten result = %+v, want rebuild d/e and delete a/b", result)
+	}
+
+	after, err := embedding.AuditSourceEmbeddingStatus(ctx, store, source.ID, embedder.Model(), opts)
+	if err != nil {
+		t.Fatalf("AuditSourceEmbeddingStatus after cleanup returned error: %v", err)
+	}
+	if after.TotalSections != 3 || after.ReadySections != 3 || after.PendingSections != 0 || after.StaleSections != 0 || after.OrphanSections != 0 || after.OrphanChunks != 0 || after.CleanupRequired || after.Status != "ready" {
+		t.Fatalf("status after cleanup = %+v, want exactly 3 ready sections", after)
+	}
+	for _, removedID := range []string{"a", "b"} {
+		for _, hash := range backend.hashes {
+			if hash.SectionID == removedID {
+				t.Fatalf("orphan section %q still has chunk %q", removedID, hash.ChunkID)
+			}
+		}
+	}
+}
+
+func TestEmbeddingStatusClassifiesReadyPendingStaleAndOrphan(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "docgraph.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open returned error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	backend := newJobsFakeVectorBackend()
+	store.SetVectorBackend(backend)
+	source, err := store.CreateSource(ctx, domain.Source{ID: "source-status-classification", Kind: "local", Name: "Docs", DSN: "file:///docs"})
+	if err != nil {
+		t.Fatalf("CreateSource returned error: %v", err)
+	}
+	if err := store.ReplaceDocument(ctx, domain.DocumentInput{ID: "doc-status-classification", SourceID: source.ID, ExternalID: "status.md", Title: "Status", ContentHash: "hash-doc"}, []domain.SectionInput{
+		{ID: "ready", Content: "ready section", ContentHash: "hash-ready", Ordinal: 0},
+		{ID: "stale", Content: "stale section", ContentHash: "hash-stale", Ordinal: 1},
+		{ID: "pending", Content: "pending section", ContentHash: "hash-pending", Ordinal: 2},
+	}); err != nil {
+		t.Fatalf("ReplaceDocument returned error: %v", err)
+	}
+	opts := embedding.EnsureOptions{SourceID: source.ID, BatchSize: 2, ChunkTargetTokens: 1200, GeneratorVersion: "generator-v1"}
+	embedder := jobsFakeEmbedder{model: "test-embedding"}
+	if _, err := embedding.Ensure(ctx, store, embedder, opts); err != nil {
+		t.Fatalf("Ensure returned error: %v", err)
+	}
+	for chunkID, hash := range backend.hashes {
+		switch hash.SectionID {
+		case "stale":
+			hash.SectionContentHash = "old-content-hash"
+			backend.hashes[chunkID] = hash
+		case "pending":
+			delete(backend.hashes, chunkID)
+		}
+	}
+	backend.hashes["orphan-status-chunk"] = domain.EmbeddingChunkHash{
+		ChunkID:            "orphan-status-chunk",
+		SectionID:          "removed",
+		DocumentID:         "removed-document",
+		SourceID:           source.ID,
+		Model:              "legacy-model",
+		SectionContentHash: "removed-hash",
+		ChunkTextHash:      "removed-text-hash",
+		Tokenizer:          "legacy-tokenizer",
+		ChunkStrategy:      "legacy-strategy",
+		GeneratorVersion:   "legacy-generator",
+	}
+
+	status, err := embedding.AuditSourceEmbeddingStatus(ctx, store, source.ID, embedder.Model(), opts)
+	if err != nil {
+		t.Fatalf("AuditSourceEmbeddingStatus returned error: %v", err)
+	}
+	if status.TotalSections != 3 || status.ReadySections != 1 || status.PendingSections != 1 || status.StaleSections != 1 || status.OrphanSections != 1 {
+		t.Fatalf("section status = %+v, want one ready/pending/stale/orphan", status)
+	}
+	if status.ExpectedChunks != 3 || status.ReadyChunks != 1 || status.PendingChunks != 1 || status.StaleChunks != 1 || status.OrphanChunks != 1 {
+		t.Fatalf("chunk status = %+v, want expected=3 and one ready/pending/stale/orphan", status)
+	}
+	if status.EmbeddedSections != status.ReadySections || status.TotalChunks != status.ExpectedChunks || status.EmbeddedChunks != status.ReadyChunks {
+		t.Fatalf("compatibility aliases do not match exact status: %+v", status)
+	}
+	if !status.CleanupRequired || status.Status != "indexing" || status.AuditedAt == "" {
+		t.Fatalf("status metadata = %+v, want cleanup_required indexing audit", status)
 	}
 }
 
@@ -517,6 +678,62 @@ func (f *jobsFakeVectorBackend) ListEmbeddingChunkHashes(ctx context.Context, mo
 		limit = len(items) - offset
 	}
 	return items[offset : offset+limit], nil
+}
+
+func (f *jobsFakeVectorBackend) ListEmbeddingChunkInventory(ctx context.Context, opts vectorstore.EmbeddingInventoryOptions) ([]domain.EmbeddingChunkHash, error) {
+	items := make([]domain.EmbeddingChunkHash, 0, len(f.hashes))
+	for _, hash := range f.hashes {
+		if opts.SourceID != "" && hash.SourceID != opts.SourceID {
+			continue
+		}
+		if !opts.IncludeAllPlans {
+			if opts.Model != "" && hash.Model != opts.Model {
+				continue
+			}
+			if opts.GeneratorVersion != "" && hash.GeneratorVersion != opts.GeneratorVersion {
+				continue
+			}
+			if opts.Tokenizer != "" && hash.Tokenizer != opts.Tokenizer {
+				continue
+			}
+			if opts.ChunkStrategy != "" && hash.ChunkStrategy != opts.ChunkStrategy {
+				continue
+			}
+		}
+		items = append(items, hash)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].SectionID != items[j].SectionID {
+			return items[i].SectionID < items[j].SectionID
+		}
+		if items[i].ChunkOrdinal != items[j].ChunkOrdinal {
+			return items[i].ChunkOrdinal < items[j].ChunkOrdinal
+		}
+		return items[i].ChunkID < items[j].ChunkID
+	})
+	if opts.Offset >= len(items) {
+		return nil, nil
+	}
+	limit := opts.Limit
+	if limit <= 0 || opts.Offset+limit > len(items) {
+		limit = len(items) - opts.Offset
+	}
+	return items[opts.Offset : opts.Offset+limit], nil
+}
+
+func (f *jobsFakeVectorBackend) DeleteEmbeddingChunksBySectionIDs(ctx context.Context, sourceID string, sectionIDs []string) (int64, error) {
+	sections := map[string]bool{}
+	for _, sectionID := range sectionIDs {
+		sections[strings.TrimSpace(sectionID)] = true
+	}
+	var deleted int64
+	for chunkID, hash := range f.hashes {
+		if hash.SourceID == sourceID && sections[hash.SectionID] {
+			delete(f.hashes, chunkID)
+			deleted++
+		}
+	}
+	return deleted, nil
 }
 
 func (f *jobsFakeVectorBackend) GetEmbeddingCoverage(ctx context.Context, sourceID string, model string, generatorVersion string, tokenizer string, chunkStrategy string) (domain.EmbeddingCoverage, error) {

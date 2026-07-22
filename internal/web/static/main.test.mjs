@@ -19,6 +19,32 @@ await import("./main.js");
 
 const model = globalThis.DocGraphWebModel;
 
+test("embedding status prefers reconciled ready and expected counts with legacy fallbacks", () => {
+  assert.equal(model.embeddingReadySections({ ready_sections: 3, embedded_sections: 8 }), 3);
+  assert.equal(model.embeddingReadySections({ ready_sections: 0, embedded_sections: 8 }), 0);
+  assert.equal(model.embeddingReadySections({ embedded_sections: 8 }), 8);
+  assert.equal(model.embeddingExpectedChunks({ expected_chunks: 5, total_chunks: 9 }), 5);
+  assert.equal(model.embeddingExpectedChunks({ total_chunks: 9 }), 9);
+  assert.equal(model.embeddingReadyChunks({ ready_chunks: 4, embedded_chunks: 7 }), 4);
+  assert.equal(model.embeddingReadyChunks({ embedded_chunks: 7 }), 7);
+});
+
+test("embedding status surfaces orphan cleanup instead of reporting ready", () => {
+  const status = {
+    enabled: true,
+    status: "ready",
+    total_sections: 3,
+    ready_sections: 3,
+    embedded_sections: 5,
+    orphan_sections: 2,
+    orphan_chunks: 4,
+  };
+  assert.equal(model.embeddingCleanupRequired(status), true);
+  assert.equal(model.embeddingStateLabel("source-a", status), "source.vector_cleanup_required");
+  assert.match(model.formatEmbeddingStatus("source-a", status), /3\/3/);
+  assert.match(model.formatEmbeddingStatus("source-a", status), /2 source\.vector_orphan/);
+});
+
 test("XMind source config remains empty", () => {
   const form = { get: () => null };
   assert.deepEqual(model.buildSourceConfig(form, "xmind"), {});

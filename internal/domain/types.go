@@ -575,19 +575,28 @@ type EmbeddingChunkHash struct {
 }
 
 type EmbeddingStatus struct {
-	SourceID         string `json:"source_id,omitempty"`
-	Enabled          bool   `json:"enabled"`
-	Status           string `json:"status,omitempty"`
-	Reason           string `json:"reason,omitempty"`
-	Backend          string `json:"backend,omitempty"`
-	TotalSections    int    `json:"total_sections"`
-	EmbeddedSections int    `json:"embedded_sections"`
-	PendingSections  int    `json:"pending_sections"`
-	StaleSections    int    `json:"stale_sections"`
+	SourceID      string `json:"source_id,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	Status        string `json:"status,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	Backend       string `json:"backend,omitempty"`
+	TotalSections int    `json:"total_sections"`
+	ReadySections int    `json:"ready_sections"`
+	// EmbeddedSections is retained as a compatibility alias for ReadySections.
+	EmbeddedSections int `json:"embedded_sections"`
+	PendingSections  int `json:"pending_sections"`
+	StaleSections    int `json:"stale_sections"`
+	OrphanSections   int `json:"orphan_sections"`
+	ExpectedChunks   int `json:"expected_chunks"`
+	ReadyChunks      int `json:"ready_chunks"`
+	// TotalChunks and EmbeddedChunks are retained for older API clients.
 	TotalChunks      int    `json:"total_chunks"`
 	EmbeddedChunks   int    `json:"embedded_chunks"`
 	PendingChunks    int    `json:"pending_chunks"`
 	StaleChunks      int    `json:"stale_chunks"`
+	OrphanChunks     int    `json:"orphan_chunks"`
+	CleanupRequired  bool   `json:"cleanup_required"`
+	AuditedAt        string `json:"audited_at,omitempty"`
 	Model            string `json:"model"`
 	Tokenizer        string `json:"tokenizer,omitempty"`
 	ChunkStrategy    string `json:"chunk_strategy,omitempty"`
